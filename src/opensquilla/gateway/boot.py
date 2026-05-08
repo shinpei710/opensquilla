@@ -1892,11 +1892,20 @@ async def start_gateway_server(
     # Start channels (after app is ready to receive webhooks)
     if channel_manager is not None:
         results = await channel_manager.start_all()
+        start_errors_fn = getattr(channel_manager, "start_errors", None)
+        start_errors = start_errors_fn() if start_errors_fn is not None else {}
         for name, ok in results.items():
             if ok:
                 log.info("gateway.channel_started", channel=name)
             else:
-                log.warning("gateway.channel_failed", channel=name)
+                details = start_errors.get(name, {})
+                log.warning(
+                    "gateway.channel_failed",
+                    channel=name,
+                    error_type=details.get("error_type"),
+                    error=details.get("error"),
+                    exception=details.get("exception"),
+                )
 
     app.state.gateway_ready = True
     return server_handle

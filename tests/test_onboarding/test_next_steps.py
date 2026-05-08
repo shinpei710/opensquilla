@@ -27,3 +27,44 @@ def test_next_steps_warns_running_gateway_must_restart():
 
     assert "If a gateway is already running, restart it so it loads this config." in text
     assert "uv run opensquilla gateway restart --json" in text
+
+
+def test_env_reference_warnings_cover_llm_and_search_missing_env(monkeypatch):
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.onboarding.next_steps import env_reference_warnings
+
+    cfg = GatewayConfig()
+    cfg.llm.api_key = ""
+    cfg.llm.api_key_env = "OPENROUTER_API_KEY"
+    cfg.search_provider = "brave"
+    cfg.search_api_key = ""
+    cfg.search_api_key_env = "BRAVE_SEARCH_API_KEY"
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+
+    warnings = env_reference_warnings(cfg)
+
+    assert any(
+        "LLM provider" in warning and "OPENROUTER_API_KEY" in warning
+        for warning in warnings
+    )
+    assert any(
+        "Search provider" in warning and "BRAVE_SEARCH_API_KEY" in warning
+        for warning in warnings
+    )
+
+
+def test_env_reference_warnings_do_not_warn_for_image_generation_missing_env_when_disabled(
+    monkeypatch,
+):
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.onboarding.next_steps import env_reference_warnings
+
+    cfg = GatewayConfig()
+    cfg.image_generation.enabled = False
+    cfg.image_generation.providers.openrouter.api_key = ""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    warnings = env_reference_warnings(cfg)
+
+    assert not any("Image generation" in warning for warning in warnings)

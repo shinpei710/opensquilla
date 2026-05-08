@@ -115,6 +115,7 @@ const SetupView = (() => {
           <div class="setup-provider-fields">
             ${_renderProviderFields(spec, current)}
           </div>
+          ${_providerEnvWarning()}
           <div class="setup-actions">
             <button class="setup-btn setup-btn--primary" data-save-provider>Save Provider</button>
             <button class="setup-btn" data-next="router">Next</button>
@@ -133,6 +134,20 @@ const SetupView = (() => {
       else if (name === 'api_key_env') value = current.api_key_env || field.default || '';
       return _fieldHtml(field, value, 'provider');
     }).join('');
+  }
+
+  function _providerEnvMissing() {
+    return _status.llmSource === 'missing_env';
+  }
+
+  function _providerEnvKey() {
+    return ((_config.llm || {}).api_key_env || 'the selected API key environment variable');
+  }
+
+  function _providerEnvWarning() {
+    if (!_providerEnvMissing()) return '';
+    const envKey = _providerEnvKey();
+    return `<div class="setup-warning">${_esc(envKey)} is not visible to this gateway process. Set it before starting or restarting the gateway, or paste an API key instead.</div>`;
   }
 
   function _renderRouterStep() {
@@ -252,6 +267,8 @@ const SetupView = (() => {
     const imageSpec = imageProviders[0] || {};
     const field = (imageSpec.fields || []).find(candidate => candidate.name === 'enabled') || { default: true };
     const imageEnabledDefault = _status.imageGenerationEnabled === false ? false : field.default !== false;
+    const imageProviderSelected = _status.imageGenerationProvider || (_status.imageGenerationPrimary || '').split('/')[0] || imageProviders[0]?.providerId || 'openrouter';
+    const imageStatusText = _imageGenerationStatusText();
     return `
       <section class="setup-panel">
         <header class="setup-panel__head">
@@ -273,9 +290,10 @@ const SetupView = (() => {
           </div>
           <div class="setup-mini">
             <h4>Image generation</h4>
+            <p class="setup-muted">${_esc(imageStatusText)}</p>
             <label><span>Provider</span>
               <select data-image-provider>
-                ${imageProviders.map(p => `<option value="${_esc(p.providerId)}">${_esc(p.label)}</option>`).join('')}
+                ${imageProviders.map(p => `<option value="${_esc(p.providerId)}"${p.providerId === imageProviderSelected ? ' selected' : ''}>${_esc(p.label)}</option>`).join('')}
               </select>
             </label>
             <label><span>Primary model</span><input data-image-field="primary" value="${_esc(_status.imageGenerationPrimary || '')}"></label>
@@ -289,6 +307,16 @@ const SetupView = (() => {
           <button class="setup-btn" data-next="finish">Next</button>
         </div>
       </section>`;
+  }
+
+  function _imageGenerationStatusText() {
+    if (_status.imageGenerationEnabled === false) {
+      return 'image_generate is hidden from agents until this capability is enabled.';
+    }
+    if (_status.imageGenerationConfigured === true) {
+      return 'image_generate will be available in new turns once the gateway has the visible key.';
+    }
+    return 'image_generate is enabled but still needs a visible provider key before agents can use it.';
   }
 
   function _renderFinishStep() {
@@ -320,20 +348,21 @@ const SetupView = (() => {
 
   function _fieldHtml(field, value, scope) {
     const required = field.required ? ' *' : '';
+    const desc = field.description ? `<small class="setup-field-desc">${_esc(field.description)}</small>` : '';
     const showWhen = field.showWhen && Object.keys(field.showWhen).length ? _esc(JSON.stringify(field.showWhen)) : '';
     const attrs = `data-name="${_esc(field.name)}" data-scope="${scope}" data-show-when="${showWhen}"`;
     if (field.type === 'bool') {
-      return `<label class="setup-check" ${attrs}><input type="checkbox" ${field.default ? ' checked' : ''}><span>${_esc(field.label)}${required}</span></label>`;
+      return `<label class="setup-check" ${attrs}><input type="checkbox" ${field.default ? ' checked' : ''}><span>${_esc(field.label)}${required}${desc}</span></label>`;
     }
     if (field.type === 'select') {
-      return `<label ${attrs}><span>${_esc(field.label)}${required}</span><select>
+      return `<label ${attrs}><span>${_esc(field.label)}${required}</span>${desc}<select>
         ${(field.choices || []).map(choice => `<option value="${_esc(choice)}"${choice === value ? ' selected' : ''}>${_esc(choice)}</option>`).join('')}
       </select></label>`;
     }
     const isSecret = field.secret || field.type === 'password';
     const inputType = isSecret ? 'password' : (field.type === 'int' || field.type === 'float' ? 'number' : 'text');
     const placeholder = field.placeholder || (isSecret ? 'leave blank to keep current' : '');
-    return `<label ${attrs}><span>${_esc(field.label)}${required}</span><input type="${inputType}" data-secret="${isSecret}" value="${isSecret ? '' : _esc(String(value || ''))}" placeholder="${_esc(placeholder)}"></label>`;
+    return `<label ${attrs}><span>${_esc(field.label)}${required}</span>${desc}<input type="${inputType}" data-secret="${isSecret}" value="${isSecret ? '' : _esc(String(value || ''))}" placeholder="${_esc(placeholder)}"></label>`;
   }
 
   function _bindStep() {
@@ -414,8 +443,14 @@ const SetupView = (() => {
     const providerId = _el.querySelector('[data-provider-select]')?.value;
     try {
       await _rpc.call('onboarding.provider.configure', Object.assign({ providerId }, _readScopedFields('provider')));
-      UI.toast('Provider saved.', 'info');
       await _load();
+      if (_providerEnvMissing()) {
+        UI.toast(`${_providerEnvKey()} is not visible to this gateway process.`, 'err');
+        _step = 'provider';
+        _draw();
+        return;
+      }
+      UI.toast('Provider saved.', 'info');
       _step = 'router';
       _draw();
     } catch (err) {

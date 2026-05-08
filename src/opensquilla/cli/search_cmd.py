@@ -10,12 +10,15 @@ from rich.table import Table
 
 from opensquilla.cli.gateway_rpc import run_gateway_sync
 from opensquilla.cli.output import print_json
+from opensquilla.cli.ui import console as ui_console
+from opensquilla.cli.ui import warning_panel
 from opensquilla.onboarding.config_store import (
     default_config_path,
     load_config,
     persist_config,
 )
 from opensquilla.onboarding.mutations import upsert_search_provider
+from opensquilla.onboarding.next_steps import env_reference_warnings
 from opensquilla.onboarding.search_specs import (
     list_search_provider_setup_specs,
     search_provider_catalog_payload,
@@ -172,5 +175,7 @@ def search_configure(
     )
     typer.echo(f"Search provider configured: {provider}")
     typer.echo(f"Config: {persist.path}")
+    for warning in env_reference_warnings(result.config):
+        ui_console.print(warning_panel(warning))
     if persist.backup_path:
         typer.echo(f"Backup: {persist.backup_path}")

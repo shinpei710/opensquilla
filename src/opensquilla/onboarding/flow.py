@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 from dataclasses import dataclass
 from typing import Any
 
+from opensquilla.cli.ui import (
+    ACCENT,
+    ACCENT_DIM,
+    ACCENT_SOFT,
+    banner_panel,
+    console,
+    markup_escape,
+    questionary_style,
+    warning_panel,
+)
 from opensquilla.onboarding.channel_specs import (
     ChannelSetupField,
     ChannelSetupSpec,
@@ -19,8 +30,14 @@ from opensquilla.onboarding.config_store import (
     load_config,
     persist_config,
 )
+from opensquilla.onboarding.image_generation_specs import (
+    ImageGenerationProviderSetupSpec,
+    get_image_generation_provider_setup_spec,
+    list_image_generation_provider_setup_specs,
+)
 from opensquilla.onboarding.mutations import (
     upsert_channel,
+    upsert_image_generation_provider,
     upsert_llm_provider,
     upsert_router,
     upsert_search_provider,
@@ -35,11 +52,48 @@ from opensquilla.onboarding.search_specs import (
 )
 from opensquilla.onboarding.status import get_onboarding_status
 
+_QSTYLE = None
+
+
+def _qs():
+    global _QSTYLE
+    if _QSTYLE is None:
+        built = questionary_style()
+        if built is None:
+            return None
+        _QSTYLE = built
+    return _QSTYLE
+
+
+def _styled(q):
+    """Wrap the questionary module so every prompt inherits the brand style.
+
+    When ``questionary_style()`` returns ``None`` (e.g. test stub or missing
+    optional dep) the wrapper passes calls through unchanged.
+    """
+    from types import SimpleNamespace
+
+    style = _qs()
+    if style is None:
+        return q
+
+    def _wrap(name):
+        fn = getattr(q, name)
+        return lambda *a, **kw: fn(*a, **{"style": style, **kw})
+
+    return SimpleNamespace(
+        select=_wrap("select"),
+        text=_wrap("text"),
+        confirm=_wrap("confirm"),
+        password=_wrap("password"),
+    )
+
 
 @dataclass(frozen=True)
 class OnboardOptions:
     skip_channels: bool = False
     skip_search: bool = False
+    skip_image_generation: bool = False
     if_needed: bool = False
     provider_id: str | None = None
     model: str | None = None
@@ -232,11 +286,14 @@ def _ask_search_fields(questionary, spec) -> dict[str, Any]:
     answers["use_env_proxy"] = questionary.confirm(
         "Use environment proxy for search?", default=False
     ).ask()
-    answers["fallback_policy"] = questionary.select(
-        "Search fallback policy", choices=["off", "network"], default="off"
+    fallback_choice = questionary.select(
+        "Search fallback policy",
+        choices=list(_SEARCH_FALLBACK_LABELS.values()),
+        default=_SEARCH_FALLBACK_LABELS["off"],
     ).ask()
+    answers["fallback_policy"] = _search_fallback_choice_to_value(fallback_choice)
     answers["diagnostics"] = questionary.confirm(
-        "Enable search diagnostics?", default=False
+        _SEARCH_DIAGNOSTICS_PROMPT, default=False
     ).ask()
     return answers
 
@@ -245,8 +302,10 @@ def run_interactive_search_configure() -> PersistResult:
     if not _is_tty():
         return _print_noninteractive_hint()
 
-    import questionary
+    import questionary as _qmod
+    questionary = _styled(_qmod)
 
+    console.print(banner_panel("Search Setup", "Wire a web search provider"))
     spec, provider_id = _ask_search_choice(questionary)
     answers = _ask_search_fields(questionary, spec)
     cfg = load_config()
@@ -264,6 +323,130 @@ def run_interactive_search_configure() -> PersistResult:
     return persist_config(result.config, restart_required=False)
 
 
+def _image_generation_choice_label(spec: ImageGenerationProviderSetupSpec) -> str:
+    return f"{spec.provider_id} ({spec.label})"
+
+
+def _image_generation_choice_to_provider_id(choice: str) -> str:
+    return choice.split(" ")[0]
+
+
+def _preferred_image_generation_provider_id(config) -> str | None:
+    provider_id = str(getattr(config.llm, "provider", "") or "")
+    supported = {
+        spec.provider_id
+        for spec in list_image_generation_provider_setup_specs()
+        if spec.runtime_supported
+    }
+    return provider_id if provider_id in supported else None
+
+
+def _ask_image_generation_choice(questionary, config):
+    supported = [
+        spec
+        for spec in list_image_generation_provider_setup_specs()
+        if spec.runtime_supported
+    ]
+    preferred = _preferred_image_generation_provider_id(config)
+    default_spec = next(
+        (spec for spec in supported if spec.provider_id == preferred),
+        supported[0],
+    )
+    selected = questionary.select(
+        "Image generation provider",
+        choices=[_image_generation_choice_label(spec) for spec in supported],
+        default=_image_generation_choice_label(default_spec),
+    ).ask()
+    provider_id = _image_generation_choice_to_provider_id(selected)
+    return get_image_generation_provider_setup_spec(provider_id), provider_id
+
+
+def _ask_image_generation_fields(
+    questionary,
+    spec: ImageGenerationProviderSetupSpec,
+    config,
+) -> dict[str, Any]:
+    answers: dict[str, Any] = {}
+    answers["primary"] = (
+        questionary.text("Primary image model", default=spec.default_model).ask()
+        or spec.default_model
+    )
+
+    key_choices: list[str] = []
+    env_choice = f"Use environment variable {spec.env_key}" if spec.env_key else ""
+    if env_choice and os.environ.get(spec.env_key):
+        key_choices.append(env_choice)
+    llm_choice = "Reuse matching LLM provider key"
+    if config.llm.provider == spec.provider_id and config.llm.api_key:
+        key_choices.append(llm_choice)
+    paste_choice = "Paste API key now"
+    key_choices.append(paste_choice)
+
+    key_source = questionary.select(
+        "Image API key source",
+        choices=key_choices,
+        default=key_choices[0],
+    ).ask()
+    if key_source == paste_choice:
+        answers["api_key"] = questionary.password("Image API key").ask() or ""
+    else:
+        answers["api_key"] = ""
+
+    answers["base_url"] = (
+        questionary.text("Image base URL", default=spec.default_base_url).ask()
+        or spec.default_base_url
+    )
+    answers["enabled"] = questionary.confirm(
+        "Image generation enabled?", default=True
+    ).ask()
+    return answers
+
+
+def _print_image_generation_intro(spec: ImageGenerationProviderSetupSpec) -> None:
+    console.print(
+        f"[bold {ACCENT}]▌[/] [bold]Image generation[/]"
+        f" [dim]· {markup_escape(spec.label)}[/dim]"
+    )
+    console.print(
+        f"  [dim]Enables the [{ACCENT_SOFT}]image_generate[/] tool for new turns "
+        "when the gateway can see the selected provider key.[/dim]"
+    )
+
+
+def _print_image_generation_saved(provider_id: str) -> None:
+    console.print(
+        f"[bold {ACCENT}]◆[/] [bold]Image generation configured.[/]"
+    )
+    console.print(
+        f"  [dim]Provider:[/dim] [{ACCENT_SOFT}]{markup_escape(provider_id)}[/]"
+        " [dim]· start a new turn after the gateway can see the key[/dim]"
+    )
+
+
+def run_interactive_image_generation_configure() -> PersistResult:
+    if not _is_tty():
+        return _print_noninteractive_hint()
+
+    import questionary as _qmod
+    questionary = _styled(_qmod)
+
+    cfg = load_config()
+    spec, provider_id = _ask_image_generation_choice(questionary, cfg)
+    _print_image_generation_intro(spec)
+    answers = _ask_image_generation_fields(questionary, spec, cfg)
+    result = upsert_image_generation_provider(
+        cfg,
+        provider_id=provider_id,
+        primary=answers.get("primary", ""),
+        api_key=answers.get("api_key", ""),
+        base_url=answers.get("base_url", ""),
+        enabled=bool(answers.get("enabled", True)),
+    )
+    persisted = persist_config(result.config, restart_required=False)
+    _print_image_generation_saved(provider_id)
+    return persisted
+
+
 _TEXT_ROUTER_TIERS = ("t0", "t1", "t2", "t3")
 _EXPOSED_ROUTER_TIERS = ("t0", "t1", "t2", "t3", "image_model")
 _TEXT_TIER_LABELS = {
@@ -278,6 +461,21 @@ _DONE_LABEL = "Done"
 
 _ROUTER_MODE_LABEL = "SquillaRouter"
 _ROUTER_DISABLED_LABEL = "Disabled"
+_SEARCH_FALLBACK_LABELS = {
+    "off": "off - no fallback; surface the original provider error",
+    "network": "network - retry with DuckDuckGo on timeout/network errors",
+}
+_SEARCH_DIAGNOSTICS_PROMPT = (
+    "Enable search diagnostics? Include provider attempt/error details "
+    "for troubleshooting?"
+)
+
+
+def _search_fallback_choice_to_value(choice: str | None) -> str:
+    for value, label in _SEARCH_FALLBACK_LABELS.items():
+        if choice == label or choice == value:
+            return value
+    return "off"
 
 
 def _router_mode_choices(provider_id: str) -> list[str]:
@@ -331,23 +529,29 @@ def _tier_choice_to_internal(selected: str | None) -> str | None:
 def _print_router_defaults(config) -> None:
     router = config.squilla_router
     if not getattr(router, "enabled", True):
-        print("Router: disabled; requests use the direct provider/model.")
+        console.print(
+            f"[{ACCENT_DIM}]router[/] [dim]disabled — requests bypass tier routing[/dim]"
+        )
         return
     default_tier = str(getattr(router, "default_tier", "t1") or "t1")
     default = router.tiers.get(default_tier, {})
-    print(
-        "Router default: "
-        f"{default_tier} -> {default.get('provider', '')}/{default.get('model', '')}"
+    console.print(
+        f"[bold {ACCENT}]◆ router[/] "
+        f"[dim]default[/] [{ACCENT_SOFT}]{default_tier}[/] "
+        f"[dim]→[/] {markup_escape(default.get('provider', ''))}"
+        f"[dim]/[/]{markup_escape(default.get('model', ''))}"
     )
-    print("Router tiers:")
     for tier_name in _EXPOSED_ROUTER_TIERS:
         tier = router.tiers.get(tier_name)
         if not isinstance(tier, dict):
             continue
-        suffix = " (default)" if tier_name == default_tier else ""
-        print(
-            f"  {tier_name}: {tier.get('provider', '')}/"
-            f"{tier.get('model', '')}{suffix}"
+        marker = (
+            f"[{ACCENT}]●[/]" if tier_name == default_tier else f"[{ACCENT_DIM}]○[/]"
+        )
+        console.print(
+            f"  {marker} [{ACCENT_SOFT}]{tier_name:<11}[/]"
+            f" [dim]{markup_escape(tier.get('provider', ''))}/"
+            f"{markup_escape(tier.get('model', ''))}[/dim]"
         )
 
 
@@ -468,9 +672,14 @@ def _channel_prompt_default(
 
 def _ask_channel_field(questionary, field: ChannelSetupField, default: Any) -> Any:
     if field.help:
-        print(f"{field.label}: {field.help}")
+        console.print(
+            f"  [dim]{markup_escape(field.label)}: {markup_escape(field.help)}[/dim]"
+        )
     elif field.placeholder:
-        print(f"{field.label}: {field.placeholder}")
+        console.print(
+            f"  [dim]{markup_escape(field.label)}: "
+            f"{markup_escape(field.placeholder)}[/dim]"
+        )
     if field.field_type == "select":
         select_default = default if isinstance(default, str) else None
         return questionary.select(
@@ -534,19 +743,50 @@ def _ask_channel_fields(
 
 
 def _print_channel_intro(spec: ChannelSetupSpec) -> None:
-    print(f"{spec.label}: {spec.description}")
+    console.print(
+        f"[bold {ACCENT}]▌[/] [bold]{markup_escape(spec.label)}[/]"
+        f" [dim]· {markup_escape(spec.description)}[/dim]"
+    )
     if spec.help:
-        print(spec.help)
+        console.print(f"  [dim]{markup_escape(spec.help)}[/dim]")
     if spec.requires_public_url:
-        print("Webhook mode requires a public HTTPS URL reachable by the platform.")
-    print("This wizard asks only the fields needed to create the channel.")
-    print("Advanced defaults and webhook-only fields can be edited later.")
+        console.print(
+            f"  [{ACCENT_SOFT}]webhook[/] "
+            "[dim]needs a public HTTPS URL reachable by the platform[/dim]"
+        )
+    console.print(
+        "  [dim]minimal-field wizard · advanced/webhook-only fields editable later[/dim]"
+    )
+
+
+def _warn_channel_dependency_gaps(spec: ChannelSetupSpec, answers: dict[str, Any]) -> None:
+    """Warn about optional channel dependencies that will fail at gateway start."""
+    if spec.type == "feishu" and answers.get("connection_mode") == "websocket":
+        if importlib.util.find_spec("lark_oapi") is None:
+            console.print(
+                warning_panel(
+                    "Feishu websocket mode requires the optional feishu extra "
+                    "(lark-oapi). Reinstall with `.[recommended,feishu]` from "
+                    "this source checkout or `opensquilla[feishu]` before "
+                    "restarting the gateway, otherwise this channel will save "
+                    "but fail to start.",
+                    title="Channel dependency missing",
+                )
+            )
 
 
 def _print_channel_saved(name: str) -> None:
-    print("Channel configured, not connected yet.")
-    print("Restart the gateway process to load the channel adapter.")
-    print(f"Verify after restart: uv run opensquilla channels status {name} --json")
+    console.print(
+        f"[bold {ACCENT}]◆[/] [bold]Channel configured, not connected yet.[/]"
+    )
+    console.print(
+        "  [dim]Restart the gateway process to load the channel adapter.[/dim]"
+    )
+    console.print(
+        f"  [dim]Verify after restart:[/dim] "
+        f"[{ACCENT_SOFT}]uv run opensquilla channels status "
+        f"{markup_escape(name)} --json[/]"
+    )
 
 
 def run_interactive_onboard(options: OnboardOptions) -> PersistResult:
@@ -557,8 +797,15 @@ def run_interactive_onboard(options: OnboardOptions) -> PersistResult:
     if not _is_tty():
         return _print_noninteractive_hint()
 
-    import questionary
+    import questionary as _qmod
+    questionary = _styled(_qmod)
 
+    console.print(
+        banner_panel(
+            "OpenSquilla Onboarding",
+            "Provider · Router · Channel · Search",
+        )
+    )
     spec, provider_id = _ask_provider_choice(questionary, options)
     answers = _ask_provider_fields(questionary, spec, options)
     res = upsert_llm_provider(
@@ -599,6 +846,11 @@ def run_interactive_onboard(options: OnboardOptions) -> PersistResult:
     ).ask():
         run_interactive_search_configure()
 
+    if not options.skip_image_generation and questionary.confirm(
+        "Enable image generation now?", default=False
+    ).ask():
+        run_interactive_image_generation_configure()
+
     return persist
 
 
@@ -606,7 +858,8 @@ def run_interactive_channel_add(type_name: str | None) -> PersistResult:
     if not _is_tty():
         return _print_noninteractive_hint()
 
-    import questionary
+    import questionary as _qmod
+    questionary = _styled(_qmod)
 
     if type_name is None:
         type_name = questionary.select(
@@ -616,6 +869,7 @@ def run_interactive_channel_add(type_name: str | None) -> PersistResult:
     spec = get_channel_setup_spec(type_name)
     _print_channel_intro(spec)
     answers = _ask_channel_fields(questionary, spec, type_name=type_name)
+    _warn_channel_dependency_gaps(spec, answers)
 
     cfg = load_config()
     res = upsert_channel(cfg, entry_payload=answers)
@@ -628,12 +882,16 @@ def run_interactive_channel_edit(name: str | None = None) -> PersistResult:
     if not _is_tty():
         return _print_noninteractive_hint()
 
-    import questionary
+    import questionary as _qmod
+    questionary = _styled(_qmod)
 
     cfg = load_config()
     existing_entries = [e.model_dump(mode="python") for e in cfg.channels.channels]
     if not existing_entries:
-        print("No channels to edit. Use 'configure --section channels' to add one.")
+        console.print(
+            f"[{ACCENT_DIM}]no channels to edit[/]"
+            " [dim]· run `configure --section channels` to add one[/dim]"
+        )
         return persist_config(cfg, restart_required=False, backup=False)
 
     if name is None:
@@ -652,6 +910,7 @@ def run_interactive_channel_edit(name: str | None = None) -> PersistResult:
         type_name=type_name,
         current={**target_entry, "name": name},
     )
+    _warn_channel_dependency_gaps(spec, answers)
 
     res = upsert_channel(cfg, entry_payload=answers)
     persisted = persist_config(res.config, restart_required=True)
@@ -664,7 +923,8 @@ def run_interactive_configure(section: str | None = None) -> PersistResult | Non
         _print_noninteractive_hint()
         return None
 
-    import questionary
+    import questionary as _qmod
+    questionary = _styled(_qmod)
 
     section = section or questionary.select(
         "Section",
@@ -687,8 +947,11 @@ def run_interactive_configure(section: str | None = None) -> PersistResult | Non
         return run_interactive_channel_add(None)
     if section == "search":
         return run_interactive_search_configure()
-    print(
-        f"Section {section!r} is not yet supported in the wizard. "
-        "Edit ~/.opensquilla/config.toml directly."
+    if section in {"image-generation", "image_generation"}:
+        return run_interactive_image_generation_configure()
+    console.print(
+        f"[{ACCENT_DIM}]section[/] [{ACCENT_SOFT}]{markup_escape(repr(section))}[/]"
+        " [dim]not yet supported in the wizard · edit "
+        "~/.opensquilla/config.toml directly[/dim]"
     )
     return None

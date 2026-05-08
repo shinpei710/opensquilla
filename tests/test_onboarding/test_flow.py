@@ -192,6 +192,7 @@ def test_interactive_onboard_prompts_router_defaults_before_persist(tmp_path, mo
             if message in {
                 "Configure a messaging channel now?",
                 "Configure web search now?",
+                "Enable image generation now?",
             }:
                 return _Answer(False)
             raise AssertionError(f"unexpected confirm prompt: {message}")
@@ -206,6 +207,152 @@ def test_interactive_onboard_prompts_router_defaults_before_persist(tmp_path, mo
     assert 'api_key_env = "OPENROUTER_API_KEY"' in data
     assert 'default_tier = "t2"' in data
     assert 'model = "z-ai/glm-5.1"' in data
+
+
+def test_interactive_onboard_can_enable_image_generation(tmp_path, monkeypatch):
+    import sys
+    import tomllib
+    import types
+
+    from opensquilla.onboarding import flow
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-image-env")
+    monkeypatch.setattr(flow, "_is_tty", lambda: True)
+
+    calls: list[str] = []
+
+    class _Answer:
+        def __init__(self, value):
+            self.value = value
+
+        def ask(self):
+            return self.value
+
+    class _Questionary(types.SimpleNamespace):
+        def select(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "LLM provider":
+                return _Answer("openrouter (OpenRouter)")
+            if message == "Router mode":
+                return _Answer("SquillaRouter")
+            if message == "Default text model":
+                return _Answer(kwargs.get("default"))
+            if message == "Image generation provider":
+                assert kwargs.get("default") == "openrouter (OpenRouter Images)"
+                return _Answer("openrouter (OpenRouter Images)")
+            if message == "Image API key source":
+                assert "Use environment variable OPENROUTER_API_KEY" in kwargs.get("choices", [])
+                return _Answer("Use environment variable OPENROUTER_API_KEY")
+            raise AssertionError(f"unexpected select prompt: {message}")
+
+        def text(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "Primary image model":
+                return _Answer(kwargs.get("default"))
+            if message == "Image base URL":
+                return _Answer(kwargs.get("default"))
+            raise AssertionError(f"unexpected text prompt: {message}")
+
+        def password(self, message: str, **_kwargs):
+            raise AssertionError(f"unexpected password prompt: {message}")
+
+        def confirm(self, message: str, **_kwargs):
+            calls.append(message)
+            if message == (
+                "Use OPENROUTER_API_KEY from this shell instead of storing the API key "
+                "in config? Detected now."
+            ):
+                return _Answer(True)
+            if message == "Edit router tier models now?":
+                return _Answer(False)
+            if message in {
+                "Configure a messaging channel now?",
+                "Configure web search now?",
+            }:
+                return _Answer(False)
+            if message == "Enable image generation now?":
+                return _Answer(True)
+            if message == "Image generation enabled?":
+                return _Answer(True)
+            raise AssertionError(f"unexpected confirm prompt: {message}")
+
+    monkeypatch.setitem(sys.modules, "questionary", _Questionary())
+
+    flow.run_interactive_onboard(flow.OnboardOptions())
+
+    assert calls.index("Enable image generation now?") > calls.index("Configure web search now?")
+    data = tomllib.loads(target.read_text())
+    assert data["image_generation"]["enabled"] is True
+    assert (
+        data["image_generation"]["primary"]
+        == "openrouter/google/gemini-3.1-flash-image-preview"
+    )
+
+
+def test_interactive_configure_image_generation_persists(tmp_path, monkeypatch):
+    import sys
+    import tomllib
+    import types
+
+    from opensquilla.onboarding import flow
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-image-env")
+    monkeypatch.setattr(flow, "_is_tty", lambda: True)
+
+    calls: list[str] = []
+
+    class _Answer:
+        def __init__(self, value):
+            self.value = value
+
+        def ask(self):
+            return self.value
+
+    class _Questionary(types.SimpleNamespace):
+        def select(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "Image generation provider":
+                return _Answer("openai (OpenAI Images)")
+            if message == "Image API key source":
+                return _Answer("Use environment variable OPENAI_API_KEY")
+            raise AssertionError(f"unexpected select prompt: {message}")
+
+        def text(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "Primary image model":
+                return _Answer(kwargs.get("default"))
+            if message == "Image base URL":
+                return _Answer(kwargs.get("default"))
+            raise AssertionError(f"unexpected text prompt: {message}")
+
+        def password(self, message: str, **_kwargs):
+            raise AssertionError(f"unexpected password prompt: {message}")
+
+        def confirm(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "Image generation enabled?":
+                assert kwargs.get("default") is True
+                return _Answer(True)
+            raise AssertionError(f"unexpected confirm prompt: {message}")
+
+    monkeypatch.setitem(sys.modules, "questionary", _Questionary())
+
+    flow.run_interactive_configure("image-generation")
+
+    assert calls == [
+        "Image generation provider",
+        "Primary image model",
+        "Image API key source",
+        "Image base URL",
+        "Image generation enabled?",
+    ]
+    data = tomllib.loads(target.read_text())
+    assert data["image_generation"]["enabled"] is True
+    assert data["image_generation"]["primary"] == "openai/gpt-image-1"
 
 
 def test_router_tier_overrides_edit_only_selected_tiers():
@@ -253,7 +400,7 @@ def test_router_tier_overrides_edit_only_selected_tiers():
 
 
 def test_interactive_feishu_websocket_prompts_only_core_fields(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, capsys
 ):
     import sys
     import types
@@ -263,6 +410,7 @@ def test_interactive_feishu_websocket_prompts_only_core_fields(
     target = tmp_path / "c.toml"
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
     monkeypatch.setattr(flow, "_is_tty", lambda: True)
+    monkeypatch.setattr(flow.importlib.util, "find_spec", lambda name: None)
 
     calls: list[str] = []
 
@@ -305,6 +453,9 @@ def test_interactive_feishu_websocket_prompts_only_core_fields(
 
     flow.run_interactive_channel_add(None)
 
+    out = capsys.readouterr().out
+    assert "Feishu websocket mode requires the optional feishu extra" in out
+    assert "opensquilla[feishu]" in out
     assert calls == ["Channel type", "Channel name", "App id", "App secret", "Connection mode"]
     data = target.read_text()
     assert 'type = "feishu"' in data
@@ -352,7 +503,10 @@ def test_search_provider_key_defaults_to_env_reference(monkeypatch):
         def confirm(self, message: str, **kwargs):
             if message == "Use environment proxy for search?":
                 return _Answer(False)
-            if message == "Enable search diagnostics?":
+            if message == (
+                "Enable search diagnostics? Include provider attempt/error details "
+                "for troubleshooting?"
+            ):
                 return _Answer(False)
             raise AssertionError(f"unexpected confirm prompt: {message}")
 
@@ -373,6 +527,61 @@ def test_search_provider_key_defaults_to_env_reference(monkeypatch):
 
     assert answers["api_key"] == ""
     assert answers["api_key_env"] == "BRAVE_SEARCH_API_KEY"
+
+
+def test_search_fallback_choice_names_duckduckgo_and_persists_value(monkeypatch):
+    from opensquilla.onboarding.flow import _ask_search_fields
+    from opensquilla.onboarding.search_specs import get_search_provider_setup_spec
+
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+
+    class _Answer:
+        def __init__(self, value):
+            self.value = value
+
+        def ask(self):
+            return self.value
+
+    class _Questionary:
+        def select(self, message: str, **kwargs):
+            if message == "Search API key source":
+                return _Answer("Use environment variable BRAVE_SEARCH_API_KEY")
+            if message == "Search fallback policy":
+                choices = kwargs.get("choices")
+                assert choices == [
+                    "off - no fallback; surface the original provider error",
+                    "network - retry with DuckDuckGo on timeout/network errors",
+                ]
+                assert kwargs.get("default") == choices[0]
+                return _Answer(choices[1])
+            raise AssertionError(f"unexpected select prompt: {message}")
+
+        def confirm(self, message: str, **_kwargs):
+            if message == "Use environment proxy for search?":
+                return _Answer(False)
+            if message == (
+                "Enable search diagnostics? Include provider attempt/error details "
+                "for troubleshooting?"
+            ):
+                return _Answer(False)
+            raise AssertionError(f"unexpected confirm prompt: {message}")
+
+        def password(self, message: str, **_kwargs):
+            raise AssertionError(f"unexpected password prompt: {message}")
+
+        def text(self, message: str, **kwargs):
+            if message == "Max search results":
+                return _Answer(kwargs.get("default"))
+            if message == "Search HTTP proxy":
+                return _Answer("")
+            raise AssertionError(f"unexpected text prompt: {message}")
+
+    answers = _ask_search_fields(
+        _Questionary(),
+        get_search_provider_setup_spec("brave"),
+    )
+
+    assert answers["fallback_policy"] == "network"
 
 
 def test_search_provider_can_use_masked_api_key_prompt(monkeypatch):
@@ -410,7 +619,10 @@ def test_search_provider_can_use_masked_api_key_prompt(monkeypatch):
         def confirm(self, message: str, **_kwargs):
             if message == "Use environment proxy for search?":
                 return _Answer(False)
-            if message == "Enable search diagnostics?":
+            if message == (
+                "Enable search diagnostics? Include provider attempt/error details "
+                "for troubleshooting?"
+            ):
                 return _Answer(False)
             raise AssertionError(f"unexpected confirm prompt: {message}")
 

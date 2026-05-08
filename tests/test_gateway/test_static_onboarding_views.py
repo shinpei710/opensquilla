@@ -75,6 +75,20 @@ def test_setup_view_keeps_channel_fields_in_config_shape():
     assert "scope === 'channel' ? label.dataset.name : _camel" in txt
 
 
+def test_setup_view_renders_catalog_field_descriptions():
+    txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
+    assert "field.description" in txt
+    assert "setup-field-desc" in txt
+
+
+def test_setup_view_warns_when_env_key_is_not_visible_to_gateway():
+    txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
+    assert "missing_env" in txt
+    assert "not visible to this gateway process" in txt
+    assert "Set it before starting or restarting the gateway" in txt
+    assert "if (_providerEnvMissing())" in txt
+
+
 def test_setup_view_preserves_selected_channel_type_while_redrawing_fields():
     txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
     assert "let _channelType" in txt
@@ -107,6 +121,19 @@ def test_setup_view_treats_image_configure_as_capability_enable_action():
     txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
     assert "field.default !== false" in txt
     assert "imageGenerationEnabled === false" in txt
+
+
+def test_setup_view_explains_image_generation_tool_visibility():
+    txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
+    assert "image_generate is hidden from agents" in txt
+    assert "image_generate will be available in new turns" in txt
+
+
+def test_setup_view_preserves_selected_image_generation_provider():
+    txt = (VIEWS / "setup.js").read_text(encoding="utf-8")
+    assert "imageProviderSelected" in txt
+    assert "imageGenerationProvider" in txt
+    assert "imageGenerationPrimary || '').split('/')[0]" in txt
 
 
 def test_setup_router_controls_use_user_facing_labels():

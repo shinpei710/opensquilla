@@ -182,6 +182,20 @@
   font-weight: 500;
 }
 
+.setup-warning {
+  border: 1px solid color-mix(in srgb, var(--warn) 50%, var(--border));
+  border-left: 3px solid var(--warn);
+  border-radius: var(--radius-md);
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--warn) 10%, transparent), transparent 42%),
+    var(--bg-surface);
+  color: var(--text);
+  padding: var(--sp-3) var(--sp-4);
+  font-size: var(--fs-sm);
+  font-weight: 500;
+  line-height: 1.45;
+}
+
 /* ─── Stepper — connected rail with calibrated marks ─────────────────── */
 
 .setup-stepper {
@@ -413,6 +427,19 @@
     background var(--transition),
     box-shadow var(--transition);
 }
+
+.setup-field-desc {
+  display: block;
+  margin-top: -2px;
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 1.35;
+  text-transform: none;
+}
+
 .setup-form input:hover,
 .setup-form select:hover,
 .setup-mini input:hover,
