@@ -3,22 +3,29 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any
+from typing import Any, TypeGuard
 
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
 from opensquilla.scheduler.payloads import (
-    AGENT_TURN_KIND,
+    REMINDER_KIND,
     SYSTEM_EVENT_KIND,
     make_agent_turn_payload,
+    make_reminder_payload,
     make_system_event_payload,
     payload_agent_id,
     payload_kind,
     payload_text,
 )
+from opensquilla.scheduler.schedule_normalizer import (
+    coerce_schedule,
+    coerce_schedule_from_params,
+)
 from opensquilla.scheduler.types import (
     DeliveryConfig,
     DeliveryMode,
+    FailureDestination,
     ReplyTargetSnapshot,
+    ScheduleKind,
     SessionTarget,
 )
 
@@ -42,18 +49,41 @@ def _job_to_wire(j: Any) -> dict[str, Any]:
     session_target = str(d.get("session_target", "isolated"))
     wake_mode = d.get("wake_mode", "now")
     wake_mode_str = wake_mode.value if hasattr(wake_mode, "value") else str(wake_mode)
-    delivery = None if session_target == "main" else d.get("delivery")
+    raw_delivery = d.get("delivery")
+    # Webhook delivery is permitted for any sessionTarget (including main); only
+    # channel/announce modes are suppressed for main because the heartbeat
+    # pipeline handles routing there. Suppressing webhook for main caused
+    # round-trip data loss on read-back.
+    if session_target == "main" and raw_delivery is not None:
+        if isinstance(raw_delivery, dict):
+            mode_value = raw_delivery.get("mode") or ""
+        else:
+            mode_attr = getattr(raw_delivery, "mode", None)
+            mode_value = getattr(mode_attr, "value", "") or str(mode_attr or "")
+        mode_norm = mode_value.strip().lower() if isinstance(mode_value, str) else ""
+        delivery = raw_delivery if mode_norm == "webhook" else None
+    else:
+        delivery = raw_delivery
     text = payload_text(payload, session_target)
     kind = payload_kind(payload, session_target)
-    return {
+    schedule_kind_value = d.get("schedule_kind", "cron")
+    schedule_kind_str = (
+        schedule_kind_value.value
+        if hasattr(schedule_kind_value, "value")
+        else str(schedule_kind_value)
+    )
+    return {  # noqa: PIE810 — wire schema favors flat literal dict
         "id": d.get("id"),
         "name": d.get("name", ""),
-        "expression": d.get("schedule_raw") or d.get("cron_expr", ""),
+        # Always serve the normalized expression so the WebUI cron editor can
+        # parse it as a 5-field cron. Historical raw text lives in scheduleRaw.
+        "expression": d.get("cron_expr", "") or "",
         "prompt": text,
         "message": text,
         "text": text,
         "payloadKind": kind,
         "agentId": payload_agent_id(payload, "main"),
+        "status": status_str,
         "enabled": (
             bool(d.get("enabled", True)) and status_str not in ("paused", "disabled", "deleted")
         ),
@@ -63,8 +93,11 @@ def _job_to_wire(j: Any) -> dict[str, Any]:
         "run_count": d.get("run_count", 0),
         "error_count": d.get("error_count", 0),
         "created_at": _iso(d.get("created_at")),
-        "schedule_kind": str(d.get("schedule_kind", "cron")),
+        "schedule_kind": schedule_kind_str,
+        "scheduleKind": schedule_kind_str,
         "schedule_raw": d.get("schedule_raw", ""),
+        "scheduleRaw": d.get("schedule_raw", ""),
+        "tz": d.get("tz", "") or "",
         "session_target": session_target,
         "sessionTarget": session_target,
         "targetSessionKey": d.get("session_key", ""),
@@ -74,6 +107,28 @@ def _job_to_wire(j: Any) -> dict[str, Any]:
         "consecutive_errors": d.get("consecutive_errors", 0),
         "delivery": _delivery_to_wire(delivery),
         "toolPolicy": _tool_policy_to_wire(d.get("tool_policy")),
+    }
+
+
+def _failure_destination_to_wire(fd: Any) -> dict[str, Any] | None:
+    if fd is None:
+        return None
+    if isinstance(fd, dict):
+        return {
+            "mode": fd.get("mode", "none"),
+            "channelName": fd.get("channel_name", ""),
+            "channelId": fd.get("channel_id", ""),
+            "accountId": fd.get("account_id", ""),
+            "webhookUrl": fd.get("webhook_url", "") or "",
+        }
+    mode = getattr(fd, "mode", None)
+    mode_str = getattr(mode, "value", str(mode)) if mode is not None else "none"
+    return {
+        "mode": mode_str,
+        "channelName": getattr(fd, "channel_name", ""),
+        "channelId": getattr(fd, "channel_id", ""),
+        "accountId": getattr(fd, "account_id", ""),
+        "webhookUrl": getattr(fd, "webhook_url", "") or "",
     }
 
 
@@ -87,6 +142,11 @@ def _delivery_to_wire(delivery: Any) -> dict[str, Any]:
             "channelId": delivery.get("channel_id", ""),
             "accountId": delivery.get("account_id", ""),
             "threadId": delivery.get("thread_id", ""),
+            "webhookUrl": delivery.get("webhook_url", "") or "",
+            "bestEffort": bool(delivery.get("best_effort", False)),
+            "failureDestination": _failure_destination_to_wire(
+                delivery.get("failure_destination")
+            ),
         }
     return {
         "mode": (
@@ -98,6 +158,11 @@ def _delivery_to_wire(delivery: Any) -> dict[str, Any]:
         "channelId": getattr(delivery, "channel_id", ""),
         "accountId": getattr(delivery, "account_id", ""),
         "threadId": getattr(delivery, "thread_id", ""),
+        "webhookUrl": getattr(delivery, "webhook_url", "") or "",
+        "bestEffort": bool(getattr(delivery, "best_effort", False)),
+        "failureDestination": _failure_destination_to_wire(
+            getattr(delivery, "failure_destination", None)
+        ),
     }
 
 
@@ -185,6 +250,26 @@ def _iso(dt: object) -> str | None:
     return dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
 
 
+def _coerce_schedule(raw: Any) -> tuple[ScheduleKind, str, str]:
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "schedule must be an object {kind:'cron'|'every'|'at', ...}; "
+            f"got {type(raw).__name__}"
+        )
+    return coerce_schedule(raw)
+
+
+def _schedule_from_params(params: dict[str, Any]) -> tuple[ScheduleKind, str, str]:
+    """Resolve the structured schedule from RPC params.
+
+    Preferred shape: ``params["schedule"]`` is a discriminated-union object.
+    CLI shim: when ``schedule`` is absent and ``expression`` is a non-empty
+    string, treat it as ``{kind:'cron', expr, tz}`` so legacy CLI callers
+    (cli/cron_cmd.py) keep working without an extra wrapper.
+    """
+    return coerce_schedule_from_params(params)
+
+
 def _resolve_session_target(params: dict[str, Any]) -> SessionTarget:
     raw = params.get("sessionTarget")
     if isinstance(raw, str) and raw.strip():
@@ -239,6 +324,68 @@ def _resolve_wake_mode(params: dict[str, Any], current: Any = "now") -> str:
     return value
 
 
+def _is_webhook_delivery(delivery_raw: Any) -> TypeGuard[dict[str, Any]]:
+    if not isinstance(delivery_raw, dict):
+        return False
+    mode = delivery_raw.get("mode")
+    return isinstance(mode, str) and mode.strip().lower() == "webhook"
+
+
+def _build_failure_destination(raw: Any) -> FailureDestination | None:
+    """Parse delivery.failureDestination wire payload into a FailureDestination."""
+    from opensquilla.scheduler.delivery import validate_webhook_url
+
+    if not isinstance(raw, dict):
+        return None
+    mode_str = raw.get("mode", "")
+    if not isinstance(mode_str, str):
+        return None
+    mode_norm = mode_str.strip().lower()
+    if mode_norm not in ("channel", "webhook", "announce"):
+        return None
+    if mode_norm == "announce":
+        mode_norm = "channel"
+    if mode_norm == "webhook":
+        url = raw.get("webhookUrl") or raw.get("to") or ""
+        if not url:
+            raise ValueError(
+                "failureDestination mode='webhook' requires webhookUrl"
+            )
+        validate_webhook_url(str(url))
+        return FailureDestination(
+            mode=DeliveryMode.WEBHOOK,
+            webhook_url=str(url),
+            webhook_token=str(raw.get("webhookToken") or raw.get("token") or ""),
+        )
+    return FailureDestination(
+        mode=DeliveryMode.CHANNEL,
+        channel_name=str(raw.get("channelName") or raw.get("channel") or ""),
+        channel_id=str(raw.get("channelId") or raw.get("to") or ""),
+        account_id=str(raw.get("accountId") or ""),
+        thread_id=str(raw.get("threadId") or ""),
+    )
+
+
+def _build_webhook_delivery(delivery_raw: dict[str, Any]) -> DeliveryConfig:
+    """Construct a webhook DeliveryConfig from an RPC delivery payload."""
+    from opensquilla.scheduler.delivery import validate_webhook_url
+
+    url = delivery_raw.get("webhookUrl") or delivery_raw.get("to") or ""
+    token = delivery_raw.get("webhookToken") or delivery_raw.get("token") or ""
+    best_effort = bool(delivery_raw.get("bestEffort", False))
+    validate_webhook_url(str(url))
+    failure_destination = _build_failure_destination(
+        delivery_raw.get("failureDestination")
+    )
+    return DeliveryConfig(
+        mode=DeliveryMode.WEBHOOK,
+        webhook_url=str(url),
+        webhook_token=str(token),
+        best_effort=best_effort,
+        failure_destination=failure_destination,
+    )
+
+
 def _parse_delivery_overrides(delivery_raw: Any) -> dict[str, str] | None:
     if not isinstance(delivery_raw, dict) or not delivery_raw.get("channelName"):
         return None
@@ -255,6 +402,9 @@ def _ensure_delivery_supported(
     session_target: SessionTarget,
     delivery_raw: Any,
 ) -> None:
+    if _is_webhook_delivery(delivery_raw):
+        # Webhook delivery is permitted for any sessionTarget.
+        return
     if session_target != SessionTarget.MAIN:
         return
     if isinstance(delivery_raw, dict) and delivery_raw.get("mode") == "none":
@@ -294,7 +444,7 @@ def _build_payload(
     text = raw_text if isinstance(raw_text, str) else ""
     kind = params.get("payloadKind")
     if not isinstance(kind, str) or not kind:
-        kind = SYSTEM_EVENT_KIND if session_target == SessionTarget.MAIN else AGENT_TURN_KIND
+        kind = SYSTEM_EVENT_KIND if session_target == SessionTarget.MAIN else REMINDER_KIND
     agent_id = params.get("agentId", "main")
     if require_text and not text.strip():
         raise ValueError("Cron text is required")
@@ -302,9 +452,21 @@ def _build_payload(
         if session_target != SessionTarget.MAIN:
             raise ValueError("payloadKind='system_event' requires sessionTarget='main'")
         return kind, make_system_event_payload(text, agent_id)
+    if kind == REMINDER_KIND:
+        if session_target == SessionTarget.MAIN:
+            raise ValueError("payloadKind='reminder' cannot use sessionTarget='main'")
+        return kind, make_reminder_payload(text, agent_id)
     if session_target == SessionTarget.MAIN:
         raise ValueError("payloadKind='agent_turn' cannot use sessionTarget='main'")
     return kind, make_agent_turn_payload(text, agent_id)
+
+
+def _handler_key_for_payload_kind(kind: str) -> str:
+    if kind == SYSTEM_EVENT_KIND:
+        return "system_event"
+    if kind == REMINDER_KIND:
+        return "static_message"
+    return "agent_run"
 
 
 @_d.method("cron.list", scope="operator.read")
@@ -334,9 +496,8 @@ async def _handle_cron_status(params: dict | None, ctx: RpcContext) -> dict[str,
 @_d.method("cron.add", scope="operator.admin")
 async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if not isinstance(params, dict):
-        raise ValueError("params required: expression, text")
-    if "expression" not in params:
-        raise ValueError("params.expression is required")
+        raise ValueError("params required: schedule (object) or expression (string)")
+    schedule_kind, schedule_value, schedule_tz = _schedule_from_params(params)
     session_target = _resolve_session_target(params)
     payload_kind_name, payload = _build_payload(params, session_target, require_text=True)
     text = payload_text(payload, session_target)
@@ -345,10 +506,29 @@ async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, An
     delivery_raw = params.get("delivery")
     _ensure_delivery_supported(session_target=session_target, delivery_raw=delivery_raw)
     scheduler = _require_scheduler(ctx)
+
+    # Webhook delivery bypasses session-based channel inference entirely.
+    if _is_webhook_delivery(delivery_raw):
+        webhook_delivery = _build_webhook_delivery(delivery_raw)
+        return await _finalize_cron_add(
+            scheduler=scheduler,
+            params=params,
+            text=text,
+            payload=payload,
+            payload_kind_name=payload_kind_name,
+            session_target=session_target,
+            target_session_key=target_session_key,
+            origin_session_key=origin_session_key,
+            delivery=webhook_delivery,
+            schedule_kind=schedule_kind,
+            schedule_value=schedule_value,
+            schedule_tz=schedule_tz,
+        )
+
     # Infer or parse delivery config
     user_overrides = _parse_delivery_overrides(delivery_raw)
 
-    delivery = None
+    delivery: DeliveryConfig | None = None
     try:
         from opensquilla.scheduler.delivery import infer_delivery
 
@@ -379,10 +559,60 @@ async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, An
         delivery = delivery or DeliveryConfig()
         delivery.originating_reply_target = snapshot
 
+    if isinstance(delivery_raw, dict) and delivery_raw.get("failureDestination") is not None:
+        if delivery is None:
+            delivery = DeliveryConfig()
+        delivery.failure_destination = _build_failure_destination(
+            delivery_raw["failureDestination"]
+        )
+
+    return await _finalize_cron_add(
+        scheduler=scheduler,
+        params=params,
+        text=text,
+        payload=payload,
+        payload_kind_name=payload_kind_name,
+        session_target=session_target,
+        target_session_key=target_session_key,
+        origin_session_key=origin_session_key,
+        delivery=delivery,
+        schedule_kind=schedule_kind,
+        schedule_value=schedule_value,
+        schedule_tz=schedule_tz,
+    )
+
+
+async def _finalize_cron_add(
+    *,
+    scheduler: Any,
+    params: dict[str, Any],
+    text: str,
+    payload: dict[str, Any],
+    payload_kind_name: str,
+    session_target: SessionTarget,
+    target_session_key: str,
+    origin_session_key: str,
+    delivery: DeliveryConfig | None,
+    schedule_kind: ScheduleKind,
+    schedule_value: str,
+    schedule_tz: str,
+) -> dict[str, Any]:
+    tz_value = (
+        schedule_tz
+        or (params.get("tz") if isinstance(params.get("tz"), str) else "")
+        or (params.get("timezone") if isinstance(params.get("timezone"), str) else "")
+        or ""
+    )
+    jitter_seconds: float | None = None
+    if "jitterSeconds" in params or "staggerSeconds" in params:
+        raw_jitter = params.get("jitterSeconds", params.get("staggerSeconds"))
+        if isinstance(raw_jitter, (int, float)) and raw_jitter >= 0:
+            jitter_seconds = float(raw_jitter)
+    elif params.get("exact") is True:
+        jitter_seconds = 0.0
     job = await scheduler.add_job(
         name=params.get("name") or text,
-        schedule_raw=params.get("schedule") or params["expression"],
-        handler_key="system_event" if payload_kind_name == SYSTEM_EVENT_KIND else "agent_run",
+        handler_key=_handler_key_for_payload_kind(payload_kind_name),
         payload=payload,
         session_target=session_target,
         session_key=target_session_key,
@@ -391,6 +621,12 @@ async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, An
         delivery=delivery,
         origin_session_key=origin_session_key,
         tool_policy=_tool_policy_from_params(params),
+        tz=tz_value,
+        jitter_seconds=jitter_seconds,
+        creator_is_owner=True,
+        schedule_kind=schedule_kind,
+        schedule_value=schedule_value,
+        schedule_tz=tz_value,
     )
     # Populate ws_topic
     if job.delivery and not job.delivery.ws_topic:
@@ -416,8 +652,23 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
     if "name" in params:
         patch["name"] = params["name"]
 
-    if "expression" in params or "schedule" in params:
-        patch["schedule_raw"] = params.get("schedule") or params.get("expression")
+    tz_was_supplied = "tz" in params or "timezone" in params
+    if "schedule" in params or "expression" in params:
+        sched_kind, sched_value, sched_tz = _schedule_from_params(params)
+        patch["schedule_kind"] = sched_kind
+        patch["schedule_value"] = sched_value
+        schedule_raw = params.get("schedule")
+        schedule_tz_was_supplied = (
+            isinstance(schedule_raw, dict) and "tz" in schedule_raw
+        )
+        if sched_kind == ScheduleKind.CRON and (
+            sched_tz or tz_was_supplied or schedule_tz_was_supplied
+        ):
+            patch["schedule_tz"] = sched_tz
+
+    if tz_was_supplied:
+        tz_value = params.get("tz") if "tz" in params else params.get("timezone")
+        patch["tz"] = tz_value if isinstance(tz_value, str) else ""
 
     if "enabled" in params:
         if params["enabled"]:
@@ -433,6 +684,15 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
     current_job = await scheduler.get_job(params["id"])
     if current_job is None:
         raise KeyError(f"Cron job not found: {params['id']}")
+
+    if (
+        tz_was_supplied
+        and "schedule_kind" not in patch
+        and current_job.schedule_kind == ScheduleKind.CRON
+    ):
+        patch["schedule_kind"] = ScheduleKind.CRON
+        patch["schedule_value"] = current_job.cron_expr
+        patch["schedule_tz"] = patch.get("tz", "")
 
     payload_related = any(
         key in params
@@ -496,9 +756,7 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
             session_target,
             require_text=False,
         )
-        patch["handler_key"] = (
-            "system_event" if payload_kind_name == SYSTEM_EVENT_KIND else "agent_run"
-        )
+        patch["handler_key"] = _handler_key_for_payload_kind(payload_kind_name)
         patch["payload"] = payload
         patch["session_target"] = session_target
         patch["session_key"] = _resolve_target_session_key(merged_params, session_target)
@@ -521,14 +779,44 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
         _ensure_delivery_supported(session_target=effective_target, delivery_raw=delivery_raw)
         if isinstance(delivery_raw, dict) and delivery_raw.get("mode") == "none":
             patch["delivery"] = DeliveryConfig()
+        elif _is_webhook_delivery(delivery_raw):
+            new_delivery = _build_webhook_delivery(delivery_raw)
+            new_delivery.ws_topic = current_job.delivery.ws_topic
+            patch["delivery"] = new_delivery
         elif isinstance(delivery_raw, dict) and delivery_raw.get("channelName"):
-            patch["delivery"] = type(current_job.delivery)(
-                mode=type(current_job.delivery.mode).CHANNEL,
+            patch["delivery"] = DeliveryConfig(
+                mode=DeliveryMode.CHANNEL,
                 channel_name=delivery_raw["channelName"],
-                channel_id=delivery_raw.get("channelId", ""),
+                channel_id=delivery_raw.get("channelId") or delivery_raw.get("to", ""),
                 account_id=delivery_raw.get("accountId", ""),
                 thread_id=delivery_raw.get("threadId", ""),
                 ws_topic=current_job.delivery.ws_topic,
+                best_effort=bool(delivery_raw.get("bestEffort", False)),
+                failure_destination=_build_failure_destination(
+                    delivery_raw.get("failureDestination")
+                ),
+            )
+        elif (
+            isinstance(delivery_raw, dict)
+            and delivery_raw.get("failureDestination") is not None
+        ):
+            # Standalone FD patch: keep the existing primary delivery target,
+            # only update the failure_destination side.
+            existing = current_job.delivery
+            patch["delivery"] = DeliveryConfig(
+                mode=existing.mode,
+                channel_name=existing.channel_name,
+                channel_id=existing.channel_id,
+                account_id=existing.account_id,
+                thread_id=existing.thread_id,
+                ws_topic=existing.ws_topic,
+                originating_reply_target=existing.originating_reply_target,
+                webhook_url=existing.webhook_url,
+                webhook_token=existing.webhook_token,
+                best_effort=existing.best_effort,
+                failure_destination=_build_failure_destination(
+                    delivery_raw["failureDestination"]
+                ),
             )
 
     if "toolPolicy" in params or "tool_policy" in params:

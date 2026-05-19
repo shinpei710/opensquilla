@@ -1,4 +1,4 @@
-name: Portable Zip Release
+name: Windows Release Assets
 
 on:
   push:
@@ -22,6 +22,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: windows-release-assets-${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag || github.run_id }}
+  cancel-in-progress: false
+
 env:
   RELEASE_PROFILE: recommended
   RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
@@ -29,26 +33,61 @@ env:
   PYTHON_RUNTIME_VERSION: ${{ github.event.inputs.python_runtime_version || '3.12.13' }}
 
 jobs:
-  build-portable:
-    name: Build ${{ matrix.platform_tag }} portable zip
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            platform_tag: windows-x64
-
+  build-release-assets:
+    name: Build Windows release assets
+    runs-on: windows-latest
+    timeout-minutes: 90
     steps:
+      - name: Validate workflow inputs
+        shell: bash
+        run: |
+          if [[ -n "${RELEASE_TAG}" && ! "${RELEASE_TAG}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+.*$ ]]; then
+            echo "Release tag must look like v0.2.0rc1 or v0.2.0: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          if [[ ! "${PYTHON_RUNTIME_RELEASE}" =~ ^[0-9]{8}$ ]]; then
+            echo "python_runtime_release must be a YYYYMMDD python-build-standalone release tag." >&2
+            exit 1
+          fi
+          if [[ ! "${PYTHON_RUNTIME_VERSION}" =~ ^3[.]12[.][0-9]+$ ]]; then
+            echo "python_runtime_version must be a CPython 3.12 patch version." >&2
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@v4
         with:
           lfs: true
+          persist-credentials: false
           ref: ${{ env.RELEASE_TAG != '' && env.RELEASE_TAG || github.ref }}
 
       - name: Hydrate router assets
         shell: bash
         run: git lfs pull --include="src/opensquilla/squilla_router/models/**"
+
+      - name: Verify router assets are hydrated
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          root = Path("src/opensquilla/squilla_router/models/v4.2_phase3_inference")
+          required = [
+              root / "PROVENANCE.md",
+              root / "artifact_manifest.json",
+              root / "bge_onnx" / "model.onnx",
+              root / "features" / "tfidf.pkl",
+              root / "lgbm_main.bin",
+              root / "mlp" / "model.onnx",
+              root / "router.runtime.yaml",
+          ]
+          for path in required:
+              assert path.is_file(), f"missing router asset: {path}"
+              prefix = path.read_bytes()[:80]
+              assert not prefix.startswith(b"version https://git-lfs.github.com/spec/v1"), (
+                  f"Git LFS pointer file is not hydrated: {path}"
+              )
+          PY
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -80,116 +119,178 @@ jobs:
       - name: Test release builder
         run: uv run --extra dev pytest tests/test_scripts/test_build_wheelhouse_zip.py
 
-      - name: Build portable zip
+      - name: Build versioned portable zip
         shell: bash
         run: |
           rm -rf dist build/wheelhouse-zip
           python scripts/build_wheelhouse_zip.py \
             --profile "${RELEASE_PROFILE}" \
-            --platform-tag "${{ matrix.platform_tag }}" \
+            --platform-tag windows-x64 \
             --python-runtime-release "${PYTHON_RUNTIME_RELEASE}" \
             --python-runtime-version "${PYTHON_RUNTIME_VERSION}" \
             --bundle-python-runtime
 
-      - name: Smoke release artifacts
+      - name: Collect versioned wheel
         shell: bash
         run: |
           python - <<'PY'
-          import hashlib
+          import shutil
+          from pathlib import Path
+
+          wheels = sorted(Path("build/wheelhouse-zip/wheels").glob("opensquilla-*.whl"))
+          assert len(wheels) == 1, f"expected one built wheel, got {len(wheels)}"
+          shutil.copy2(wheels[0], Path("dist") / wheels[0].name)
+          PY
+
+      - name: Smoke versioned release artifacts
+        shell: bash
+        run: |
+          python - <<'PY'
           import json
           import tomllib
           from pathlib import Path
           from zipfile import ZipFile
 
           version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
-          zips = sorted(Path("dist").glob("*.zip"))
-          assert len(zips) == 1, f"expected one portable zip, got {len(zips)}"
-          checksum_lines = []
+          zips = sorted(
+              path for path in Path("dist").glob("OpenSquilla-*.zip")
+              if path.name != "OpenSquilla-windows-x64-portable.zip"
+          )
+          wheels = sorted(
+              path for path in Path("dist").glob("opensquilla-*.whl")
+              if path.name != "opensquilla-latest-py3-none-any.whl"
+          )
+          assert len(zips) == 1, f"expected one versioned portable zip, got {len(zips)}"
+          assert len(wheels) == 1, f"expected one versioned wheel, got {len(wheels)}"
+          assert zips[0].name == (
+              f"OpenSquilla-{version}-windows-x64-py312-recommended-portable.zip"
+          )
+          assert wheels[0].name == f"opensquilla-{version}-py3-none-any.whl"
 
-          for zip_path in zips:
-              digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
-              checksum_lines.append(f"{digest}  {zip_path.name}")
-              per_zip = Path(str(zip_path) + ".sha256")
-              assert per_zip.is_file(), f"missing checksum for {zip_path.name}"
-              assert per_zip.read_text(encoding="utf-8").strip() == checksum_lines[-1]
+          with ZipFile(zips[0]) as archive:
+              names = set(archive.namelist())
+              archive_roots = sorted({name.split("/", 1)[0] for name in names if "/" in name})
+              assert len(archive_roots) == 1, f"expected one archive root: {archive_roots}"
+              root = archive_roots[0] + "/"
+              manifest = json.loads(archive.read(root + "manifest.json"))
+              assert manifest["version"] == version, "manifest.version must match project version"
+              assert manifest["platform_tag"] == "windows-x64"
+              assert root + "LICENSE" in names
+              assert root + "THIRD_PARTY_NOTICES.md" in names
+              assert root + "README.md" in names
+              assert root + "packages/" + manifest["wheel_name"] in names
+              assert manifest["portable"] is True
+              assert root + "start.sh" in names
+              assert root + "start.ps1" in names
+              assert root + "Start OpenSquilla.cmd" in names
+              assert root + "install.sh" not in names
+              assert root + "install.ps1" not in names
+              assert any(name.startswith(root + "runtime/python/") for name in names)
 
-              with ZipFile(zip_path) as archive:
-                  names = set(archive.namelist())
-                  archive_roots = sorted({name.split("/", 1)[0] for name in names if "/" in name})
-                  assert len(archive_roots) == 1, f"expected one archive root in {zip_path.name}: {archive_roots}"
-                  root = archive_roots[0] + "/"
-                  manifest = json.loads(archive.read(root + "manifest.json"))
-                  assert manifest["version"] == version, "manifest.version must match project version"
-                  assert manifest["platform_tag"] == "${{ matrix.platform_tag }}"
-                  assert root + "LICENSE" in names
-                  assert root + "THIRD_PARTY_NOTICES.md" in names
-                  assert root + "README.md" in names
-                  assert root + "packages/" + manifest["wheel_name"] in names
-                  assert manifest["portable"] is True
+          with ZipFile(wheels[0]) as archive:
+              for info in archive.infolist():
+                  if not info.filename.endswith((".bin", ".onnx", ".pkl", ".joblib")):
+                      continue
+                  prefix = archive.read(info)[:80]
+                  assert not prefix.startswith(b"version https://git-lfs.github.com/spec/v1"), (
+                      f"Git LFS pointer leaked into wheel: {info.filename}"
+                  )
+          PY
 
-                  assert root + "start.sh" in names
-                  assert root + "start.ps1" in names
-                  assert root + "install.sh" not in names
-                  assert root + "install.ps1" not in names
-                  assert any(name.startswith(root + "runtime/python/") for name in names)
+      - name: Create stable release assets
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import shutil
+          from pathlib import Path
 
-          sha256s = Path("dist/SHA256SUMS")
-          assert sha256s.is_file(), "missing aggregate SHA256SUMS"
-          assert sha256s.read_text(encoding="utf-8").splitlines() == checksum_lines
+          dist = Path("dist")
+          zips = sorted(
+              path for path in dist.glob("OpenSquilla-*.zip")
+              if path.name != "OpenSquilla-windows-x64-portable.zip"
+          )
+          wheels = sorted(
+              path for path in dist.glob("opensquilla-*.whl")
+              if path.name != "opensquilla-latest-py3-none-any.whl"
+          )
+          assert len(zips) == 1, f"expected one versioned portable zip, got {len(zips)}"
+          assert len(wheels) == 1, f"expected one versioned wheel, got {len(wheels)}"
+          stable_zip = dist / "OpenSquilla-windows-x64-portable.zip"
+          stable_wheel = dist / "opensquilla-latest-py3-none-any.whl"
+          shutil.copy2(zips[0], stable_zip)
+          shutil.copy2(wheels[0], stable_wheel)
+          assets = [zips[0], stable_zip, wheels[0], stable_wheel]
+          lines = [
+              f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}"
+              for path in assets
+          ]
+          (dist / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
           PY
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: opensquilla-zips-${{ matrix.platform_tag }}-${{ env.RELEASE_PROFILE }}
+          name: opensquilla-release-assets-windows-x64-${{ env.RELEASE_PROFILE }}
           path: |
             dist/*.zip
-            dist/*.zip.sha256
+            dist/*.whl
+            dist/SHA256SUMS
 
   publish-release:
-    name: Aggregate release zips
-    needs: build-portable
+    name: Publish release assets
+    needs: build-release-assets
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
-      - name: Download platform artifacts
+      - name: Download release assets
         uses: actions/download-artifact@v4
         with:
-          pattern: opensquilla-zips-*-${{ env.RELEASE_PROFILE }}
+          pattern: opensquilla-release-assets-windows-x64-${{ env.RELEASE_PROFILE }}
           path: dist
           merge-multiple: true
 
-      - name: Build aggregate SHA256SUMS
+      - name: Verify release asset set
         shell: bash
         run: |
           python - <<'PY'
           import hashlib
           from pathlib import Path
 
-          zips = sorted(Path("dist").glob("*.zip"))
-          assert zips, "no release zips were downloaded"
-          assert len(zips) == 1, f"expected one Windows portable zip, got {len(zips)}"
-          assert "windows-x64" in zips[0].name
-          assert all("portable" in zip_path.name for zip_path in zips)
-          lines = []
-          for zip_path in zips:
-              digest = hashlib.sha256(zip_path.read_bytes()).hexdigest()
-              expected = f"{digest}  {zip_path.name}"
-              per_zip = Path(str(zip_path) + ".sha256")
-              assert per_zip.is_file(), f"missing checksum for {zip_path.name}"
-              assert per_zip.read_text(encoding="utf-8").strip() == expected
-              lines.append(expected)
-          Path("dist/SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          dist = Path("dist")
+          versioned_zips = sorted(
+              path for path in dist.glob("OpenSquilla-*.zip")
+              if path.name != "OpenSquilla-windows-x64-portable.zip"
+          )
+          versioned_wheels = sorted(
+              path for path in dist.glob("opensquilla-*.whl")
+              if path.name != "opensquilla-latest-py3-none-any.whl"
+          )
+          stable_zip = dist / "OpenSquilla-windows-x64-portable.zip"
+          stable_wheel = dist / "opensquilla-latest-py3-none-any.whl"
+          sha256s = dist / "SHA256SUMS"
+          assert len(versioned_zips) == 1, f"expected one versioned portable zip, got {len(versioned_zips)}"
+          assert len(versioned_wheels) == 1, f"expected one versioned wheel, got {len(versioned_wheels)}"
+          assert stable_zip.is_file(), "missing stable portable zip"
+          assert stable_wheel.is_file(), "missing stable wheel"
+          assert sha256s.is_file(), "missing SHA256SUMS"
+          assets = [versioned_zips[0], stable_zip, versioned_wheels[0], stable_wheel]
+          expected = [
+              f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}"
+              for path in assets
+          ]
+          assert sha256s.read_text(encoding="utf-8").splitlines() == expected
           PY
 
       - name: Upload aggregate workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: opensquilla-release-zips-${{ env.RELEASE_PROFILE }}
+          name: opensquilla-release-assets-${{ env.RELEASE_PROFILE }}
           path: |
             dist/*.zip
-            dist/*.zip.sha256
+            dist/*.whl
             dist/SHA256SUMS
 
       - name: Upload to GitHub Release
@@ -200,6 +301,117 @@ jobs:
           TAG: ${{ env.RELEASE_TAG }}
         shell: bash
         run: |
+          IS_PRERELEASE="$(python - <<'PY'
+          import os
+          import re
+
+          tag = os.environ["TAG"]
+          print("true" if re.search(r"(?:a|b|rc)[0-9]+$", tag) else "false")
+          PY
+          )"
+          TITLE="OpenSquilla ${TAG#v}"
+          create_args=("${TAG}" --draft --verify-tag)
+          if [[ "${IS_PRERELEASE}" == "true" ]]; then
+            TITLE="$(python - <<'PY'
+          import os
+          import re
+
+          version = os.environ["TAG"].removeprefix("v")
+          match = re.fullmatch(r"([0-9]+[.][0-9]+[.][0-9]+)(?:a|b|rc)([0-9]+)", version)
+          if match:
+              print(f"OpenSquilla {match.group(1)} Preview {match.group(2)}")
+          else:
+              print(f"OpenSquilla {version} Preview")
+          PY
+          )"
+            create_args+=(--prerelease)
+          fi
+          create_args+=(--title "${TITLE}")
           gh release view "${TAG}" >/dev/null 2>&1 || \
-            gh release create "${TAG}" --draft --verify-tag --title "${TAG}"
-          gh release upload "${TAG}" dist/*.zip dist/*.zip.sha256 dist/SHA256SUMS --clobber
+            gh release create "${create_args[@]}"
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          tag = os.environ["TAG"]
+          raw = subprocess.check_output(
+              ["gh", "release", "view", tag, "--json", "assets"],
+              text=True,
+          )
+          data = json.loads(raw)
+          for asset in data.get("assets", []):
+              name = asset["name"]
+              managed = (
+                  name == "SHA256SUMS"
+                  or name.startswith("OpenSquilla-")
+                  or name.startswith("opensquilla-")
+                  or name.endswith(".sha256")
+              )
+              if managed:
+                  subprocess.run(
+                      ["gh", "release", "delete-asset", tag, name, "--yes"],
+                      check=True,
+                  )
+          PY
+          gh release upload "${TAG}" dist/*.zip dist/*.whl dist/SHA256SUMS --clobber
+
+      - name: Verify GitHub Release assets
+        if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ env.RELEASE_TAG }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+
+          expected = {
+              "OpenSquilla-windows-x64-portable.zip",
+              "opensquilla-latest-py3-none-any.whl",
+              "SHA256SUMS",
+          }
+          tag = os.environ["TAG"]
+          raw = subprocess.check_output(
+              ["gh", "release", "view", tag, "--json", "assets"],
+              text=True,
+          )
+          data = json.loads(raw)
+          names = {asset["name"] for asset in data.get("assets", [])}
+          missing = sorted(expected - names)
+          versioned_zip = [
+              name for name in names
+              if name.startswith("OpenSquilla-")
+              and name.endswith("-windows-x64-py312-recommended-portable.zip")
+          ]
+          versioned_wheel = [
+              name for name in names
+              if name.startswith("opensquilla-")
+              and name.endswith("-py3-none-any.whl")
+              and name != "opensquilla-latest-py3-none-any.whl"
+          ]
+          allowed = expected | set(versioned_zip) | set(versioned_wheel)
+          unexpected = sorted(names - allowed)
+          if (
+              missing
+              or len(versioned_zip) != 1
+              or len(versioned_wheel) != 1
+              or unexpected
+          ):
+              print(
+                  "Unexpected GitHub Release assets:",
+                  {
+                      "missing": missing,
+                      "versioned_zip_count": len(versioned_zip),
+                      "versioned_wheel_count": len(versioned_wheel),
+                      "unexpected": unexpected,
+                      "names": sorted(names),
+                  },
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          PY

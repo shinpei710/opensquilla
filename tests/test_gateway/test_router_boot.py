@@ -7,10 +7,11 @@ from typing import Any
 
 import pytest
 
-from opensquilla.engine.types import DoneEvent
+from opensquilla.engine.types import AgentConfig, DoneEvent
 from opensquilla.gateway.boot import (
     _configured_agent_ids,
     _register_dream_crons,
+    _task_runtime_turn_hard_deadline_s,
     _warn_workspace_state_mismatch,
     build_flush_service,
     build_services,
@@ -23,7 +24,53 @@ from opensquilla.gateway.diagnostics import DiagnosticsState
 from opensquilla.gateway.routing import build_cli_route_envelope, build_cron_route_envelope
 from opensquilla.onboarding.mutations import upsert_channel
 from opensquilla.scheduler.types import CronJob, JobStatus
+from opensquilla.session.compaction import CompactionConfig
 from opensquilla.tools.registry import ToolRegistry
+from opensquilla.tools.types import CallerKind, ToolContext
+
+
+def test_gateway_boot_bridges_compaction_notifications_to_session_stream() -> None:
+    source = Path("src/opensquilla/gateway/boot.py").read_text(encoding="utf-8")
+
+    assert "add_compaction_listener" in source
+    assert '"session.event.compaction"' in source
+    assert "_compaction_listener_remove" in source
+
+
+def test_task_runtime_default_hard_deadline_exceeds_agent_runtime_timeout() -> None:
+    config = GatewayConfig()
+
+    deadline = _task_runtime_turn_hard_deadline_s(config)
+
+    assert deadline == 930.0
+
+
+def test_task_runtime_hard_deadline_honors_explicit_config() -> None:
+    config = GatewayConfig()
+    config.task_runtime.turn_hard_deadline_s = 12.5
+
+    assert _task_runtime_turn_hard_deadline_s(config) == 12.5
+
+
+def test_gateway_stream_timeouts_allow_long_silent_agent_work() -> None:
+    config = GatewayConfig()
+
+    assert config.agent_stream_idle_timeout_seconds == 600.0
+    assert config.webui_stream_idle_grace_seconds == 630.0
+    assert config.webui_stream_idle_grace_seconds > config.agent_stream_idle_timeout_seconds
+
+
+def test_compaction_time_budget_defaults_allow_long_chain_work() -> None:
+    gateway_config = GatewayConfig()
+    agent_config = AgentConfig()
+    compaction_config = CompactionConfig()
+
+    assert gateway_config.memory.flush_timeout_seconds == 15.0
+    assert gateway_config.memory.flush_background_timeout_seconds == 120.0
+    assert gateway_config.compaction.timeout_seconds == 90.0
+    assert agent_config.flush_timeout_seconds == 15.0
+    assert agent_config.flush_background_timeout_seconds == 120.0
+    assert compaction_config.timeout_seconds == 90.0
 
 
 class _FakeDreamScheduler:
@@ -288,6 +335,111 @@ async def test_start_gateway_server_schedules_router_preload_after_channels(
         await server.close()
 
 
+@pytest.mark.asyncio
+async def test_start_gateway_server_wires_cron_failure_dispatcher(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Driver-level guard for the production cron failure-destination wire.
+
+    When ``svc.cron_scheduler`` exists, boot must register
+    ``DeliveryChain.dispatch_failure_alert`` as the global failure dispatcher
+    in ``scheduler.jobs`` so failed cron runs reach the configured FD at
+    runtime. Without this wire the dispatch plumbing is dead in production
+    even though unit tests cover the hook directly.
+    """
+    captured: dict[str, Any] = {}
+
+    class FakeTurnRunner:
+        def __init__(self, **_kw: Any) -> None: ...
+
+        def set_session_lock_provider(self, _provider: Any) -> None: ...
+
+    class FakeCronScheduler:
+        def __init__(self) -> None:
+            self.registered: dict[str, Any] = {}
+
+        def register_handler(self, key: str, fn: Any) -> None:
+            self.registered[key] = fn
+
+        async def list_jobs(self) -> list:
+            return []
+
+    cron_sched = FakeCronScheduler()
+
+    async def fake_build_services(**kwargs: Any) -> Any:
+        async def close() -> None:
+            return None
+
+        return SimpleNamespace(
+            provider_selector=object(),
+            tool_registry=object(),
+            session_manager=None,
+            skill_loader=object(),
+            usage_tracker=object(),
+            config=kwargs["config"],
+            memory_sync_managers={},
+            model_catalog=None,
+            memory_retrievers={},
+            turn_capture_services={},
+            flush_service=None,
+            cron_scheduler=cron_sched,
+            task_runtime=None,
+            agent_registry=None,
+            memory_managers={},
+            memory_stores={},
+            _turn_runner_ref=[],
+            close=close,
+        )
+
+    from opensquilla.gateway import boot
+    from opensquilla.scheduler import jobs as scheduler_jobs
+
+    def _record_dispatcher(fn: Any) -> None:
+        captured["dispatcher"] = fn
+
+    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
+    monkeypatch.setattr(boot, "build_services", fake_build_services)
+    monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
+    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
+    monkeypatch.setattr(scheduler_jobs, "set_failure_dispatcher", _record_dispatcher)
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None
+    )
+
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        control_ui={"enabled": False},
+        channels={"channels": []},
+    )
+
+    server = await boot.start_gateway_server(config=config, run=False)
+    try:
+        assert callable(captured.get("dispatcher")), (
+            "set_failure_dispatcher was not called during boot — the cron "
+            "failure-destination wire is missing from gateway/boot.py"
+        )
+        # The wire must register DeliveryChain.dispatch_failure_alert
+        # (a bound method), not some unrelated callable.
+        assert (
+            getattr(captured["dispatcher"], "__name__", "")
+            == "dispatch_failure_alert"
+        )
+        # Handler factories ran, confirming the wire ran inside the cron-init
+        # branch (not just by coincidence).
+        assert set(cron_sched.registered) >= {
+            "agent_run",
+            "static_message",
+            "system_event",
+        }
+    finally:
+        await server.close()
+
+
 def test_build_flush_service_respects_memory_flush_enabled_config() -> None:
     service = build_flush_service(
         tool_registry=ToolRegistry(),
@@ -298,15 +450,100 @@ def test_build_flush_service_respects_memory_flush_enabled_config() -> None:
     assert service is None
 
 
-def test_build_flush_service_uses_configured_memory_timeout() -> None:
+def test_build_flush_service_uses_configured_background_memory_timeout() -> None:
     service = build_flush_service(
         tool_registry=ToolRegistry(),
         provider_selector=SimpleNamespace(resolve=lambda: object()),
-        config=GatewayConfig(memory={"flush_timeout_seconds": 0.25}),
+        config=GatewayConfig(
+            memory={
+                "flush_timeout_seconds": 0.25,
+                "flush_background_timeout_seconds": 42.0,
+            }
+        ),
     )
 
     assert service is not None
-    assert service._default_timeout == 0.25
+    assert service._default_timeout == 42.0
+
+
+@pytest.mark.asyncio
+async def test_build_services_registers_session_search_tool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.sandbox.integration.configure_runtime",
+        lambda *args, **kwargs: SimpleNamespace(
+            effective=SimpleNamespace(as_dict=lambda: {})
+        ),
+    )
+
+    captured_memory_kwargs: dict[str, Any] = {}
+
+    async def fake_build_memory_managers(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        captured_memory_kwargs.update(_kwargs)
+        return {}
+
+    monkeypatch.setattr(
+        "opensquilla.memory.manager.build_memory_managers",
+        fake_build_memory_managers,
+    )
+    registry = ToolRegistry()
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        control_ui={"enabled": False},
+        channels={"channels": []},
+        mcp={"enabled": False},
+        memory={"flush_enabled": False},
+    )
+
+    services = await build_services(
+        config=config,
+        tool_registry=registry,
+        session_db_path=str(tmp_path / "sessions.sqlite"),
+    )
+    try:
+        session_search = registry.get("session_search")
+        assert session_search is not None
+        assert "Full-text search across persisted session transcripts" in (
+            session_search.spec.description
+        )
+        assert (
+            "source-aware memory_search, which searches curated memory source files plus "
+            "indexed session snippets"
+            in session_search.spec.description
+        )
+        owner_names = {
+            tool["name"]
+            for tool in await registry.list_tools(
+                caller_kind=CallerKind.AGENT,
+                is_owner=True,
+            )
+        }
+        channel_names = {
+            tool.name
+            for tool in registry.to_tool_definitions(
+                ToolContext(is_owner=False, caller_kind=CallerKind.CHANNEL)
+            )
+        }
+        assert "session_search" in owner_names
+        assert "session_search" not in channel_names
+
+        await services.session_manager.create("agent:main:main")
+        await services.session_manager.append_message(
+            "agent:main:main",
+            "user",
+            "needle transcript detail",
+        )
+
+        output = await session_search.handler(query="needle", limit=5)
+
+        assert "needle" in output
+        assert "agent:main:main" in output
+        assert captured_memory_kwargs["session_storage"] is services.session_manager.storage
+    finally:
+        await services.close()
 
 
 def test_router_boot_validation_does_not_load_heavy_runtime(
@@ -610,6 +847,65 @@ async def test_task_runtime_turn_applies_cron_job_tool_policy() -> None:
     )
 
     tool_context = runner.calls[0]["tool_context"]
-    assert tool_context.allowed_tools == {"session_status", "memory_search"}
+    assert tool_context.allowed_tools == {"session_status"}
     assert "exec_command" in tool_context.denied_tools
     assert "web_fetch" in tool_context.denied_tools
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_turn_uses_owner_boundary_for_owner_cron_job() -> None:
+    class RecordingTurnRunner:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            self.calls.append(kwargs)
+            yield DoneEvent()
+
+    async def emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        return None
+
+    job = CronJob(
+        id="cron-owner",
+        name="Owner",
+        payload={"kind": "agent_turn", "agent_id": "ops"},
+        creator_is_owner=True,
+        tool_policy={
+            "profile": "minimal",
+            "also_allow": ["memory_search", "exec_command"],
+            "deny": ["web_fetch"],
+        },
+    )
+    run = SimpleNamespace(
+        agent_id="ops",
+        task_id="task-1",
+        session_key="cron:cron-owner:run:1",
+        message="hello",
+        envelope=build_cron_route_envelope(
+            job,
+            session_key="cron:cron-owner:run:1",
+            agent_id="ops",
+        ),
+        attachments=[],
+        input_provenance={},
+        run_kind="cron_turn",
+        no_memory_capture=False,
+        ingress_pipeline_steps=[],
+        semantic_message=None,
+        stream_event_sink=None,
+    )
+    runner = RecordingTurnRunner()
+
+    await dispatch_task_runtime_turn(
+        run,
+        config=GatewayConfig(),
+        session_manager=None,
+        turn_runner=runner,
+        event_emitter=emit,
+    )
+
+    tool_context = runner.calls[0]["tool_context"]
+    assert tool_context.is_owner is True
+    assert tool_context.allowed_tools is None
+    assert tool_context.tool_policy == job.tool_policy
+    assert "exec_command" not in tool_context.denied_tools

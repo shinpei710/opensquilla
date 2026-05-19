@@ -146,10 +146,11 @@ class RpcClient {
           }
         }
       } else if (data.type === 'event') {
+        const meta = data.meta || {};
         const handlers = this._listeners.get(data.event);
-        if (handlers) handlers.forEach(h => h(data.payload));
+        if (handlers) handlers.forEach(h => h(data.payload, meta));
         const wild = this._listeners.get('*');
-        if (wild) wild.forEach(h => h(data.event, data.payload));
+        if (wild) wild.forEach(h => h(data.event, data.payload, meta));
       }
     };
 

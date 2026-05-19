@@ -123,3 +123,16 @@ def test_wheelhouse_release_publishes_only_recommended_router_profile() -> None:
     assert "RELEASE_PROFILE: recommended" in text
     assert "--profile \"${RELEASE_PROFILE}\"" in text
     assert "- core" not in text
+
+
+def test_wheelhouse_release_hydrates_current_router_bundle() -> None:
+    text = (WORKFLOW_DIR / "wheelhouse-release.yml").read_text(encoding="utf-8")
+
+    assert "models/v4.2_phase3_inference" in text
+    assert 'root / "bge_onnx" / "model.onnx"' in text
+    assert 'root / "features" / "tfidf.pkl"' in text
+    assert 'root / "lgbm_main.bin"' in text
+    assert 'root / "mlp" / "model.onnx"' in text
+    assert 'root / "router.runtime.yaml"' in text
+    assert "intent_head.joblib" not in text
+    assert "router_model.onnx" not in text

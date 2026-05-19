@@ -73,6 +73,7 @@ class EventFrame(BaseModel):
     type: Literal["event"] = "event"
     event: str
     payload: Any | None = None
+    meta: dict[str, Any] | None = None
     seq: int | None = None
     state_version: StateVersion | None = None
 
@@ -141,8 +142,8 @@ class PolicyInfo(BaseModel):
     max_buffered_bytes: int = MAX_BUFFERED_BYTES
     tick_interval_ms: int = TICK_INTERVAL_MS
     agent_stream_heartbeat_interval_ms: int = 15_000
-    agent_stream_idle_timeout_ms: int = 180_000
-    webui_stream_idle_grace_ms: int = 210_000
+    agent_stream_idle_timeout_ms: int = 600_000
+    webui_stream_idle_grace_ms: int = 630_000
     client_ws_keepalive_timeout_ms: int = 120_000
 
 
@@ -189,5 +190,10 @@ def make_ok_res(req_id: str, payload: Any = None) -> ResFrame:
     return ResFrame(id=req_id, ok=True, payload=payload)
 
 
-def make_event(event: str, payload: Any = None, seq: int | None = None) -> EventFrame:
-    return EventFrame(event=event, payload=payload, seq=seq)
+def make_event(
+    event: str,
+    payload: Any = None,
+    seq: int | None = None,
+    meta: dict[str, Any] | None = None,
+) -> EventFrame:
+    return EventFrame(event=event, payload=payload, seq=seq, meta=meta)

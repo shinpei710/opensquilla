@@ -37,6 +37,7 @@ class ToolProfile(StrEnum):
 
 _CHANNEL_DEFAULT_ALLOW: frozenset[str] = frozenset(
     {
+        "cron",  # channel-safe reminders; cron tool enforces caller-scoped quotas
         "git_diff",
         "git_log",
         "git_status",
@@ -49,6 +50,21 @@ _CHANNEL_DEFAULT_ALLOW: frozenset[str] = frozenset(
         "memory_search",
         "pdf",
         "publish_artifact",
+        "create_csv",
+        "create_pdf_report",
+        "create_pptx",
+        "create_xlsx",
+        "feishu_doc_create",
+        "feishu_doc_list_blocks",
+        "feishu_doc_read_raw",
+        "feishu_drive_meta",
+        "feishu_drive_search",
+        "feishu_drive_upload_artifact",
+        "feishu_media_upload_artifact",
+        "feishu_scopes_status",
+        "feishu_wiki_get_node",
+        "feishu_wiki_list_nodes",
+        "feishu_wiki_list_spaces",
         "read_file",
         "session_status",
         "sessions_history",
@@ -59,15 +75,49 @@ _CHANNEL_DEFAULT_ALLOW: frozenset[str] = frozenset(
     }
 )
 
+_CHANNEL_HARD_DENY_NON_OWNER: frozenset[str] = frozenset(
+    {
+        "apply_patch",
+        "background_process",
+        "edit_file",
+        "exec_command",
+        "execute_code",
+        "git_commit",
+        "write_file",
+    }
+)
+
 
 def filter_by_profile(
     tools: list[ToolDefinition],
     profile: ToolProfile | str,
+    ctx: ToolContext | None = None,
 ) -> list[ToolDefinition]:
     resolved = ToolProfile(profile)
     if resolved is ToolProfile.OWNER_FULL:
         return list(tools)
-    return [tool for tool in tools if tool.name in _CHANNEL_DEFAULT_ALLOW]
+    explicit = ctx.allowed_tools if ctx is not None else None
+    return [
+        tool
+        for tool in tools
+        if profile_allows_tool(tool.name, resolved, explicitly_allowed=explicit)
+    ]
+
+
+def profile_allows_tool(
+    tool_name: str,
+    profile: ToolProfile | str,
+    *,
+    explicitly_allowed: set[str] | frozenset[str] | None = None,
+) -> bool:
+    resolved = ToolProfile(profile)
+    if resolved is ToolProfile.OWNER_FULL:
+        return True
+    if tool_name in _CHANNEL_DEFAULT_ALLOW:
+        return True
+    if tool_name in _CHANNEL_HARD_DENY_NON_OWNER:
+        return False
+    return bool(explicitly_allowed and tool_name in explicitly_allowed)
 
 
 def resolve_profile(ctx: ToolContext | None) -> ToolProfile:
@@ -126,7 +176,22 @@ class ToolRegistry:
             and ctx.surfaced_tools is not None
             and rt.spec.name in ctx.surfaced_tools
         )
-        if not rt.spec.exposed_by_default and not explicitly_allowed and not surfaced:
+        channel_profile_visible = (
+            ctx is not None
+            and ctx.caller_kind is CallerKind.CHANNEL
+            and not ctx.is_owner
+            and profile_allows_tool(
+                rt.spec.name,
+                ToolProfile.CHANNEL_DEFAULT,
+                explicitly_allowed=ctx.allowed_tools,
+            )
+        )
+        if (
+            not rt.spec.exposed_by_default
+            and not explicitly_allowed
+            and not surfaced
+            and not channel_profile_visible
+        ):
             return False
         if ctx is not None:
             if rt.spec.owner_only and not ctx.is_owner:
@@ -193,6 +258,17 @@ class ToolRegistry:
             )
         if explicit_kind is CallerKind.CRON or (session_key and session_key.startswith("cron:")):
             mode = explicit_interaction or InteractionMode.UNATTENDED
+            if is_owner:
+                ctx = ToolContext(
+                    is_owner=True,
+                    caller_kind=CallerKind.CRON,
+                    interaction_mode=mode,
+                    agent_id=agent_id or "main",
+                )
+                return resolve_runtime_tool_surface(
+                    ctx,
+                    capabilities=tool_surface_capabilities,
+                )
             ctx = ToolContext(
                 is_owner=False,
                 caller_kind=CallerKind.CRON,
@@ -200,6 +276,19 @@ class ToolRegistry:
                 agent_id=agent_id or "main",
                 allowed_tools=set(CRON_AGENT_ALLOW),
                 denied_tools=set(CRON_AGENT_DENY),
+            )
+            return resolve_runtime_tool_surface(
+                ctx,
+                capabilities=tool_surface_capabilities,
+            )
+        if explicit_kind is CallerKind.CHANNEL:
+            mode = explicit_interaction or InteractionMode.INTERACTIVE
+            ctx = ToolContext(
+                is_owner=is_owner,
+                caller_kind=CallerKind.CHANNEL,
+                interaction_mode=mode,
+                agent_id=agent_id or "main",
+                allowed_tools=None if is_owner else set(_CHANNEL_DEFAULT_ALLOW),
             )
             return resolve_runtime_tool_surface(
                 ctx,
@@ -225,6 +314,23 @@ class ToolRegistry:
             "required": rt.spec.required,
         }
 
+    @staticmethod
+    def _description_for(rt: RegisteredTool, ctx: ToolContext) -> str:
+        description = rt.spec.description
+        scratch_dir = getattr(ctx, "scratch_dir", None)
+        if scratch_dir and rt.spec.name in {
+            "exec_command",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "execute_code",
+        }:
+            description = (
+                f"{description} For temporary scripts, logs, debug output, and "
+                f"candidate patches, use the configured scratch directory: {scratch_dir}."
+            )
+        return description
+
     def to_tool_definitions(self, ctx: ToolContext | None = None) -> list[ToolDefinition]:
         """Export tools as MCP-compatible ToolDefinition list.
 
@@ -238,7 +344,7 @@ class ToolRegistry:
         return [
             ToolDefinition(
                 name=rt.spec.name,
-                description=rt.spec.description,
+                description=self._description_for(rt, active_ctx),
                 input_schema=ToolInputSchema(
                     type="object",
                     properties=rt.spec.parameters,
@@ -282,7 +388,7 @@ class ToolRegistry:
         return [
             {
                 "name": rt.spec.name,
-                "description": rt.spec.description,
+                "description": self._description_for(rt, ctx),
                 "schema": self._schema_for(rt),
                 "source": "plugin" if "." in rt.spec.name else "builtin",
                 "enabled": True,
@@ -310,7 +416,7 @@ class ToolRegistry:
         return [
             {
                 "name": rt.spec.name,
-                "description": rt.spec.description,
+                "description": self._description_for(rt, ctx),
                 "schema": self._schema_for(rt),
             }
             for rt in self._iter_visible_tools(ctx, sort=True)
@@ -344,6 +450,7 @@ def tool(
     execution_timeout_seconds: float | None = None,
     execution_timeout_argument: str | None = None,
     execution_timeout_padding: float = 0.0,
+    result_budget_class: str | None = None,
     registry: ToolRegistry | None = None,
 ) -> Any:
     """Decorator to register an async function as a tool.
@@ -365,6 +472,7 @@ def tool(
             execution_timeout_seconds=execution_timeout_seconds,
             execution_timeout_argument=execution_timeout_argument,
             execution_timeout_padding=execution_timeout_padding,
+            result_budget_class=result_budget_class,
         )
         target = registry if registry is not None else _default_registry
         target.register(spec, fn)

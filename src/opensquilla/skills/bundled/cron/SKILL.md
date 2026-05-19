@@ -30,10 +30,28 @@ metadata:
 
 When the user asks to schedule something, set up a recurring task, create a timer, or create a reminder, use the `cron` tool.
 
-- To create a schedule: call `cron(action="add", schedule="<cron-or-natural-time>", task="<task text>")`.
-- For reminders such as "remind me to drink water every minute" or "每分钟提醒我喝水", call `cron(action="add", schedule="<schedule>", task="<reminder text>", job_kind="system_event", session_target="main")`.
-- To list schedules: call `cron(action="list")`.
-- To trigger a schedule immediately: call `cron(action="run", job_id="<job id>")`.
-- To cancel a schedule: call `cron(action="remove", job_id="<job id>")`.
+The `schedule` argument is a **structured object**, not a string. Choose one shape and translate any natural language yourself before calling the tool — the tool will not parse free-form text and will reject flat strings with a structured error.
+
+Three accepted schedule shapes:
+
+- `{"kind": "cron", "expr": "<5-field POSIX cron>", "tz": "<optional IANA timezone>"}`
+  Recurring on a calendar pattern. Example: `{"kind": "cron", "expr": "0 9 * * 1-5", "tz": "Asia/Shanghai"}` for weekdays at 09:00 Shanghai wall time.
+- `{"kind": "every", "every_seconds": <integer ≥ 1>}`
+  Recurring on a fixed sub-minute or odd interval. Example: `{"kind": "every", "every_seconds": 30}` for every 30 seconds.
+- `{"kind": "at", "at": "<ISO-8601 with timezone>"}`
+  One-shot at an absolute time. The timestamp must include a timezone offset.
+
+Translation examples (do this in your own reasoning before calling the tool):
+
+- "每5分钟提醒我喝水" → `cron(action="add", schedule={"kind": "cron", "expr": "*/5 * * * *"}, task="喝水", job_kind="system_event", session_target="main")`
+- "每30秒打印一次" → `cron(action="add", schedule={"kind": "every", "every_seconds": 30}, task="...", job_kind="agent_turn", session_target="isolated")`
+- "明天早上9点叫我" → compute the absolute ISO-8601 string with timezone, then `cron(action="add", schedule={"kind": "at", "at": "<that ISO-8601>"}, task="...", job_kind="system_event", session_target="main")`
+- "every weekday at 9am Los Angeles time" → `cron(action="add", schedule={"kind": "cron", "expr": "0 9 * * 1-5", "tz": "America/Los_Angeles"}, task="...")`
+
+Other actions:
+
+- List: `cron(action="list")`.
+- Trigger now: `cron(action="run", job_id="<job id>")`.
+- Cancel: `cron(action="remove", job_id="<job id>")`.
 
 Cron expression format: `minute hour day month weekday` (e.g. `0 9 * * 1-5` = weekdays at 9am).

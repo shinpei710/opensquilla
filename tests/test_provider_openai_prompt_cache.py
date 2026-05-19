@@ -62,6 +62,20 @@ def _collect_done(provider: OpenAIProvider, cfg: ChatConfig) -> DoneEvent:
     return asyncio.run(_collect())
 
 
+def test_provider_strips_trailing_paste_punctuation_from_api_key(monkeypatch) -> None:
+    captured: dict[str, Any] = {}
+    _patch_openai_transport(monkeypatch, captured)
+    provider = OpenAIProvider(
+        api_key="test-key、",
+        model="deepseek/deepseek-v4-flash",
+        base_url="https://openrouter.ai/api/v1",
+    )
+
+    _collect_done(provider, ChatConfig())
+
+    assert captured["headers"]["Authorization"] == "Bearer test-key"
+
+
 def test_openrouter_anthropic_auto_cache_adds_top_level_cache_control(monkeypatch) -> None:
     captured: dict[str, Any] = {}
     _patch_openai_transport(monkeypatch, captured)

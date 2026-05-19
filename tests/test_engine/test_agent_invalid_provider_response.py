@@ -507,6 +507,92 @@ async def test_no_done_after_text_does_not_retry() -> None:
 
 
 @pytest.mark.asyncio
+async def test_length_capped_visible_text_continues_once_before_terminal() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderText(text="partial answer"),
+                ProviderDone(stop_reason="length", input_tokens=7, output_tokens=9),
+            ],
+            [
+                ProviderText(text=" finished"),
+                ProviderDone(stop_reason="stop", input_tokens=8, output_tokens=1),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert any(event.kind == "text_delta" and event.text == "partial answer" for event in events)
+    assert any(event.kind == "text_delta" and event.text == " finished" for event in events)
+    assert any(
+        event.kind == "warning" and event.code == "provider_output_continue"
+        for event in events
+    )
+    assert not any(event.kind == "error" for event in events)
+    done = next(event for event in events if event.kind == "done")
+    assert done.text == "partial answer finished"
+    assert done.input_tokens == 15
+    assert done.output_tokens == 10
+
+
+@pytest.mark.asyncio
+async def test_length_capped_tool_call_is_not_executed() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderToolUseStart(tool_use_id="tool-1", tool_name="echo"),
+                ProviderToolUseEnd(
+                    tool_use_id="tool-1",
+                    tool_name="echo",
+                    arguments={"value": "x"},
+                ),
+                ProviderDone(stop_reason="length", input_tokens=7, output_tokens=9),
+            ]
+        ]
+    )
+    called = False
+
+    async def tool_handler(call: Any) -> ToolResult:
+        nonlocal called
+        called = True
+        return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="tool ok")
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(retry_base_backoff_ms=0, retry_max_backoff_ms=0),
+        tool_definitions=[
+            ToolDefinition(
+                name="echo",
+                description="Echo.",
+                input_schema=ToolInputSchema(),
+            )
+        ],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert called is False
+    assert any(event.kind == "tool_use_start" for event in events)
+    assert any(
+        event.kind == "error" and event.code == "provider_output_truncated"
+        for event in events
+    )
+    assert not any(event.kind == "tool_result" for event in events)
+    assert agent._history == []
+
+
+@pytest.mark.asyncio
 async def test_discarded_empty_attempt_counts_usage_but_skips_cache_check(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

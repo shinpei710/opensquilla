@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 from urllib.parse import urlparse
 
-from opensquilla.session.terminal_reply import build_terminal_reply
+from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 
 
 class GatewayRPCError(Exception):
@@ -72,7 +72,7 @@ class GatewayClient:
         self._http_base: str | None = None
         self._auth_token: str | None = None
 
-    async def connect(self, url: str = "ws://localhost:18790/ws") -> None:
+    async def connect(self, url: str = "ws://localhost:18791/ws") -> None:
         """Connect to gateway. Raises SystemExit with friendly message on failure."""
         has_existing_connection = (
             self._ws is not None
@@ -430,9 +430,10 @@ class GatewayClient:
     ) -> AsyncIterator[dict]:
         """Send message and yield session events until done.
 
-        ``elevated`` — None/"off" (default sandboxed), "on" (host exec with
-        approval), "bypass" (host exec, auto-approve, sensitive paths still
-        blocked), or "full" (host exec, auto-approve, sensitive paths bypassed).
+        ``elevated`` — None (use configured default), "off" (sandboxed),
+        "on" (host exec with approval), "bypass" (host exec, auto-approve,
+        sensitive paths still blocked), or "full" (host exec, auto-approve,
+        sensitive paths bypassed).
         """
         # Subscribe to message events for this session
         await self._call("sessions.messages.subscribe", {"key": session_key})
@@ -583,13 +584,18 @@ def _normalize_session_error_payload(payload: dict) -> dict[str, Any]:
         "error_message": raw_text,
         **payload,
     }
+    _, safe_error_message = sanitize_agent_error(
+        terminal_payload,
+        fallback_error_class=str(code) if code else None,
+        fallback_error_message=raw_text,
+    )
     terminal_message = build_terminal_reply(terminal_payload)
     return {
         **payload,
         "message": terminal_message,
         "terminal_message": terminal_message,
         "terminal_reason": terminal_payload["terminal_reason"],
-        "error_message": raw_text,
+        "error_message": safe_error_message,
     }
 
 

@@ -6,6 +6,7 @@ from typing import Any
 
 import typer
 
+from opensquilla.cli.ui import ACCENT_MARKUP, console
 from opensquilla.onboarding.channel_specs import get_channel_setup_spec
 
 TOKEN_ALIASES = (
@@ -64,8 +65,5 @@ def apply_channel_token(payload: dict[str, Any], type_name: str, token: str) -> 
     if not token:
         return
     field_name = resolve_channel_token_field(type_name)
-    typer.secho(
-        f"--token resolved to {type_name}.{field_name}",
-        fg=typer.colors.CYAN,
-    )
+    console.print(f"[{ACCENT_MARKUP}]--token resolved to[/] {type_name}.{field_name}")
     payload[field_name] = token

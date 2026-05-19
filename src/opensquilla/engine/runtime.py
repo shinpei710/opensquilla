@@ -10,40 +10,98 @@ import asyncio
 import base64
 import binascii
 import contextvars
+import copy
 import inspect
 import json
 import os
 import platform
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Hashable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final, SupportsInt, TypeGuard, cast
+from typing import Any, Final, Literal, SupportsInt, TypeGuard, cast
 
 import structlog
 
-from opensquilla.artifacts import artifact_marker, artifact_payload
+from opensquilla.artifacts import artifact_marker
 from opensquilla.attachment_refs import is_attachment_ref, read_attachment_ref_bytes
 from opensquilla.bootstrap_types import BootstrapFileReport
 from opensquilla.engine.agent import Agent, ToolHandler
 from opensquilla.engine.cache_break_monitor import notify_compaction
+from opensquilla.engine.hooks import (
+    CompactionHook,
+    DefaultTraceEmitterHook,
+    TurnEvent,
+    TurnHook,
+    TurnHookContext,
+)
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.pricing import PriceEntry, lookup_price
-from opensquilla.engine.tool_text_compat import strip_synthetic_tool_call_text
+from opensquilla.engine.turn_runner import (
+    AgentBootstrapStage,
+    AgentBootstrapStageInput,
+    AttachmentStage,
+    AttachmentStageInput,
+    CompactionAndHistoryStage,
+    CompactionAndHistoryStageInput,
+    InputStage,
+    InputStageInput,
+    PromptAssemblerStage,
+    PromptAssemblerStageInput,
+    ProviderAndToolsStage,
+    ProviderAndToolsStageInput,
+    StreamConsumerStage,
+    StreamConsumerStageInput,
+    TurnFinalizerStage,
+    TurnFinalizerStageInput,
+)
+from opensquilla.engine.turn_runner.harness import (
+    _PromptReportBuilderAdapter,
+    _RequestContextPrependAdapter,
+    _TurnRunnerAgentConfigBuilderAdapter,
+    _TurnRunnerAgentFactoryAdapter,
+    _TurnRunnerAgentRunAdapter,
+    _TurnRunnerAttachmentMessageBuilderAdapter,
+    _TurnRunnerCompactionPersistAdapter,
+    _TurnRunnerExtraContextAdapter,
+    _TurnRunnerHistoryLoaderAdapter,
+    _TurnRunnerMemoryFingerprintAdapter,
+    _TurnRunnerMemorySnapshotAdapter,
+    _TurnRunnerMemorySnapshotRefreshAdapter,
+    _TurnRunnerMemorySyncNotifyAdapter,
+    _TurnRunnerModelCatalogAdapter,
+    _TurnRunnerPipelineExecutionAdapter,
+    _TurnRunnerPreflightCompactionAdapter,
+    _TurnRunnerPromptAssemblerAdapter,
+    _TurnRunnerPromptConfigResolverAdapter,
+    _TurnRunnerProviderResolverAdapter,
+    _TurnRunnerRouterContextAdapter,
+    _TurnRunnerSessionIdResolverAdapter,
+    _TurnRunnerSessionTotalsAdapter,
+    _TurnRunnerSummarizerProviderAdapter,
+    _TurnRunnerSystemPromptRefreshAdapter,
+    _TurnRunnerT3UpgradeCompactionAdapter,
+    _TurnRunnerTimeoutBudgetAdapter,
+    _TurnRunnerToolBuilderAdapter,
+    _TurnRunnerTranscriptAppendAdapter,
+    _TurnRunnerTurnErrorPersistAdapter,
+    _TurnRunnerTurnMemoryCaptureAdapter,
+)
+from opensquilla.engine.turn_runner.stream_consumer_stage import _StreamState
 from opensquilla.engine.types import (
     AgentConfig,
     AgentEvent,
-    ArtifactEvent,
-    CompactionEvent,
     DoneEvent,
     ErrorEvent,
-    TextDeltaEvent,
     ThinkingLevel,
     ToolResultEvent,
-    ToolUseStartEvent,
     WarningEvent,
+)
+from opensquilla.execution_status import (
+    mark_execution_status_truncated,
+    normalize_execution_status,
 )
 from opensquilla.memory.session_flush import SessionFlushService
 from opensquilla.observability.decision_log import (
@@ -61,15 +119,16 @@ from opensquilla.provider import (
     ErrorEvent as ProviderErrorEvent,
 )
 from opensquilla.provider import (
-    LLMProvider,
     ProviderRecoveryAction,
     classify_provider_error,
     decide_recovery_action,
 )
 from opensquilla.safety import injection_guard, permission_matrix, sandbox, tool_tiers
+from opensquilla.session.compaction_lifecycle import (
+    flush_receipt_allows_destructive_compaction,
+)
 from opensquilla.session.cost_rollup import (
     normalize_event_cost_source,
-    rollup_cost_source,
 )
 from opensquilla.session.keys import (
     allows_private_memory_prompt_injection,
@@ -77,6 +136,7 @@ from opensquilla.session.keys import (
     is_subagent_key,
     normalize_agent_id,
 )
+from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 from opensquilla.tools.types import CallerKind, ToolContext
 
 # Stable user-facing envelope for LLM timeouts.
@@ -115,6 +175,24 @@ _ARTIFACT_DELIVERY_FAILURE_MARKER: Final[str] = "File delivery failed:"
 _ARTIFACT_DELIVERY_TOOL_NAME: Final[str] = "publish_artifact"
 _ARTIFACT_DELIVERY_FAILURE_MAX_CHARS: Final[int] = 360
 
+_HOOKS_FEATURE_ENV: Final[str] = "OPENSQUILLA_HOOKS"
+
+
+def _hooks_mode_from_env() -> str:
+    """Resolve the active hook mode from the ``OPENSQUILLA_HOOKS`` env var.
+
+    Returns ``"legacy"`` only when explicitly set to ``legacy``
+    (case-insensitive); any other value (including unset) returns ``"new"``.
+    The default flipped to ``new`` after the equivalence harness showed zero
+    divergence between legacy and hook paths across the engine and tools test
+    suites. ``OPENSQUILLA_HOOKS=legacy`` remains as an escape hatch for one
+    release cycle so any unforeseen drift can be diagnosed without rolling
+    back code.
+    """
+
+    raw = os.environ.get(_HOOKS_FEATURE_ENV, "").strip().lower()
+    return "legacy" if raw == "legacy" else "new"
+
 
 def _is_deepseek_model_id(model: str) -> bool:
     normalized = model.strip().lower()
@@ -123,7 +201,6 @@ def _is_deepseek_model_id(model: str) -> bool:
 
 # Tools that are safe to run concurrently within a single LLM turn.
 # Any tool name absent from this set is treated as mutex (serial dispatch).
-# See docs/dev/tool-concurrency-spec.md for the dispatch contract.
 _SAFE_TOOL_NAMES: frozenset[str] = frozenset({
     "agents_list",
     "git_diff",
@@ -146,7 +223,72 @@ _SAFE_TOOL_NAMES: frozenset[str] = frozenset({
     "skill_view",
     "tts",
     "web_fetch",
+    "web_search",
 })
+
+_ToolConcurrencyMode = Literal["mutex", "concurrent", "keyed", "predicate"]
+
+
+@dataclass(frozen=True)
+class _ToolConcurrencyPolicy:
+    mode: _ToolConcurrencyMode
+    key: Hashable | None = None
+    max_inflight: int | None = None
+    limit_key: Hashable | None = None
+
+
+_FEISHU_READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset({
+    "feishu_chat_read",
+    "feishu_doc_list_blocks",
+    "feishu_doc_read_raw",
+    "feishu_drive_meta",
+    "feishu_drive_search",
+    "feishu_scopes_status",
+    "feishu_wiki_get_node",
+    "feishu_wiki_list_nodes",
+    "feishu_wiki_list_spaces",
+})
+
+_MUTEX_TOOL_POLICY = _ToolConcurrencyPolicy(mode="mutex")
+_CONCURRENT_TOOL_POLICY = _ToolConcurrencyPolicy(mode="concurrent")
+_FEISHU_READ_TOOL_POLICY = _ToolConcurrencyPolicy(
+    mode="concurrent",
+    max_inflight=4,
+    limit_key=("feishu", "read"),
+)
+
+
+def _get_tool_concurrency_policy(
+    tool_name: str,
+    arguments: Mapping[str, Any] | None = None,
+    *,
+    parent_session_key: str | None = None,
+) -> _ToolConcurrencyPolicy:
+    if tool_name in _SAFE_TOOL_NAMES:
+        return _CONCURRENT_TOOL_POLICY
+    if tool_name in _FEISHU_READ_ONLY_TOOL_NAMES:
+        return _FEISHU_READ_TOOL_POLICY
+    if tool_name == "sessions_send":
+        session_key = (arguments or {}).get("session_key")
+        if isinstance(session_key, str) and session_key.strip():
+            return _ToolConcurrencyPolicy(
+                mode="keyed",
+                key=("sessions_send", session_key.strip()),
+            )
+        return _MUTEX_TOOL_POLICY
+    if tool_name == "sessions_spawn":
+        from opensquilla.tools.types import current_tool_context  # noqa: PLC0415
+
+        ctx = current_tool_context.get()
+        parent_key = parent_session_key or (ctx.session_key if ctx is not None else None)
+        if parent_key:
+            return _ToolConcurrencyPolicy(
+                mode="keyed",
+                key=("sessions_spawn", parent_key),
+            )
+        return _MUTEX_TOOL_POLICY
+    return _MUTEX_TOOL_POLICY
+
 
 # Per-call-chain owner tracking for session-lock re-entry detection.
 # A ContextVar is copied into child asyncio Tasks created while a turn is
@@ -325,9 +467,9 @@ def _normalize_capture_kind(value: str) -> str:
     return value.strip().lower().replace("-", "_").replace(".", "_").replace(":", "_")
 
 
-# Boot-path initialization of safety baseline (S-SAFETY). All four submodules
+# Boot-path initialization of the safety baseline. All four submodules
 # are imported here so tool dispatch and ingress guards can consult them
-# without late imports. See docs/architecture/module-contracts.md §safety.
+# without late imports.
 #
 # The tuple pins the imports to module scope so the linter does not drop them
 # as "unused" — dispatch paths reach these modules via attribute lookup at
@@ -541,11 +683,17 @@ def _persisted_tool_result_segment(
         "result": result,
         "is_error": event.is_error,
     }
+    if event.execution_status is not None:
+        segment["execution_status"] = normalize_execution_status(event.execution_status)
     if len(result) <= max_chars:
         return segment
 
     segment["result_truncated"] = True
     segment["result_original_chars"] = len(result)
+    if "execution_status" in segment:
+        segment["execution_status"] = mark_execution_status_truncated(
+            segment["execution_status"]
+        )
     try:
         parsed = json.loads(result)
     except (json.JSONDecodeError, TypeError):
@@ -582,12 +730,39 @@ def _artifact_delivery_failure_summary(event: ToolResultEvent) -> str | None:
     return summary or "publish_artifact failed"
 
 
-def _artifact_delivery_failure_notice() -> str:
+def _artifact_delivery_failure_notice(*, partial: bool = False) -> str:
+    if partial:
+        return (
+            f"{_ARTIFACT_DELIVERY_FAILURE_MARKER} some generated files were attached, "
+            "but at least one file could not be attached. Ask me to resend the "
+            "missing file after I correct the generated file path."
+        )
     return (
         f"{_ARTIFACT_DELIVERY_FAILURE_MARKER} no downloadable file was attached "
         "to this response. Ask me to resend the file after I correct the generated "
         "file path."
     )
+
+
+def _cancelled_partial_response_text(
+    partial_text: str,
+    artifacts: list[dict[str, Any]],
+) -> str:
+    partial_text = partial_text.rstrip()
+    if artifacts:
+        names = [
+            str(item.get("name") or item.get("filename") or "").strip()
+            for item in artifacts
+            if isinstance(item, dict)
+        ]
+        named = [name for name in names if name]
+        delivered = (
+            "The generated file was delivered: " + ", ".join(named) + "."
+            if named
+            else "The generated file was delivered."
+        )
+        return f"{partial_text}\n\n{delivered}" if partial_text else delivered
+    return f"{partial_text}\n\n[interrupted]" if partial_text else "[interrupted]"
 
 
 def _should_add_artifact_delivery_failure_notice(
@@ -596,7 +771,7 @@ def _should_add_artifact_delivery_failure_notice(
     turn_artifacts: list[dict[str, Any]],
     final_text: str,
 ) -> bool:
-    if not failure_summaries or turn_artifacts:
+    if not failure_summaries:
         return False
     return _ARTIFACT_DELIVERY_FAILURE_MARKER not in final_text
 
@@ -1011,6 +1186,8 @@ class TurnRunner:
         session_flush_service: SessionFlushService | None = None,
         session_lock_provider: Callable[[str], asyncio.Lock] | None = None,
         diagnostics_state: Any | None = None,
+        turn_hooks: Sequence[TurnHook] | None = None,
+        compaction_hooks: Sequence[CompactionHook] | None = None,
     ) -> None:
         self._provider_selector = provider_selector
         self._tool_registry = tool_registry
@@ -1024,6 +1201,18 @@ class TurnRunner:
         self._turn_capture_services = turn_capture_services
         self._session_flush_service = session_flush_service
         self._diagnostics_state = diagnostics_state
+        # TurnHook surface. The default trace hook reproduces the inline trace
+        # event behavior while keeping the event sink replaceable at construction.
+        if turn_hooks is None:
+            self._turn_hooks: tuple[TurnHook, ...] = (DefaultTraceEmitterHook(),)
+        else:
+            self._turn_hooks = tuple(turn_hooks)
+        # CompactionHook surface. CompactionAndHistoryStage fans
+        # before/after-compact events out through these hooks. Empty tuple by
+        # default means compaction runs with no hook fan-out.
+        self._compaction_hooks: tuple[CompactionHook, ...] = (
+            tuple(compaction_hooks) if compaction_hooks else ()
+        )
         # Per-session lock provider.
         # Gateway path: task_runtime._get_session_lock_for_turn (wired in boot.py).
         # CLI/standalone path: _standalone_lock_provider from build_turn_runner_from_services.
@@ -1042,10 +1231,96 @@ class TurnRunner:
         # Captured at session start, refreshed on write/compaction.
         self._memory_snapshots: dict[tuple[str, str], MemorySnapshot] = {}
         # Frozen bootstrap snapshots keyed by (agent_id, session_key, context_mode).
-        # Captured on first prompt assembly so USER.md/AGENTS.md edits do not
+        # Captured on first prompt assembly so bootstrap-source edits do not
         # churn the cacheable prefix mid-session.
         self._bootstrap_snapshots: dict[tuple[str, str, str], BootstrapSnapshot] = {}
         self._compaction_failures: dict[str, _CompactionFailureState] = {}
+        self._turn_compacted_sessions: set[str] = set()
+        self._active_pre_compaction_flush_tasks: dict[str, asyncio.Task] = {}
+        # TurnRunner stage decomposition InputStage instance. Holds no per-turn state;
+        # constructed once. Active unconditionally as of.
+        self._input_stage = InputStage(extra_ctx=_TurnRunnerExtraContextAdapter())
+        # TurnRunner stage decomposition ProviderAndToolsStage instance. Holds no
+        # per-turn state. Active unconditionally as of.
+        self._provider_and_tools_stage = ProviderAndToolsStage(
+            provider_resolver=_TurnRunnerProviderResolverAdapter(self),
+            tool_builder=_TurnRunnerToolBuilderAdapter(self),
+        )
+        # TurnRunner stage decomposition PromptAssemblerStage instance. Holds no
+        # per-turn state. Active unconditionally as of.
+        self._prompt_assembler_stage = PromptAssemblerStage(
+            prompt_assembler=_TurnRunnerPromptAssemblerAdapter(self),
+            pipeline_executor=_TurnRunnerPipelineExecutionAdapter(self),
+            router_context=_TurnRunnerRouterContextAdapter(self),
+            prompt_config_resolver=_TurnRunnerPromptConfigResolverAdapter(self),
+            prompt_report_builder=_PromptReportBuilderAdapter(),
+            session_id_resolver=_TurnRunnerSessionIdResolverAdapter(self),
+            memory_fingerprint=_TurnRunnerMemoryFingerprintAdapter(self),
+        )
+        # TurnRunner stage decomposition AgentBootstrapStage instance. Holds no
+        # per-turn state. Active unconditionally as of.
+        self._agent_bootstrap_stage = AgentBootstrapStage(
+            timeout_budget=_TurnRunnerTimeoutBudgetAdapter(self),
+            model_catalog=_TurnRunnerModelCatalogAdapter(self),
+            agent_config_builder=_TurnRunnerAgentConfigBuilderAdapter(self),
+            summarizer_provider=_TurnRunnerSummarizerProviderAdapter(),
+            memory_snapshot=_TurnRunnerMemorySnapshotAdapter(self),
+            agent_factory=_TurnRunnerAgentFactoryAdapter(self),
+        )
+        # TurnRunner stage decomposition CompactionAndHistoryStage instance. Holds no
+        # per-turn state. Active unconditionally as of.
+        self._compaction_and_history_stage = CompactionAndHistoryStage(
+            t3_upgrade=_TurnRunnerT3UpgradeCompactionAdapter(self),
+            preflight=_TurnRunnerPreflightCompactionAdapter(self),
+            history_loader=_TurnRunnerHistoryLoaderAdapter(self),
+            request_context_prepender=_RequestContextPrependAdapter(),
+            compaction_hooks=self._compaction_hooks,
+        )
+        # TurnRunner stage decomposition AttachmentStage instance. Holds no per-turn
+        # state. Active unconditionally as of.
+        self._attachment_stage = AttachmentStage(
+            builder=_TurnRunnerAttachmentMessageBuilderAdapter(self),
+        )
+        # TurnRunner stage decomposition StreamConsumerStage instance. Holds no
+        # per-turn state. Active unconditionally as of. The
+        # warning transformer binds ``self._handle_runtime_warning`` as
+        # a one-method callable; the recording-fake discipline applies
+        # identically to a Protocol-shaped port.
+        self._stream_consumer_stage = StreamConsumerStage(
+            agent_run=_TurnRunnerAgentRunAdapter(),
+            compaction_persist=_TurnRunnerCompactionPersistAdapter(self),
+            memory_snapshot_refresh=_TurnRunnerMemorySnapshotRefreshAdapter(self),
+            system_prompt_refresh=_TurnRunnerSystemPromptRefreshAdapter(self),
+            memory_sync_notify=_TurnRunnerMemorySyncNotifyAdapter(),
+            warning_transformer=self._handle_runtime_warning,
+            compaction_hooks=self._compaction_hooks,
+        )
+        # TurnRunner stage decomposition TurnFinalizerStage instance. Holds no
+        # per-turn state. Active unconditionally as of. Adapter
+        # contracts:
+        #   * TranscriptAppendPort folds the ``token_count`` introspect
+        #     and the ``session_manager is None`` guard.
+        #   * TurnMemoryCapturePort forwards verbatim; the stage owns
+        #     the log-and-continue try/except.
+        #   * SessionTotalsPort inlines the post-DoneEvent cost rollup
+        #     bit-identically to the legacy slice.
+        #   * TurnErrorPersistPort forwards verbatim; the helper owns
+        #     its own try/except + None guards.
+        self._turn_finalizer_stage = TurnFinalizerStage(
+            transcript_append=_TurnRunnerTranscriptAppendAdapter(self),
+            turn_memory_capture=_TurnRunnerTurnMemoryCaptureAdapter(self),
+            session_totals=_TurnRunnerSessionTotalsAdapter(self),
+            turn_error_persist=_TurnRunnerTurnErrorPersistAdapter(self),
+        )
+
+    def has_compacted_this_turn(self, session_key: str) -> bool:
+        return session_key in self._turn_compacted_sessions
+
+    def mark_compacted_this_turn(self, session_key: str) -> None:
+        self._turn_compacted_sessions.add(session_key)
+
+    def clear_compacted_this_turn(self, session_key: str) -> None:
+        self._turn_compacted_sessions.discard(session_key)
 
     def refresh_memory_snapshot(self, agent_id: str) -> None:
         """Refresh frozen snapshots for all sessions of the given agent.
@@ -1136,8 +1411,10 @@ class TurnRunner:
             session_id = session_key.split(":")[-1] or session_key
         return replace(
             tool_context,
+            session_key=session_key,
             artifact_media_root=str(media_root),
             artifact_session_id=session_id,
+            workspace_file_writes=[],
             artifact_max_bytes=getattr(attachments_cfg, "artifact_max_bytes", None),
             artifact_disk_budget_bytes=getattr(
                 attachments_cfg,
@@ -1178,7 +1455,7 @@ class TurnRunner:
         session = await self._session_manager.get_session(session_key)
         if session is None:
             return
-        captured_path = await capture_service.capture_turn(
+        await capture_service.capture_turn(
             session_key=session_key,
             session_id=getattr(session, "session_id", ""),
             user_text=runtime_message,
@@ -1189,20 +1466,8 @@ class TurnRunner:
                 run_kind=run_kind,
             ),
             captured_at=datetime.now(tz=UTC),
-            index_immediately=False,
             no_memory_capture=no_memory_capture,
         )
-        if (
-            captured_path
-            and self._memory_sync_managers
-            and bool(getattr(memory_cfg, "index_captured_turns", False))
-        ):
-            sync_manager = self._memory_sync_managers.get(
-                agent_id
-            ) or self._memory_sync_managers.get("main")
-            mark_dirty = getattr(sync_manager, "mark_dirty", None)
-            if callable(mark_dirty):
-                mark_dirty()
 
     @staticmethod
     def _capture_filter_matches(value: str | None, excluded_values: Any) -> bool:
@@ -1290,6 +1555,10 @@ class TurnRunner:
         attachments: list[dict] | None = None,
         timeout: float | None = None,
         max_iterations: int | None = None,
+        iteration_timeout: float | None = None,
+        tool_timeout: float | None = None,
+        request_timeout: float | None = None,
+        max_provider_retries: int | None = None,
         input_mode: str = "user",
         persist_input: bool = False,
         input_provenance: dict[str, Any] | None = None,
@@ -1316,7 +1585,11 @@ class TurnRunner:
         session_key = canonicalize_session_key(session_key)
         agent_id = normalize_agent_id(agent_id)
         lock = self.get_session_lock(session_key)
-        effective_tool_context = replace(tool_context, session_key=session_key)
+        effective_tool_context = replace(
+            tool_context,
+            session_key=session_key,
+            tool_run_budget_key=f"{session_key}:{uuid.uuid4().hex}",
+        )
         # Re-entry detection: check whether this call chain already owns the
         # session lock (gateway path: TaskRuntime._execute holds the shared
         # lock before calling run()). We use a ContextVar keyed by lock id so
@@ -1328,28 +1601,35 @@ class TurnRunner:
         _caller_holds_lock = owner_map is not None and id(lock) in owner_map
         if _caller_holds_lock:
             # Same call chain already holds the lock (re-entrant call).
-            async for event in self._run_turn(
-                message,
-                session_key,
-                agent_id,
-                model,
-                attachments or [],
-                effective_tool_context,
-                timeout=timeout,
-                max_iterations=max_iterations,
-                input_mode=input_mode,
-                persist_input=persist_input,
-                input_provenance=input_provenance,
-                history_has_persisted_user=history_has_persisted_user,
-                session_intent=session_intent,
-                semantic_message=semantic_message,
-                run_kind=run_kind,
-                heartbeat_ack_max_chars=heartbeat_ack_max_chars,
-                bootstrap_context_mode=bootstrap_context_mode,
-                no_memory_capture=no_memory_capture,
-                ingress_pipeline_steps=ingress_pipeline_steps,
-            ):
-                yield event
+            try:
+                async for event in self._run_turn(
+                    message,
+                    session_key,
+                    agent_id,
+                    model,
+                    attachments or [],
+                    effective_tool_context,
+                    timeout=timeout,
+                    max_iterations=max_iterations,
+                    iteration_timeout=iteration_timeout,
+                    tool_timeout=tool_timeout,
+                    request_timeout=request_timeout,
+                    max_provider_retries=max_provider_retries,
+                    input_mode=input_mode,
+                    persist_input=persist_input,
+                    input_provenance=input_provenance,
+                    history_has_persisted_user=history_has_persisted_user,
+                    session_intent=session_intent,
+                    semantic_message=semantic_message,
+                    run_kind=run_kind,
+                    heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+                    bootstrap_context_mode=bootstrap_context_mode,
+                    no_memory_capture=no_memory_capture,
+                    ingress_pipeline_steps=ingress_pipeline_steps,
+                ):
+                    yield event
+            finally:
+                self.clear_compacted_this_turn(session_key)
         else:
             async with lock:
                 # Record this Task as the lock owner in the ContextVar so that
@@ -1368,6 +1648,10 @@ class TurnRunner:
                         effective_tool_context,
                         timeout=timeout,
                         max_iterations=max_iterations,
+                        iteration_timeout=iteration_timeout,
+                        tool_timeout=tool_timeout,
+                        request_timeout=request_timeout,
+                        max_provider_retries=max_provider_retries,
                         input_mode=input_mode,
                         persist_input=persist_input,
                         input_provenance=input_provenance,
@@ -1382,6 +1666,7 @@ class TurnRunner:
                     ):
                         yield event
                 finally:
+                    self.clear_compacted_this_turn(session_key)
                     _SESSION_LOCK_OWNER.reset(_token)
 
     async def _run_turn(
@@ -1394,6 +1679,10 @@ class TurnRunner:
         tool_context: ToolContext | None = None,
         timeout: float | None = None,
         max_iterations: int | None = None,
+        iteration_timeout: float | None = None,
+        tool_timeout: float | None = None,
+        request_timeout: float | None = None,
+        max_provider_retries: int | None = None,
         input_mode: str = "user",
         persist_input: bool = False,
         input_provenance: dict[str, Any] | None = None,
@@ -1429,9 +1718,14 @@ class TurnRunner:
         turn_segments: list[dict] = []
         turn_artifacts: list[dict[str, Any]] = []
         artifact_delivery_failures: list[str] = []
-        self._write_trace_event(
+        self._emit_turn_event(
             "turn_start",
             trace_context,
+            session_key=session_key,
+            agent_id=agent_id,
+            turn_id=turn_id,
+            run_kind=run_kind,
+            input_mode=input_mode,
             seq=1,
             attrs={"input_mode": input_mode, "run_kind": run_kind},
             payload={
@@ -1440,51 +1734,47 @@ class TurnRunner:
             },
         )
         try:
-            runtime_message = message
-            semantic_input = semantic_message if semantic_message is not None else message
-            extra_prompt_context: dict[str, str] | None = None
-            if input_mode == "system_event":
-                runtime_message = f"[INTERNAL SYSTEM EVENT]\n{message}"
-                semantic_input = message
-                extra_prompt_context = {
-                    "Internal Event Mode": (
-                        "The next input is an internal scheduler event, not a human user"
-                        " message. Treat it as system-originated context."
-                    )
-                }
-            extra_prompt_context = self._merge_extra_prompt_context(
-                extra_prompt_context,
-                self._extra_context_for_tool_context(tool_context),
+            input_out = await self._input_stage.run(
+                InputStageInput(
+                    message=message,
+                    semantic_message=semantic_message,
+                    input_mode=input_mode,
+                    persist_input=persist_input,
+                    input_provenance=input_provenance,
+                    session_key=session_key,
+                    tool_context=tool_context,
+                    session_append=self._session_manager,
+                )
             )
+            runtime_message = input_out.runtime_message
+            semantic_input = input_out.semantic_input
+            extra_prompt_context = input_out.extra_prompt_context
 
-            if persist_input and self._session_manager is not None and message:
-                input_role = "system" if input_mode == "system_event" else "user"
-                persisted_entry = await self._session_manager.append_message(
-                    session_key,
-                    role=input_role,
-                    content=message,
-                    provenance=input_provenance,
+            pt_outcome = await self._provider_and_tools_stage.run(
+                ProviderAndToolsStageInput(
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    tool_context=tool_context,
+                    run_kind=run_kind,
+                    input_mode=input_mode,
                 )
-                # Pick up any stamp SessionManager applied (user role only).
-                if (
-                    input_mode != "system_event"
-                    and persisted_entry is not None
-                    and isinstance(persisted_entry.content, str)
-                    and persisted_entry.content != message
-                ):
-                    runtime_message = persisted_entry.content
-
-            # 1. Resolve provider (clone to avoid shared state race)
-            provider, cloned_selector = self._resolve_provider()
-            if provider is None:
+            )
+            if pt_outcome.terminate:
+                # Harness performs the legacy observability + persist +
+                # yield sequence in the legacy ORDER (trace-emit, persist,
+                # yield, return).
+                provider_error_event = cast(
+                    ErrorEvent, pt_outcome.require_early_yield()
+                )
                 log.error("turn_runner.no_provider", session_key=session_key)
-                provider_error_event = ErrorEvent(
-                    message="No provider available",
-                    code="no_provider",
-                )
-                self._write_trace_event(
+                self._emit_turn_event(
                     "turn_error",
                     trace_context,
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    turn_id=turn_id,
+                    run_kind=run_kind,
+                    input_mode=input_mode,
                     seq=2,
                     payload={
                         "error_type": "ProviderResolutionError",
@@ -1495,110 +1785,54 @@ class TurnRunner:
                 await self._persist_turn_error(session_key, provider_error_event)
                 yield provider_error_event
                 return
+            pt_out = pt_outcome.require_output()
+            provider = pt_out.provider
+            cloned_selector = pt_out.cloned_selector
+            tool_defs = pt_out.tool_defs
+            tool_handler = pt_out.tool_handler
+            tool_context = pt_out.effective_tool_context
+            tool_metadata = pt_out.tool_metadata
 
-            # 2. Build tools (filtered by tool_context)
-            if tool_context is not None:
-                tool_context = await self._with_artifact_context(tool_context, session_key)
-                tool_context = self._with_runtime_write_callbacks(tool_context, agent_id)
-
-            tool_metadata: dict[str, Any] = {}
-            if "metadata" in inspect.signature(self._build_tools).parameters:
-                tool_defs, tool_handler = self._build_tools(tool_context, metadata=tool_metadata)
-            else:
-                tool_defs, tool_handler = self._build_tools(tool_context)
-
-            # 4. Assemble identity prompt
-            prompt_metadata: dict[str, Any] = {}
-            base_prompt = self._assemble_prompt(
-                agent_id,
-                tool_defs,
-                session_key=session_key,
-                semantic_message=semantic_input,
-                extra_context=extra_prompt_context,
-                prompt_metadata=prompt_metadata,
-                bootstrap_context_mode=bootstrap_context_mode,
-            )
-
-            # 4. Run pipeline
-            pipeline_kwargs: dict[str, Any] = {}
-            if _accepts_keyword_arg(self._run_pipeline, "ingress_pipeline_steps"):
-                pipeline_kwargs["ingress_pipeline_steps"] = ingress_pipeline_steps
-            if _accepts_keyword_arg(self._run_pipeline, "semantic_message"):
-                pipeline_kwargs["semantic_message"] = semantic_input
-            router_context = await self._router_previous_assistant_context(
-                session_key,
-                exclude_last_user=history_has_persisted_user or persist_input,
-            )
-            if _accepts_keyword_arg(self._run_pipeline, "prev_assistant_text"):
-                pipeline_kwargs["prev_assistant_text"] = router_context.get("prev_assistant_text")
-            if _accepts_keyword_arg(self._run_pipeline, "prev_assistant_usage"):
-                pipeline_kwargs["prev_assistant_usage"] = router_context.get(
-                    "prev_assistant_usage"
+            pa_outcome = await self._prompt_assembler_stage.run(
+                PromptAssemblerStageInput(
+                    runtime_message=runtime_message,
+                    semantic_input=semantic_input,
+                    extra_prompt_context=extra_prompt_context,
+                    provider=provider,
+                    cloned_selector=cloned_selector,
+                    tool_defs=tool_defs,
+                    effective_tool_context=tool_context,
+                    tool_metadata=tool_metadata,
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    turn_id=turn_id,
+                    attachments=attachments,
+                    bootstrap_context_mode=bootstrap_context_mode,
+                    model=model,
+                    history_has_persisted_user=history_has_persisted_user,
+                    persist_input=persist_input,
+                    ingress_pipeline_steps=ingress_pipeline_steps,
                 )
-            if _accepts_keyword_arg(self._run_pipeline, "history_user_texts"):
-                pipeline_kwargs["history_user_texts"] = router_context.get("history_user_texts")
-            if _accepts_keyword_arg(self._run_pipeline, "flags_text_override"):
-                pipeline_kwargs["flags_text_override"] = semantic_input
-            if _accepts_keyword_arg(self._run_pipeline, "tool_context"):
-                pipeline_kwargs["tool_context"] = tool_context
-            turn, provider = await self._run_pipeline(
-                runtime_message,
-                session_key,
-                provider,
-                cloned_selector,
-                tool_defs,
-                base_prompt,
-                attachments,
-                **pipeline_kwargs,
             )
-            turn.metadata.update(prompt_metadata)
-            turn.metadata.update(tool_metadata)
-            if self._config is not None and hasattr(self._config, "memory_mode_fingerprint"):
-                try:
-                    turn.metadata["memory_mode_fingerprint"] = (
-                        self._config.memory_mode_fingerprint()
-                    )
-                except Exception:
-                    pass
-            effective_runtime_message = getattr(turn, "message", runtime_message)
-            if model and cloned_selector is not None:
-                cloned_selector.override_model(model)
-                provider = cloned_selector.resolve()
-            if cloned_selector is not None:
-                provider = _SelectorFallbackProvider(provider, cloned_selector)
+            pa_out = pa_outcome.require_output()
+            provider = pa_out.provider
+            turn = pa_out.turn
             turn_obj = turn
-            tool_defs_for_log = tool_defs
+            tool_defs_for_log = turn.tool_defs
             provider_for_log = provider
-
-            # 5. Resolve final prompt and config
-            final_prompt, cache_breakpoints, request_context_prompt = self._resolve_prompt_config(
-                turn
-            )
+            effective_runtime_message = pa_out.effective_runtime_message
+            final_prompt = pa_out.final_prompt
             final_prompt_str = final_prompt
-            session_id_for_log = await self._resolve_session_id_for_log(session_key)
-            prompt_report_for_log = build_prompt_report(
-                turn_id=turn_id,
-                session_key=session_key,
-                session_id=session_id_for_log,
-                agent_id=agent_id,
-                system_prompt=final_prompt_str,
-                tool_defs=turn.tool_defs,
-                metadata=turn.metadata,
-                tool_profile=turn.metadata.get("tool_profile"),
-            )
-
-            # Resolve model_id: explicit param > pipeline-routed > selector current config
-            selector_model = ""
-            if cloned_selector is not None:
-                try:
-                    selector_model = getattr(cloned_selector.current_config, "model", "") or ""
-                except Exception:
-                    selector_model = ""
-            resolved_model = model or turn.model or selector_model
-            provider_name = getattr(provider, "provider_name", "") or type(provider).__name__
+            cache_breakpoints = pa_out.cache_breakpoints
+            request_context_prompt = pa_out.request_context_prompt
+            resolved_model = pa_out.resolved_model
+            provider_name = pa_out.provider_name
+            session_id_for_log = pa_out.session_id_for_log
+            prompt_report_for_log = pa_out.prompt_report
+            selector_model = pa_out.selector_model
             trace_context = replace(
                 trace_context,
-                session_id=session_id_for_log,
+                session_id=pa_out.trace_context_session_id,
             )
             if is_turn_call_log_enabled(self._diagnostics_state):
                 turn_call_logger = TurnCallLogger(
@@ -1622,12 +1856,14 @@ class TurnRunner:
                 )
                 turn_call_logger.write(
                     "turn_start",
-                        {
-                            "input_mode": input_mode,
-                            "message": effective_runtime_message,
-                            "attachment_count": len(attachments),
-                            "tool_names": [getattr(td, "name", "") for td in turn.tool_defs],
-                        },
+                    {
+                        "input_mode": input_mode,
+                        "message": effective_runtime_message,
+                        "attachment_count": len(attachments),
+                        "tool_names": [
+                            getattr(td, "name", "") for td in turn.tool_defs
+                        ],
+                    },
                 )
             log.debug(
                 "turn_runner.model_resolved",
@@ -1635,539 +1871,164 @@ class TurnRunner:
                 pipeline_model=turn.model,
                 selector_model=selector_model,
                 resolved=resolved_model,
-                squilla_router_tier=turn.metadata.get("routed_tier"),
+                squilla_router_tier=pa_out.squilla_router_tier,
             )
-            # Runtime timeout is the whole agent turn lifecycle. Provider
-            # request timeout remains separate and is passed as request_timeout.
-            effective_runtime_timeout = (
-                float(timeout)
-                if timeout is not None
-                else self._resolve_agent_runtime_timeout(session_key)
-            )
-            effective_max_iterations = self._resolve_agent_max_iterations(
-                session_key,
-                max_iterations,
-            )
-            effective_request_timeout = self._resolve_llm_timeout(session_key)
-
-            # Resolve max_tokens & context_window from model catalog
-            user_max_tokens = getattr(getattr(self._config, "llm", None), "max_tokens", 0)
-            if self._model_catalog is not None:
-                max_tokens = self._model_catalog.resolve_max_tokens(
-                    resolved_model, user_override=user_max_tokens
+            ab_outcome = await self._agent_bootstrap_stage.run(
+                AgentBootstrapStageInput(
+                    provider=provider,
+                    cloned_selector=cloned_selector,
+                    turn=turn,
+                    final_prompt=final_prompt,
+                    cache_breakpoints=cache_breakpoints,
+                    request_context_prompt=request_context_prompt,
+                    resolved_model=resolved_model,
+                    session_id_for_log=session_id_for_log,
+                    tool_handler=tool_handler,
+                    turn_call_logger=turn_call_logger,
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    timeout=timeout,
+                    max_iterations=max_iterations,
+                    iteration_timeout=iteration_timeout,
+                    tool_timeout=tool_timeout,
+                    request_timeout=request_timeout,
+                    max_provider_retries=max_provider_retries,
                 )
-                context_window = self._model_catalog.resolve_context_window(resolved_model)
-            else:
-                max_tokens = user_max_tokens if user_max_tokens > 0 else 8192
-                context_window = 200_000
+            )
+            ab_out = ab_outcome.require_output()
+            agent = ab_out.agent
+            agent_config = ab_out.agent_config
+            # These locals are read by the test_agent_bootstrap_stage_snapshot
+            # frame-walking probe. Do not remove.
+            effective_runtime_timeout = ab_out.effective_runtime_timeout  # noqa: F841
+            effective_max_iterations = ab_out.effective_max_iterations  # noqa: F841
+            effective_iteration_timeout = ab_out.effective_iteration_timeout  # noqa: F841
+            effective_tool_timeout = ab_out.effective_tool_timeout  # noqa: F841
+            effective_agent_request_timeout = ab_out.effective_request_timeout  # noqa: F841
+            effective_max_provider_retries = ab_out.effective_max_provider_retries  # noqa: F841
+            model_caps = ab_out.model_capabilities  # noqa: F841
+            private_memory_allowed = ab_out.private_memory_allowed
+            sync_manager = ab_out.sync_manager
 
-            # Resolve model capabilities for reasoning support
-            model_caps = None
-            if self._model_catalog is not None:
-                provider_name = getattr(
-                    getattr(self._config, "llm", None), "provider", "openrouter"
+            # 6. Compaction (t3 + preflight) + history load + request-context
+            # prepend. CompactionAndHistoryStage owns the four-call sequence
+            # (t3_upgrade → preflight → load_history → prepend_request_context_prompt).
+            ch_outcome = await self._compaction_and_history_stage.run(
+                CompactionAndHistoryStageInput(
+                    agent=agent,
+                    context_window_tokens=agent_config.context_window_tokens,
+                    provider=provider,
+                    resolved_model=resolved_model,
+                    turn=turn,
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    history_has_persisted_user=history_has_persisted_user,
                 )
-                base_url = getattr(getattr(self._config, "llm", None), "base_url", "")
-                model_caps = self._model_catalog.get_capabilities(
-                    resolved_model, provider_name=provider_name, base_url=base_url
+            )
+            ch_out = ch_outcome.require_output()
+            agent.config.request_context_prompt = (
+                ch_out.final_request_context_prompt
+            )
+
+            # 8. Build extra messages for attachments + turn_input rebind.
+            # AttachmentStage owns the slice.
+            att_outcome = await self._attachment_stage.run(
+                AttachmentStageInput(
+                    effective_runtime_message=effective_runtime_message,
+                    attachments=attachments,
                 )
-
-            _mem_cfg = getattr(self._config, "memory", None) if self._config else None
-            _agent_token_cfg = (
-                getattr(self._config, "agent_token_saving", None) if self._config else None
             )
-            thinking = self._resolve_turn_thinking(turn)
-            tool_result_compression_mode = self._resolve_tool_result_compression_mode(
-                _agent_token_cfg
-            )
-            tool_result_summary_model = getattr(
-                _agent_token_cfg,
-                "tool_result_compression_summary_model",
-                None,
-            )
-            agent_config = AgentConfig(
-                max_iterations=effective_max_iterations,
-                system_prompt=final_prompt,
-                cache_breakpoints=cache_breakpoints,
-                request_context_prompt=request_context_prompt,
-                cache_mode=turn.metadata.get("cache_mode", "off"),
-                skills_context_prompt=turn.metadata.get("skills_context_prompt"),
-                model_id=resolved_model,
-                timeout=effective_runtime_timeout,
-                request_timeout=effective_request_timeout,
-                max_tokens=max_tokens,
-                context_window_tokens=context_window,
-                flush_enabled=getattr(_mem_cfg, "flush_enabled", True),
-                flush_timeout_seconds=getattr(_mem_cfg, "flush_timeout_seconds", 5.0),
-                flush_backoff_initial_seconds=getattr(
-                    _mem_cfg,
-                    "flush_backoff_initial_seconds",
-                    30.0,
-                ),
-                flush_backoff_max_seconds=getattr(_mem_cfg, "flush_backoff_max_seconds", 300.0),
-                flush_archive_max_bytes=getattr(_mem_cfg, "flush_archive_max_bytes", 800_000),
-                flush_workspace_dir=str(self._resolve_memory_source_dir(agent_id)),
-                model_capabilities=model_caps,
-                thinking=thinking,
-                tool_result_compression_enabled=getattr(
-                    _agent_token_cfg,
-                    "tool_result_compression_enabled",
-                    True,
-                ),
-                tool_result_compression_mode=tool_result_compression_mode,  # type: ignore[arg-type]
-                tool_result_compression_max_share=getattr(
-                    _agent_token_cfg,
-                    "tool_result_compression_max_share",
-                    0.25,
-                ),
-                tool_result_compression_summary_model=tool_result_summary_model,
-                tool_result_compression_summary_max_tokens=getattr(
-                    _agent_token_cfg,
-                    "tool_result_compression_summary_max_tokens",
-                    1024,
-                ),
-                tool_result_compression_summary_timeout_seconds=getattr(
-                    _agent_token_cfg,
-                    "tool_result_compression_summary_timeout_seconds",
-                    20.0,
-                ),
-                tool_result_compression_summary_input_max_chars=getattr(
-                    _agent_token_cfg,
-                    "tool_result_compression_summary_input_max_chars",
-                    60_000,
-                ),
-                metadata=turn.metadata,
-            )
-            tool_result_summarizer_provider = self._resolve_tool_result_summarizer_provider(
-                mode=tool_result_compression_mode,
-                cloned_selector=cloned_selector,
-                current_provider=provider,
-                summary_model=tool_result_summary_model,
-            )
-
-            # Resolve per-agent memory sync manager (Trigger 1: warm session)
-            sync_manager = (
-                self._memory_sync_managers.get(agent_id) if self._memory_sync_managers else None
-            )
-            if sync_manager is not None:
-                await sync_manager.warm_session(session_key)
-
-            # Capture frozen memory snapshot on first turn of this session
-            private_memory_allowed = allows_private_memory_prompt_injection(session_key)
-            snap_key = (agent_id, session_key)
-            if private_memory_allowed and snap_key not in self._memory_snapshots:
-                _ws = self._resolve_memory_source_dir(agent_id)
-                self._memory_snapshots[snap_key] = MemorySnapshot(
-                    memory_md=self._load_memory_md(_ws),
-                    daily_notes=self._load_daily_notes(_ws),
-                )
-
-            agent = Agent(
-                provider=cast(LLMProvider, provider),
-                config=agent_config,
-                tool_definitions=turn.tool_defs,
-                tool_handler=tool_handler,
-                usage_tracker=self._usage_tracker,
-                session_key=session_key,
-                turn_call_logger=turn_call_logger,
-                tool_result_summarizer_provider=cast(
-                    LLMProvider | None,
-                    tool_result_summarizer_provider,
-                ),
-            )
-            agent._memory_sync_manager = sync_manager
-            cast(Any, agent)._session_flush_service = self._session_flush_service
-
-            # 6. Pre-flight compaction (before loading history into Agent)
-            t3_upgrade_result = await self._maybe_compact_on_t3_upgrade(
-                session_key,
-                turn,
-                agent_config.context_window_tokens,
-                compaction_provider=provider,
-                compaction_model=resolved_model,
-            )
-            if t3_upgrade_result in {_T3_NOT_APPLICABLE, _T3_FLUSH_FAILED}:
-                await self._maybe_preflight_compact(
-                    session_key,
-                    agent_config.context_window_tokens,
-                    compaction_provider=provider,
-                    compaction_model=resolved_model,
-                )
-
-            # 7. Load history. Compaction summaries are composed after
-            # preflight compaction and before Agent.run_turn so summaries
-            # created during preflight are visible on the same turn without
-            # mutating the cacheable system prompt.
-            compaction_summary_context = await self._load_history(
-                agent,
-                session_key,
-                trim_last_user=history_has_persisted_user,
-            )
-            agent.config.request_context_prompt = _prepend_request_context_prompt(
-                agent.config.request_context_prompt,
-                compaction_summary_context,
-            )
-
-            # 8. Build extra messages for attachments
-            extra_msgs = self._build_attachment_messages(
-                effective_runtime_message,
-                attachments,
-                media_root=self._attachment_media_root(),
-            )
+            att_out = att_outcome.require_output()
+            extra_msgs = att_out.extra_messages
 
             # 9. Stream events (final_text_parts/turn_segments are declared
-            # up-front above so the CancelledError handler can read them)
+            # up-front above so the CancelledError handler can read them).
+            # StreamConsumerStage owns the slice. The four pre-stream
+            # accumulators (final_text_parts, turn_segments, turn_artifacts,
+            # artifact_delivery_failures) stay declared in this scope and
+            # are PASSED BY REFERENCE into _StreamState so the
+            # CancelledError handler below still sees them.
             current_text_parts: list[str] = []
             error_message: str | None = None
             pending_error_event: ErrorEvent | None = None
             done_event: DoneEvent | None = None
-            turn_input = effective_runtime_message if extra_msgs is None else ""
-            agent_run_kwargs: dict[str, Any] = {}
-            if _accepts_keyword_arg(agent.run_turn, "semantic_message"):
-                agent_run_kwargs["semantic_message"] = semantic_input
-            async for event in agent.run_turn(
-                turn_input,
+            turn_input = att_out.turn_input
+
+            stream_state = _StreamState(
+                current_text_parts=current_text_parts,
+                final_text_parts=final_text_parts,
+                turn_segments=turn_segments,
+                turn_artifacts=turn_artifacts,
+                artifact_delivery_failures=artifact_delivery_failures,
+            )
+            stream_inp = StreamConsumerStageInput(
+                agent=agent,
+                agent_id=agent_id,
+                sync_manager=sync_manager,
+                private_memory_allowed=private_memory_allowed,
+                turn=turn,
+                tool_defs=tool_defs,
+                turn_input=turn_input,
                 extra_messages=extra_msgs,
-                **agent_run_kwargs,
-            ):
-                if isinstance(event, TextDeltaEvent):
-                    final_text_parts.append(event.text)
-                    current_text_parts.append(event.text)
-                elif isinstance(event, ToolUseStartEvent):
-                    if event.synthetic_from_text and current_text_parts:
-                        raw_current_text = "".join(current_text_parts)
-                        cleaned_current_text = strip_synthetic_tool_call_text(
-                            raw_current_text,
-                            event.tool_name,
-                        )
-                        if cleaned_current_text != raw_current_text:
-                            full_text = "".join(final_text_parts)
-                            if full_text.endswith(raw_current_text):
-                                prefix = full_text[: -len(raw_current_text)]
-                                final_text_parts = [prefix + cleaned_current_text]
-                            else:
-                                final_text_parts = [
-                                    strip_synthetic_tool_call_text(
-                                        full_text,
-                                        event.tool_name,
-                                    )
-                                ]
-                            current_text_parts = (
-                                [cleaned_current_text] if cleaned_current_text else []
-                            )
-                    if current_text_parts:
-                        turn_segments.append({"type": "text", "text": "".join(current_text_parts)})
-                        current_text_parts = []
-                    turn_segments.append(
-                        {
-                            "type": "tool_use",
-                            "tool_use_id": event.tool_use_id,
-                            "name": event.tool_name,
-                            "input": "",
-                        }
-                    )
-                elif isinstance(event, ToolResultEvent):
-                    failure_summary = _artifact_delivery_failure_summary(event)
-                    if failure_summary is not None:
-                        artifact_delivery_failures.append(failure_summary)
-                    if event.arguments is not None:
-                        for segment in reversed(turn_segments):
-                            if (
-                                segment.get("type") == "tool_use"
-                                and segment.get("tool_use_id") == event.tool_use_id
-                            ):
-                                segment["input"] = event.arguments
-                                break
-                    turn_segments.append(_persisted_tool_result_segment(event))
-                elif isinstance(event, ArtifactEvent):
-                    turn_artifacts.append(artifact_payload(event))
-                elif isinstance(event, ErrorEvent):
-                    # Agent emits ErrorEvent(code="timeout") when
-                    # asyncio.timeout() fires. Rewrite to the stable user
-                    # envelope so every downstream renderer (UI, CLI, channel)
-                    # sees the same shape as the tool-failure envelope.
-                    if event.code == "timeout":
-                        event = ErrorEvent(
-                            message=_LLM_TIMEOUT_ENVELOPE["user_message"],
-                            code=_LLM_TIMEOUT_ENVELOPE["error_class"],
-                        )
-                    if event.code == "incomplete_tool_stream":
-                        turn_segments = _drop_unpaired_tool_use_segments(turn_segments)
-                    error_message = event.message or "Unknown error"
-                    pending_error_event = event
-                    continue
-                elif isinstance(event, WarningEvent):
-                    event = self._handle_runtime_warning(event)
-                elif isinstance(event, DoneEvent):
-                    normalized_text = _normalize_heartbeat_text(
-                        event.text,
-                        run_kind=run_kind,
-                        heartbeat_ack_max_chars=heartbeat_ack_max_chars,
-                    )
-                    metadata = turn.metadata
-                    routed_tier = metadata.get("routed_tier")
-                    routing_source = metadata.get("routing_source", "none")
-                    routing_confidence = float(metadata.get("routing_confidence") or 0.0)
-                    baseline_model = metadata.get("baseline_model", "")
-                    routed_model = metadata.get("routed_model", "") or event.model
-                    savings_pct = float(metadata.get("savings_pct") or 0.0)
-                    _max_p = float(metadata.get("savings_max_price_per_m") or 0.0)
-                    _rte_p = float(metadata.get("savings_routed_price_per_m") or 0.0)
-                    savings_usd = _compute_route_input_savings_usd(
-                        _max_p,
-                        _rte_p,
-                        event.input_tokens,
-                    )
-                    router_cfg = getattr(self._config, "squilla_router", None)
-                    squilla_router_tiers = getattr(router_cfg, "tiers", {})
-                    estimated_output_savings_pct = getattr(
-                        router_cfg,
-                        "estimated_output_savings_pct",
-                        0.03,
-                    )
-                    comprehensive = _compute_comprehensive_turn_savings(
-                        event,
-                        metadata,
-                        squilla_router_tiers,
-                        routed_model,
-                        estimated_output_savings_pct=estimated_output_savings_pct,
-                    )
-                    provider_cache_hit = (event.cached_tokens or 0) > 0
-                    opensquilla_cache_hit = metadata.get("cache_mode") == "hit"
-                    event = replace(
-                        event,
-                        text=normalized_text,
-                        routed_tier=routed_tier,
-                        routing_source=routing_source or "none",
-                        routing_confidence=routing_confidence,
-                        baseline_model=baseline_model,
-                        routed_model=routed_model,
-                        savings_pct=savings_pct,
-                        savings_usd=savings_usd,
-                        cache_hit_active=provider_cache_hit or opensquilla_cache_hit,
-                        total_savings_pct=comprehensive.pct,
-                        total_savings_usd=comprehensive.usd,
-                    )
-                    done_event = event
-                    if normalized_text and not final_text_parts:
-                        final_text_parts.append(normalized_text)
-                        if turn_segments:
-                            current_text_parts.append(normalized_text)
-                    accumulated_text = "".join(final_text_parts)
-                    if _should_add_artifact_delivery_failure_notice(
-                        failure_summaries=artifact_delivery_failures,
-                        turn_artifacts=turn_artifacts,
-                        final_text=accumulated_text,
-                    ):
-                        separator = "\n\n" if accumulated_text.strip() else ""
-                        notice_delta = separator + _artifact_delivery_failure_notice()
-                        final_text_parts.append(notice_delta)
-                        current_text_parts.append(notice_delta)
-                        normalized_text = "".join(final_text_parts)
-                        event = replace(event, text=normalized_text)
-                        done_event = event
-                        yield TextDeltaEvent(text=notice_delta)
-                    # Hallucination check: emit Warning BEFORE yielding Done
-                    # so CLI/SDK consumers that stop reading on terminal events
-                    # still see it.
-                    accumulated_text = "".join(final_text_parts)
-                    if _claims_image_without_tool_use(
-                        accumulated_text, turn.tool_defs, turn_segments
-                    ):
-                        yield WarningEvent(
-                            code="image_generate_claimed_without_call",
-                            message=(
-                                "The assistant described a generated image but did not "
-                                "call an image-generation tool. No image was produced."
-                            ),
-                        )
-                elif isinstance(event, CompactionEvent):
-                    if self._session_manager is not None:
-                        try:
-                            await self._session_manager.persist_compaction_result(
-                                session_key,
-                                event.summary,
-                                event.kept_entries,
-                            )
-                            notify_compaction(session_key)
-                        except Exception as exc:
-                            log.warning("compaction_persist_failed", error=str(exc))
-                    # Refresh frozen snapshot and system prompt after compaction
-                    _ws2 = self._resolve_memory_source_dir(agent_id)
-                    if private_memory_allowed:
-                        self._memory_snapshots[(agent_id, session_key)] = MemorySnapshot(
-                            memory_md=self._load_memory_md(_ws2),
-                            daily_notes=self._load_daily_notes(_ws2),
-                        )
-                    # Compaction-refresh resets the agent to a clean cacheable
-                    # base; the next turn's normal pre-turn pipeline will
-                    # rebuild the volatile suffix (memory / workspace)
-                    # from fresh state. ``_assemble_prompt`` may still return a
-                    # ``(base, dynamic_suffix)`` tuple here — daily_notes,
-                    # workspace_files, and extra_context now live in that
-                    # suffix — so extract just the base. Feeding the
-                    # tuple straight to ``agent.refresh_system_prompt`` would
-                    # smuggle volatile bytes into ``ChatConfig.system`` and
-                    # raise ValidationError on the next turn.
-                    assembled = self._assemble_prompt(
-                        agent_id,
-                        tool_defs,
-                        session_key=session_key,
-                        bootstrap_context_mode=bootstrap_context_mode,
-                    )
-                    refreshed_prompt = assembled[0] if isinstance(assembled, tuple) else assembled
-                    agent.refresh_system_prompt(refreshed_prompt)
-                    continue  # internal event, don't yield to caller
-                yield event
-
-            # Flush any remaining text segment
-            if current_text_parts:
-                turn_segments.append({"type": "text", "text": "".join(current_text_parts)})
-
-            # Trigger 5: notify memory sync of message bytes
-            if sync_manager is not None:
-                byte_count = len(effective_runtime_message.encode("utf-8"))
-                sync_manager.notify_message(byte_count)
-
-            # 10. Persist assistant response (filter sentinel tokens)
-            final_text = "".join(final_text_parts)
-            original_final_text = final_text
-            final_text = _normalize_heartbeat_text(
-                final_text,
+                semantic_input=semantic_input,
+                effective_runtime_message=effective_runtime_message,
+                input_provenance=input_provenance,
+                session_key=session_key,
                 run_kind=run_kind,
                 heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+                bootstrap_context_mode=bootstrap_context_mode,
+                router_cfg=getattr(self._config, "squilla_router", None),
+                session_manager_present=self._session_manager is not None,
+                state=stream_state,
+                tool_context=tool_context,
             )
-            if (
-                original_final_text
-                and not final_text
-                and turn_segments
-                and all(
-                    isinstance(segment, dict) and segment.get("type") == "text"
-                    for segment in turn_segments
+            async for event in self._stream_consumer_stage.run(stream_inp):
+                yield event
+            # Read terminal state off the shared _StreamState. The
+            # four pass-by-reference lists were mutated in place, so
+            # this preserves the harness's read-after-stream
+            # contract; only the four owned fields need explicit
+            # writeback.
+            current_text_parts = stream_state.current_text_parts
+            error_message = stream_state.error_message
+            pending_error_event = stream_state.pending_error_event
+            done_event = stream_state.done_event
+            # Post-stage edge owned by the harness: flush remaining
+            # text segment. The stage's post-stream notify already
+            # fired (it is the last action of the stage body).
+            if current_text_parts:
+                turn_segments.append(
+                    {"type": "text", "text": "".join(current_text_parts)}
                 )
-            ):
-                turn_segments = []
-            # (Hallucination warning is emitted inside the DoneEvent branch
-            # above so it precedes the terminal done event for all consumers.)
 
-            if (
-                final_text or turn_segments or turn_artifacts
-            ) and self._session_manager is not None:
-                persisted_content = (
-                    json.dumps(
-                        {"text": final_text, "artifacts": turn_artifacts},
-                        ensure_ascii=False,
-                    )
-                    if turn_artifacts
-                    else final_text
+            # 10. Persist assistant response (filter sentinel tokens).
+            # TurnFinalizerStage owns the slice. The four side effects
+            # fire in legacy order: heartbeat normalize -> transcript
+            # append -> memory capture (try/except) -> error persist ->
+            # session totals rollup (try/except).
+            fin_outcome = await self._turn_finalizer_stage.run(
+                TurnFinalizerStageInput(
+                    final_text_parts=final_text_parts,
+                    turn_segments=turn_segments,
+                    turn_artifacts=turn_artifacts,
+                    error_message=error_message,
+                    pending_error_event=pending_error_event,
+                    done_event=done_event,
+                    runtime_message=runtime_message,
+                    input_mode=input_mode,
+                    input_provenance=input_provenance,
+                    resolved_model=resolved_model,
+                    agent_id=agent_id,
+                    session_key=session_key,
+                    tool_context=tool_context,
+                    run_kind=run_kind,
+                    heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+                    no_memory_capture=no_memory_capture,
                 )
-                append_kwargs: dict[str, Any] = {
-                    "role": "assistant",
-                    "content": persisted_content,
-                    "tool_calls": turn_segments if turn_segments else None,
-                }
-                if (
-                    done_event is not None
-                    and done_event.reasoning_content
-                    and _is_deepseek_model_id(done_event.model or resolved_model or "")
-                ):
-                    append_kwargs["reasoning_content"] = done_event.reasoning_content
-                if _accepts_keyword_arg(self._session_manager.append_message, "token_count"):
-                    append_kwargs["token_count"] = (
-                        done_event.output_tokens if done_event is not None else None
-                    )
-                await self._session_manager.append_message(session_key, **append_kwargs)
-                try:
-                    await self._capture_turn_memory(
-                        agent_id=agent_id,
-                        session_key=session_key,
-                        runtime_message=runtime_message,
-                        final_text=final_text,
-                        input_mode=input_mode,
-                        tool_context=tool_context,
-                        input_provenance=input_provenance,
-                        run_kind=run_kind,
-                        no_memory_capture=no_memory_capture,
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "turn_runner.capture_failed",
-                        session_key=session_key,
-                        agent_id=agent_id,
-                        error=str(exc),
-                    )
-            if error_message and self._session_manager is not None:
-                await self._persist_turn_error(session_key, pending_error_event)
-            if done_event is not None and self._session_manager is not None:
-                try:
-                    current_session = await self._session_manager.get_session(session_key)
-                    if current_session is not None:
-                        done_total_tokens = done_event.input_tokens + done_event.output_tokens
-                        event_cost_source = normalize_event_cost_source(
-                            done_event.cost_source,
-                            input_tokens=done_event.input_tokens,
-                            output_tokens=done_event.output_tokens,
-                            cache_read_tokens=done_event.cached_tokens,
-                            cache_write_tokens=done_event.cache_write_tokens,
-                            cost_usd=done_event.cost_usd,
-                            billed_cost_usd=done_event.billed_cost,
-                        )
-                        next_total_cost = (
-                            getattr(current_session, "total_cost_usd", 0.0) or 0.0
-                        ) + done_event.cost_usd
-                        next_billed_cost = (
-                            getattr(current_session, "billed_cost_usd", 0.0) or 0.0
-                        ) + done_event.billed_cost
-                        next_estimated_component = (
-                            getattr(current_session, "estimated_cost_component_usd", 0.0)
-                            or 0.0
-                        )
-                        if event_cost_source == "opensquilla_estimate":
-                            next_estimated_component += done_event.cost_usd
-                        next_missing_entries = (
-                            getattr(current_session, "missing_cost_entries", 0) or 0
-                        )
-                        if event_cost_source == "unavailable":
-                            next_missing_entries += 1
-                        next_cost_source = rollup_cost_source(
-                            billed_cost_usd=next_billed_cost,
-                            estimated_cost_component_usd=next_estimated_component,
-                            missing_cost_entries=next_missing_entries,
-                        )
-                        # Persist the last actual model into usage metadata only.
-                        # Writing it to session.model would pin future turns and
-                        # silently bypass squilla-router routing.
-                        await self._session_manager.update(
-                            session_key,
-                            input_tokens=(getattr(current_session, "input_tokens", 0) or 0)
-                            + done_event.input_tokens,
-                            output_tokens=(getattr(current_session, "output_tokens", 0) or 0)
-                            + done_event.output_tokens,
-                            total_tokens=(getattr(current_session, "total_tokens", 0) or 0)
-                            + done_total_tokens,
-                            total_tokens_fresh=True,
-                            estimated_cost_usd=(
-                                getattr(current_session, "estimated_cost_usd", 0.0) or 0.0
-                            )
-                            + done_event.cost_usd,
-                            total_cost_usd=next_total_cost,
-                            billed_cost_usd=next_billed_cost,
-                            estimated_cost_component_usd=next_estimated_component,
-                            cost_source=next_cost_source,
-                            missing_cost_entries=next_missing_entries,
-                            cache_read=(getattr(current_session, "cache_read", 0) or 0)
-                            + done_event.cached_tokens,
-                            cache_write=(getattr(current_session, "cache_write", 0) or 0)
-                            + done_event.cache_write_tokens,
-                            model_override=done_event.model
-                            or getattr(current_session, "model_override", None),
-                        )
-                except Exception as exc:
-                    log.warning(
-                        "turn_runner.session_usage_persist_failed",
-                        session_key=session_key,
-                        error=str(exc),
-                    )
+            )
+            fin_out = fin_outcome.require_output()
+            final_text = fin_out.final_text
+            turn_segments = fin_out.turn_segments
 
             if turn_call_logger is not None:
                 turn_call_logger.write(
@@ -2179,9 +2040,14 @@ class TurnRunner:
                     },
                 )
             if trace_context is not None:
-                self._write_trace_event(
+                self._emit_turn_event(
                     "turn_end",
                     trace_context,
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    turn_id=turn_id,
+                    run_kind=run_kind,
+                    input_mode=input_mode,
                     seq=2,
                     attrs={"provider": provider_name, "model": resolved_model},
                     payload={
@@ -2189,6 +2055,21 @@ class TurnRunner:
                         "segment_count": len(turn_segments),
                         "artifact_count": len(turn_artifacts),
                         "error": bool(error_message),
+                        "tool_compression_applied": bool(
+                            turn.metadata.get("tool_compression_applied", False)
+                        ),
+                        "tool_compression_calls": int(
+                            turn.metadata.get("tool_compression_calls", 0) or 0
+                        ),
+                        "tool_compression_tokens_saved": int(
+                            turn.metadata.get("tool_compression_tokens_saved", 0) or 0
+                        ),
+                        "tool_result_store_writes": int(
+                            turn.metadata.get("tool_result_store_writes", 0) or 0
+                        ),
+                        "tool_result_store_skips": int(
+                            turn.metadata.get("tool_result_store_skips", 0) or 0
+                        ),
                     },
                 )
 
@@ -2237,10 +2118,7 @@ class TurnRunner:
                 partial_text or turn_segments or turn_artifacts
             ) and self._session_manager is not None:
                 try:
-                    # Neutral marker: under Proposal C, new user input does not
-                    # cancel a turn (it queues). Cancellation now means ESC /
-                    # Stop / idle timeout. "[interrupted]" is accurate for all.
-                    body = f"{partial_text}\n\n[interrupted]" if partial_text else "[interrupted]"
+                    body = _cancelled_partial_response_text(partial_text, turn_artifacts)
                     if turn_artifacts:
                         body = json.dumps(
                             {"text": body, "artifacts": turn_artifacts},
@@ -2273,15 +2151,36 @@ class TurnRunner:
                 except Exception:
                     pass
             if trace_context is not None:
-                self._write_trace_event(
+                self._emit_turn_event(
                     "turn_cancelled",
                     trace_context,
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    turn_id=turn_id,
+                    run_kind=run_kind,
+                    input_mode=input_mode,
                     seq=2,
                     payload={"partial_text_chars": len(partial_text)},
                 )
             raise
 
         except Exception as exc:
+            error_code, error_message = sanitize_agent_error(
+                {
+                    "status": "failed",
+                    "terminal_reason": "error",
+                    "error_class": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+                fallback_error_class="agent_error",
+                fallback_error_message=str(exc) or "Agent error",
+            )
+            event_code = (
+                error_code
+                if error_code
+                in {"provider_request_too_large", "provider_output_truncated"}
+                else "agent_error"
+            )
             log.error(
                 "turn_runner.failed",
                 session_key=session_key,
@@ -2289,8 +2188,19 @@ class TurnRunner:
                 exc_info=True,
             )
             if self._session_manager is not None:
+                if event_code == "provider_output_truncated":
+                    transcript_message = build_terminal_reply(
+                        {
+                            "status": "failed",
+                            "terminal_reason": "output_truncated",
+                            "error_class": event_code,
+                            "error_message": error_message,
+                        }
+                    )
+                else:
+                    transcript_message = f"Error: {error_message}"
                 await self._session_manager.append_message(
-                    session_key, role="system", content=f"Error: {exc}"
+                    session_key, role="system", content=transcript_message
                 )
             if turn_call_logger is not None:
                 turn_call_logger.write(
@@ -2301,16 +2211,21 @@ class TurnRunner:
                     },
                 )
             if trace_context is not None:
-                self._write_trace_event(
+                self._emit_turn_event(
                     "turn_error",
                     trace_context,
+                    session_key=session_key,
+                    agent_id=agent_id,
+                    turn_id=turn_id,
+                    run_kind=run_kind,
+                    input_mode=input_mode,
                     seq=2,
                     payload={
                         "error_type": type(exc).__name__,
                         "error_chars": len(str(exc)),
                     },
                 )
-            yield ErrorEvent(message=str(exc), code="agent_error")
+            yield ErrorEvent(message=error_message, code=event_code)
 
     @staticmethod
     def _write_trace_event(
@@ -2334,6 +2249,64 @@ class TurnRunner:
             )
         except Exception as exc:  # pragma: no cover - observability must not break turns
             log.debug("trace_event.write_failed", kind=kind, error=str(exc))
+
+    def _emit_turn_event(
+        self,
+        kind: str,
+        context: TraceContext | None,
+        *,
+        session_key: str,
+        agent_id: str,
+        turn_id: str | None = None,
+        run_kind: str | None = None,
+        input_mode: str | None = None,
+        seq: int | None = None,
+        attrs: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Fan a turn event out through the registered ``TurnHook`` chain.
+
+        ``OPENSQUILLA_HOOKS=legacy`` is honored as an escape hatch and routes
+        through the static :meth:`_write_trace_event` directly so any
+        unforeseen production drift can be confined to the hook fan-out
+        without rolling back the call sites.
+        """
+
+        if context is None:
+            return
+        if _hooks_mode_from_env() == "legacy":
+            self._write_trace_event(
+                kind,
+                context,
+                seq=seq,
+                attrs=attrs,
+                payload=payload,
+            )
+            return
+        hook_ctx = TurnHookContext(
+            session_key=session_key,
+            agent_id=agent_id,
+            turn_id=turn_id,
+            run_kind=run_kind,
+            input_mode=input_mode,
+            trace_context=context,
+        )
+        event = TurnEvent(
+            kind=kind,
+            seq=seq,
+            attrs=dict(attrs or {}),
+            payload=dict(payload or {}),
+        )
+        for hook in self._turn_hooks:
+            try:
+                hook.on_event(hook_ctx, event)
+            except Exception as exc:  # noqa: BLE001 - hooks must not break turns
+                log.warning(
+                    "turn_hook.on_event_failed",
+                    hook=getattr(hook, "name", type(hook).__name__),
+                    kind=kind,
+                    error=str(exc),
+                )
 
     @staticmethod
     def _build_turn_call_source(
@@ -2416,18 +2389,63 @@ class TurnRunner:
         """Best-effort durable transcript record for terminal turn errors."""
         if self._session_manager is None or event is None:
             return
-        message = event.message or "Unknown error"
+        error_code, message = sanitize_agent_error(
+            {
+                "status": "failed",
+                "terminal_reason": event.code,
+                "error_class": event.code,
+                "error_message": event.message,
+            },
+            fallback_error_class=event.code,
+            fallback_error_message=event.message or "Unknown error",
+        )
+        event_code = (
+            error_code
+            if error_code
+            in {"provider_request_too_large", "provider_output_truncated"}
+            else event.code
+        )
+        if event_code == "provider_output_truncated":
+            transcript_message = build_terminal_reply(
+                {
+                    "status": "failed",
+                    "terminal_reason": "output_truncated",
+                    "error_class": event_code,
+                    "error_message": message,
+                }
+            )
+        else:
+            transcript_message = f"Error: {message}"
         try:
+            if event_code == "current_turn_context_exhausted":
+                compact = getattr(self._session_manager, "compact", None)
+                if callable(compact):
+                    budget = int(
+                        getattr(self._config, "context_budget_tokens", None)
+                        or getattr(self._config, "context_window_tokens", None)
+                        or 100_000
+                    )
+                    try:
+                        maybe_summary = compact(session_key, budget)
+                        if inspect.isawaitable(maybe_summary):
+                            await maybe_summary
+                    except Exception as exc:  # noqa: BLE001 - error append must still run
+                        log.warning(
+                            "turn_runner.error_compaction_failed",
+                            session_key=session_key,
+                            code=event_code,
+                            error=str(exc),
+                        )
             await self._session_manager.append_message(
                 session_key,
                 role="system",
-                content=f"Error: {message}",
+                content=transcript_message,
             )
         except Exception as exc:  # noqa: BLE001 - persistence must not mask the original error
             log.warning(
                 "turn_runner.error_persist_failed",
                 session_key=session_key,
-                code=event.code,
+                code=event_code,
                 error=str(exc),
             )
 
@@ -2603,6 +2621,233 @@ class TurnRunner:
 
         return AgentConfig().max_iterations
 
+    def _resolve_agent_iteration_timeout(
+        self,
+        session_key: str,
+        explicit: float | None = None,
+    ) -> float:
+        """Resolve per-iteration timeout for this turn.
+
+        Precedence: explicit arg > session config > env > gateway config > default.
+        """
+
+        if explicit is not None:
+            if self._non_bool_number(explicit) and explicit >= 0:
+                return float(explicit)
+            raise ValueError("iteration_timeout must be a non-negative number")
+
+        sm = self._session_manager
+        if sm is not None and hasattr(sm, "get_session_config"):
+            try:
+                session_cfg = sm.get_session_config(session_key)
+                if session_cfg is not None:
+                    value = getattr(session_cfg, "agent_iteration_timeout_seconds", None)
+                    if self._non_bool_number(value) and value >= 0:
+                        return float(value)
+                    if value is not None:
+                        log.warning(
+                            "turn_runner.invalid_agent_iteration_timeout",
+                            source="session",
+                            value=value,
+                        )
+            except Exception:  # noqa: BLE001
+                pass
+
+        env_value = os.environ.get("OPENSQUILLA_AGENT_ITERATION_TIMEOUT")
+        if env_value is not None and env_value.strip():
+            raw = env_value.strip()
+            try:
+                value = float(raw)
+            except ValueError:
+                log.warning(
+                    "turn_runner.invalid_agent_iteration_timeout", source="env", raw=raw
+                )
+            else:
+                if value >= 0:
+                    return value
+                log.warning(
+                    "turn_runner.invalid_agent_iteration_timeout", source="env", value=value
+                )
+
+        value = getattr(self._config, "agent_iteration_timeout_seconds", None)
+        if self._non_bool_number(value) and value >= 0:
+            return float(value)
+        if value is not None:
+            log.warning(
+                "turn_runner.invalid_agent_iteration_timeout",
+                source="config",
+                value=value,
+            )
+
+        return AgentConfig().iteration_timeout
+
+    def _resolve_agent_tool_timeout(
+        self,
+        session_key: str,
+        explicit: float | None = None,
+    ) -> float:
+        """Resolve per-tool execution timeout for this turn."""
+
+        if explicit is not None:
+            if self._non_bool_number(explicit) and explicit >= 0:
+                return float(explicit)
+            raise ValueError("tool_timeout must be a non-negative number")
+
+        sm = self._session_manager
+        if sm is not None and hasattr(sm, "get_session_config"):
+            try:
+                session_cfg = sm.get_session_config(session_key)
+                if session_cfg is not None:
+                    value = getattr(session_cfg, "agent_tool_timeout_seconds", None)
+                    if self._non_bool_number(value) and value >= 0:
+                        return float(value)
+                    if value is not None:
+                        log.warning(
+                            "turn_runner.invalid_agent_tool_timeout",
+                            source="session",
+                            value=value,
+                        )
+            except Exception:  # noqa: BLE001
+                pass
+
+        env_value = os.environ.get("OPENSQUILLA_AGENT_TOOL_TIMEOUT")
+        if env_value is not None and env_value.strip():
+            raw = env_value.strip()
+            try:
+                value = float(raw)
+            except ValueError:
+                log.warning("turn_runner.invalid_agent_tool_timeout", source="env", raw=raw)
+            else:
+                if value >= 0:
+                    return value
+                log.warning("turn_runner.invalid_agent_tool_timeout", source="env", value=value)
+
+        value = getattr(self._config, "agent_tool_timeout_seconds", None)
+        if self._non_bool_number(value) and value >= 0:
+            return float(value)
+        if value is not None:
+            log.warning(
+                "turn_runner.invalid_agent_tool_timeout",
+                source="config",
+                value=value,
+            )
+
+        return AgentConfig().tool_timeout
+
+    def _resolve_agent_request_timeout(
+        self,
+        session_key: str,
+        explicit: float | None = None,
+    ) -> float:
+        """Resolve single LLM request timeout for this turn (agent-runtime path)."""
+
+        if explicit is not None:
+            if self._non_bool_number(explicit) and explicit > 0:
+                return float(explicit)
+            raise ValueError("request_timeout must be a positive number")
+
+        sm = self._session_manager
+        if sm is not None and hasattr(sm, "get_session_config"):
+            try:
+                session_cfg = sm.get_session_config(session_key)
+                if session_cfg is not None:
+                    value = getattr(session_cfg, "agent_request_timeout_seconds", None)
+                    if self._non_bool_number(value) and value > 0:
+                        return float(value)
+                    if value is not None:
+                        log.warning(
+                            "turn_runner.invalid_agent_request_timeout",
+                            source="session",
+                            value=value,
+                        )
+            except Exception:  # noqa: BLE001
+                pass
+
+        env_value = os.environ.get("OPENSQUILLA_AGENT_REQUEST_TIMEOUT")
+        if env_value is not None and env_value.strip():
+            raw = env_value.strip()
+            try:
+                value = float(raw)
+            except ValueError:
+                log.warning(
+                    "turn_runner.invalid_agent_request_timeout", source="env", raw=raw
+                )
+            else:
+                if value > 0:
+                    return value
+                log.warning(
+                    "turn_runner.invalid_agent_request_timeout", source="env", value=value
+                )
+
+        value = getattr(self._config, "agent_request_timeout_seconds", None)
+        if self._non_bool_number(value) and value > 0:
+            return float(value)
+        if value is not None:
+            log.warning(
+                "turn_runner.invalid_agent_request_timeout",
+                source="config",
+                value=value,
+            )
+
+        return self._resolve_llm_timeout(session_key)
+
+    def _resolve_agent_max_provider_retries(
+        self,
+        session_key: str,
+        explicit: int | None = None,
+    ) -> int:
+        """Resolve max provider retries for this turn."""
+
+        if explicit is not None:
+            if self._non_bool_int(explicit) and explicit >= 0:
+                return int(explicit)
+            raise ValueError("max_provider_retries must be an integer >= 0")
+
+        sm = self._session_manager
+        if sm is not None and hasattr(sm, "get_session_config"):
+            try:
+                session_cfg = sm.get_session_config(session_key)
+                if session_cfg is not None:
+                    value = getattr(session_cfg, "agent_max_provider_retries", None)
+                    if self._non_bool_int(value) and value >= 0:
+                        return int(value)
+                    if value is not None:
+                        log.warning(
+                            "turn_runner.invalid_agent_max_provider_retries",
+                            source="session",
+                            value=value,
+                        )
+            except Exception:  # noqa: BLE001
+                pass
+
+        env_value = os.environ.get("OPENSQUILLA_AGENT_MAX_PROVIDER_RETRIES")
+        if env_value is not None and env_value.strip():
+            raw = env_value.strip()
+            try:
+                value = int(raw)
+            except ValueError:
+                log.warning(
+                    "turn_runner.invalid_agent_max_provider_retries", source="env", raw=raw
+                )
+            else:
+                if value >= 0:
+                    return value
+                log.warning(
+                    "turn_runner.invalid_agent_max_provider_retries", source="env", value=value
+                )
+
+        value = getattr(self._config, "agent_max_provider_retries", None)
+        if self._non_bool_int(value) and value >= 0:
+            return int(value)
+        if value is not None:
+            log.warning(
+                "turn_runner.invalid_agent_max_provider_retries",
+                source="config",
+                value=value,
+            )
+
+        return AgentConfig().max_provider_retries
+
     def _resolve_turn_thinking(self, turn: Any) -> bool | ThinkingLevel:
         """Resolve explicit config thinking before squilla-router suggestions."""
 
@@ -2683,6 +2928,15 @@ class TurnRunner:
                 available_tools=self._tool_registry.list_names(),
                 config=self._config,
             )
+            if ctx.tool_policy:
+                from opensquilla.tools.policy import apply_tool_policy_layer
+
+                ctx = apply_tool_policy_layer(
+                    ctx,
+                    ctx.tool_policy,
+                    available_tools=self._tool_registry.list_names(),
+                    hard_denied=None,
+                )
             ctx = self._apply_runtime_capability_denies(ctx)
             log.debug(
                 "tool_policy.policy_pre",
@@ -2697,7 +2951,7 @@ class TurnRunner:
         )
         tool_defs = self._tool_registry.to_tool_definitions(ctx)
         profile = resolve_profile(ctx)
-        tool_defs = filter_by_profile(tool_defs, profile)
+        tool_defs = filter_by_profile(tool_defs, profile, ctx)
         # layered intentionally — policy first, profile second.
         log.debug(
             "tool_policy.profile_post",
@@ -2790,8 +3044,7 @@ class TurnRunner:
         3. ``## <key>`` blocks for each ``extra_context`` entry (no gating).
 
         Each section's bytes match what the prior Jinja render produced for
-        the same inputs (verified in
-        ``tests/test_engine/test_prompt_cache.py::TestVolatileFieldsInSuffix``).
+        the same inputs.
         Sections are joined directly with no separator — adjacent ``\\n\\n``
         terminators in each section already provide the visual break, the
         same way the prior template rendered them inline. The final result
@@ -2909,6 +3162,14 @@ class TurnRunner:
                 bootstrap_filenames = tuple(
                     name for name in bootstrap_filenames if name != "BOOTSTRAP.md"
                 )
+            elif bootstrap_context_mode == "stateless":
+                bootstrap_filenames = tuple(
+                    name for name in bootstrap_filenames if name == "TOOLS.md"
+                )
+            elif bootstrap_context_mode == "stateless_keep_project_rules":
+                bootstrap_filenames = tuple(
+                    name for name in bootstrap_filenames if name in {"AGENTS.md", "TOOLS.md"}
+                )
             loaded_workspace_files, bootstrap_report = load_workspace_files_budgeted_with_report(
                 str(bootstrap_workspace_dir),
                 per_file_max_chars=self._resolve_bootstrap_max_chars(),
@@ -2940,7 +3201,13 @@ class TurnRunner:
                     report=list(visible_bootstrap_report),
                 )
         memory_source_dir = self._resolve_memory_source_dir(agent_id)
-        private_memory_allowed = allows_private_memory_prompt_injection(session_key)
+        stateless_prompt = bootstrap_context_mode in {
+            "stateless",
+            "stateless_keep_project_rules",
+        }
+        private_memory_allowed = (
+            False if stateless_prompt else allows_private_memory_prompt_injection(session_key)
+        )
 
         # Use frozen snapshot if available, otherwise read from disk
         snap_key = (agent_id, session_key) if session_key else None
@@ -2959,8 +3226,25 @@ class TurnRunner:
             prompt_metadata["injected_workspace_files_count"] = len(workspace_files)
             prompt_metadata["bootstrap_files"] = visible_bootstrap_report
             if not private_memory_allowed:
-                prompt_metadata["memory_prompt_injection_skipped"] = "session-scope"
-            prompt_metadata["retrieval_mode"] = "fts_only"
+                prompt_metadata["memory_prompt_injection_skipped"] = (
+                    "stateless" if stateless_prompt else "session-scope"
+                )
+            retrieval_metadata = self._effective_memory_retrieval_metadata(agent_id)
+            prompt_metadata["retrieval_mode"] = retrieval_metadata.get("retrieval_mode")
+            prompt_metadata["embedding_requested_provider"] = retrieval_metadata.get(
+                "embedding_requested_provider"
+            )
+            prompt_metadata["embedding_effective_provider"] = retrieval_metadata.get(
+                "embedding_effective_provider"
+            )
+            prompt_metadata["embedding_model"] = retrieval_metadata.get("embedding_model")
+            prompt_metadata["memory_retrieval_vector_weight"] = retrieval_metadata.get(
+                "vector_weight"
+            )
+            prompt_metadata["memory_retrieval_text_weight"] = retrieval_metadata.get(
+                "text_weight"
+            )
+            prompt_metadata["memory_mode_fingerprint"] = retrieval_metadata
 
         soul_doc = parse_soul(workspace_files["SOUL.md"]) if "SOUL.md" in workspace_files else None
         identity_fields = (
@@ -3041,6 +3325,32 @@ class TurnRunner:
 
         source = getattr(getattr(self._config, "memory", None), "source", "state")
         return resolve_agent_memory_source_dir(agent_id, self._config, source=source)
+
+    def _effective_memory_retrieval_metadata(self, agent_id: str) -> dict[str, str]:
+        retrievers = self._memory_retrievers or {}
+        for key in (agent_id, "main"):
+            retriever = retrievers.get(key)
+            metadata_fn = getattr(retriever, "effective_retrieval_metadata", None)
+            if callable(metadata_fn):
+                try:
+                    metadata = metadata_fn()
+                except Exception:
+                    continue
+                if isinstance(metadata, dict):
+                    return {str(k): str(v) for k, v in metadata.items()}
+
+        memory_cfg = getattr(self._config, "memory", None)
+        configured_mode = str(getattr(memory_cfg, "retrieval_mode", "hybrid"))
+        effective_mode = "fts_only" if configured_mode == "fts_only" else configured_mode
+        return {
+            "configured_retrieval_mode": configured_mode,
+            "retrieval_mode": effective_mode,
+            "embedding_requested_provider": "",
+            "embedding_effective_provider": "",
+            "embedding_model": "",
+            "vector_weight": str(getattr(memory_cfg, "vector_weight", "")),
+            "text_weight": str(getattr(memory_cfg, "text_weight", "")),
+        }
 
     def _resolve_bootstrap_workspace_dir(self, agent_id: str):
         from opensquilla.agents.scope import resolve_agent_workspace_dir
@@ -3127,6 +3437,47 @@ class TurnRunner:
             observe_reasoning_hint,
             resolve_model,
         )
+        from opensquilla.engine.steps.squilla_router import (
+            commit_deferred_router_history,
+        )
+
+        router_cfg = getattr(self._config, "squilla_router", None)
+        router_timeout = float(getattr(router_cfg, "routing_timeout_seconds", 5.0) or 5.0)
+
+        def _copy_router_turn(turn: TurnContext) -> TurnContext:
+            metadata: dict[str, Any] = {}
+            for key, value in turn.metadata.items():
+                try:
+                    metadata[key] = copy.deepcopy(value)
+                except Exception:
+                    metadata[key] = value
+            pipeline_steps = metadata.get("pipeline_steps")
+            if isinstance(pipeline_steps, list):
+                metadata["pipeline_steps"] = list(pipeline_steps)
+            metadata["_defer_squilla_router_history"] = True
+            return replace(
+                turn,
+                tool_defs=list(turn.tool_defs),
+                attachments=list(turn.attachments),
+                metadata=metadata,
+            )
+
+        async def _bounded_apply_squilla_router(turn: TurnContext) -> TurnContext:
+            async def _run_router_step() -> TurnContext:
+                return await apply_squilla_router(_copy_router_turn(turn))
+
+            try:
+                routed = await asyncio.wait_for(
+                    asyncio.to_thread(lambda: asyncio.run(_run_router_step())),
+                    timeout=router_timeout,
+                )
+                return commit_deferred_router_history(routed)
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    f"squilla router timed out after {router_timeout:g}s"
+                ) from exc
+
+        _bounded_apply_squilla_router.__name__ = "apply_squilla_router"
 
         initial_metadata: dict[str, Any] = {"skill_loader": self._skill_loader}
         if ingress_pipeline_steps:
@@ -3159,7 +3510,7 @@ class TurnRunner:
             turn,
             [
                 resolve_model,
-                apply_squilla_router,
+                _bounded_apply_squilla_router,
                 observe_reasoning_hint,
                 filter_skills,
                 inject_subagent_grounding,
@@ -3384,6 +3735,14 @@ class TurnRunner:
                     "tool_compression_tokens_saved",
                     0,
                 )
+                savings_telemetry.tool_result_store_writes = metadata.get(
+                    "tool_result_store_writes",
+                    0,
+                )
+                savings_telemetry.tool_result_store_skips = metadata.get(
+                    "tool_result_store_skips",
+                    0,
+                )
 
                 # Thinking mode
                 savings_telemetry.thinking_mode = metadata.get("thinking_mode")
@@ -3606,6 +3965,13 @@ class TurnRunner:
 
         if self._compaction_circuit_open(session_key):
             return _T3_HANDLED
+        if self.has_compacted_this_turn(session_key):
+            log.info(
+                "t3_upgrade_compaction.skipped",
+                session_key=session_key,
+                reason="already_compacted_this_turn",
+            )
+            return _T3_HANDLED
 
         try:
             transcript = await self._session_manager.get_transcript(session_key)
@@ -3621,70 +3987,21 @@ class TurnRunner:
             final_tier="t3",
             context_window_tokens=context_window_tokens,
         )
+        notify_compaction(
+            session_key,
+            source="automatic",
+            phase="t3_upgrade",
+            status="started",
+            previous_tier=previous,
+            context_window_tokens=context_window_tokens,
+        )
 
         if self._pre_compaction_flush_enabled():
-            if self._session_flush_service is None:
-                log.warning(
-                    "t3_upgrade_compaction.flush_failed",
-                    session_key=session_key,
-                    error="flush_service_unavailable",
-                )
-                self._record_compaction_failure(session_key)
-                return _T3_FLUSH_FAILED
-
-            flush_t0 = time.monotonic()
-            try:
-                from opensquilla.session.keys import parse_agent_id
-
-                receipt = await self._session_flush_service.execute(
-                    transcript,
-                    session_key,
-                    agent_id=parse_agent_id(session_key),
-                    message_window=0,
-                    segment_mode="auto",
-                    timeout=self._pre_compaction_flush_timeout_seconds(),
-                )
-                if not self._flush_receipt_allows_destructive_compaction(receipt):
-                    log.warning(
-                        "t3_upgrade_compaction.flush_failed",
-                        session_key=session_key,
-                        error=getattr(receipt, "error", None) or "degraded_flush_receipt",
-                        mode=getattr(receipt, "mode", "unknown"),
-                        integrity_status=getattr(receipt, "integrity_status", None),
-                        indexed_chunk_count=getattr(receipt, "indexed_chunk_count", None),
-                        output_coverage_status=getattr(
-                            receipt,
-                            "output_coverage_status",
-                            None,
-                        ),
-                        invalid_candidate_count=getattr(
-                            receipt,
-                            "invalid_candidate_count",
-                            None,
-                        ),
-                        candidate_missing_ids=getattr(receipt, "candidate_missing_ids", None),
-                        obligation_status=getattr(receipt, "obligation_status", None),
-                        obligation_missing_ids=getattr(receipt, "obligation_missing_ids", None),
-                    )
-                    self._record_compaction_failure(session_key)
-                    return _T3_FLUSH_FAILED
-                log.info(
-                    "t3_upgrade_compaction.flush_done",
-                    session_key=session_key,
-                    mode=getattr(receipt, "mode", "unknown"),
-                    message_count=getattr(receipt, "message_count", 0),
-                    duration_ms=int((time.monotonic() - flush_t0) * 1000),
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "t3_upgrade_compaction.flush_failed",
-                    session_key=session_key,
-                    error=str(exc),
-                )
-                self._record_compaction_failure(session_key)
-                return _T3_FLUSH_FAILED
+            await self._await_pre_compaction_flush_grace(
+                transcript,
+                session_key,
+                event_prefix="t3_upgrade_compaction",
+            )
 
         try:
             compaction_config = None
@@ -3704,9 +4021,26 @@ class TurnRunner:
                 context_window_tokens,
                 compaction_config,
             )
+            self.mark_compacted_this_turn(session_key)
             self._record_compaction_success(session_key)
             if result:
-                notify_compaction(session_key)
+                notify_compaction(
+                    session_key,
+                    source="automatic",
+                    phase="t3_upgrade",
+                    status="completed",
+                    context_window_tokens=context_window_tokens,
+                    summary_len=len(result),
+                )
+            else:
+                notify_compaction(
+                    session_key,
+                    source="automatic",
+                    phase="t3_upgrade",
+                    status="skipped",
+                    reason="empty_summary",
+                    context_window_tokens=context_window_tokens,
+                )
             log.info(
                 "t3_upgrade_compaction.compact_done",
                 session_key=session_key,
@@ -3722,6 +4056,14 @@ class TurnRunner:
                 error=str(exc),
             )
             self._record_compaction_failure(session_key)
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase="t3_upgrade",
+                status="failed",
+                message=str(exc),
+                context_window_tokens=context_window_tokens,
+            )
             return _T3_COMPACT_FAILED
 
         return _T3_HANDLED
@@ -3747,6 +4089,13 @@ class TurnRunner:
             return
         if self._compaction_circuit_open(session_key):
             return
+        if self.has_compacted_this_turn(session_key):
+            log.info(
+                "preflight_compaction.skipped",
+                session_key=session_key,
+                reason="already_compacted_this_turn",
+            )
+            return
         try:
             transcript = await self._session_manager.get_transcript(session_key)
         except KeyError:
@@ -3754,9 +4103,9 @@ class TurnRunner:
         if not transcript:
             return
 
-        from opensquilla.session.tokenizer import estimate_tokens
+        from opensquilla.session.compaction import estimate_entry_replay_tokens
 
-        total_tokens = sum(estimate_tokens(e.content or "") for e in transcript)
+        total_tokens = sum(estimate_entry_replay_tokens(e) for e in transcript)
         ratio = self._preflight_compact_ratio()
         threshold = int(context_window_tokens * ratio)
         if total_tokens <= threshold:
@@ -3769,61 +4118,20 @@ class TurnRunner:
             threshold=threshold,
             ratio=ratio,
         )
+        notify_compaction(
+            session_key,
+            source="automatic",
+            phase="preflight",
+            status="started",
+            tokens_before=total_tokens,
+            context_window_tokens=context_window_tokens,
+        )
         if self._pre_compaction_flush_enabled():
-            if self._session_flush_service is None:
-                log.warning(
-                    "preflight_compaction.flush_failed",
-                    session_key=session_key,
-                    error="flush_service_unavailable",
-                )
-                self._record_compaction_failure(session_key)
-                return
-
-            try:
-                from opensquilla.session.keys import parse_agent_id
-
-                receipt = await self._session_flush_service.execute(
-                    transcript,
-                    session_key,
-                    agent_id=parse_agent_id(session_key),
-                    message_window=0,
-                    segment_mode="auto",
-                    timeout=self._pre_compaction_flush_timeout_seconds(),
-                )
-                if not self._flush_receipt_allows_destructive_compaction(receipt):
-                    log.warning(
-                        "preflight_compaction.flush_failed",
-                        session_key=session_key,
-                        error=getattr(receipt, "error", None) or "degraded_flush_receipt",
-                        mode=getattr(receipt, "mode", "unknown"),
-                        integrity_status=getattr(receipt, "integrity_status", None),
-                        indexed_chunk_count=getattr(receipt, "indexed_chunk_count", None),
-                        output_coverage_status=getattr(
-                            receipt,
-                            "output_coverage_status",
-                            None,
-                        ),
-                        invalid_candidate_count=getattr(
-                            receipt,
-                            "invalid_candidate_count",
-                            None,
-                        ),
-                        candidate_missing_ids=getattr(receipt, "candidate_missing_ids", None),
-                        obligation_status=getattr(receipt, "obligation_status", None),
-                        obligation_missing_ids=getattr(receipt, "obligation_missing_ids", None),
-                    )
-                    self._record_compaction_failure(session_key)
-                    return
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "preflight_compaction.flush_failed",
-                    session_key=session_key,
-                    error=str(exc),
-                )
-                self._record_compaction_failure(session_key)
-                return
+            await self._await_pre_compaction_flush_grace(
+                transcript,
+                session_key,
+                event_prefix="preflight_compaction",
+            )
         compaction_config = None
         if compaction_provider is not None or compaction_model:
             from opensquilla.session.compaction import build_compaction_config_from_provider
@@ -3842,6 +4150,7 @@ class TurnRunner:
                 context_window_tokens,
                 compaction_config,
             )
+            self.mark_compacted_this_turn(session_key)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -3851,10 +4160,36 @@ class TurnRunner:
                 error=str(exc),
             )
             self._record_compaction_failure(session_key)
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase="preflight",
+                status="failed",
+                message=str(exc),
+                tokens_before=total_tokens,
+                context_window_tokens=context_window_tokens,
+            )
             return
         self._record_compaction_success(session_key)
         if result:
-            notify_compaction(session_key)
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase="preflight",
+                status="completed",
+                tokens_before=total_tokens,
+                context_window_tokens=context_window_tokens,
+            )
+        else:
+            notify_compaction(
+                session_key,
+                source="automatic",
+                phase="preflight",
+                status="skipped",
+                reason="empty_summary",
+                tokens_before=total_tokens,
+                context_window_tokens=context_window_tokens,
+            )
 
     def _pre_compaction_flush_enabled(self) -> bool:
         from opensquilla.memory.flush_config import is_session_flush_enabled
@@ -3873,12 +4208,185 @@ class TurnRunner:
 
     def _pre_compaction_flush_timeout_seconds(self) -> float:
         memory_cfg = getattr(self._config, "memory", None)
-        raw_timeout = getattr(memory_cfg, "flush_timeout_seconds", 5.0)
+        raw_timeout = getattr(memory_cfg, "flush_timeout_seconds", 15.0)
         try:
             timeout = float(raw_timeout)
         except (TypeError, ValueError):
-            return 5.0
+            return 15.0
         return max(timeout, 0.0)
+
+    def _pre_compaction_flush_background_timeout_seconds(self) -> float:
+        memory_cfg = getattr(self._config, "memory", None)
+        raw_timeout = getattr(memory_cfg, "flush_background_timeout_seconds", 120.0)
+        try:
+            timeout = float(raw_timeout)
+        except (TypeError, ValueError):
+            return 120.0
+        return max(timeout, 0.0)
+
+    async def _await_pre_compaction_flush_grace(
+        self,
+        transcript: list[Any],
+        session_key: str,
+        *,
+        event_prefix: str,
+    ) -> bool:
+        if self._session_flush_service is None:
+            log.warning(
+                f"{event_prefix}.flush_unavailable",
+                session_key=session_key,
+                error="flush_service_unavailable",
+            )
+            return False
+
+        task = self._active_pre_compaction_flush_tasks.get(session_key)
+        if task is not None:
+            if task.done():
+                try:
+                    receipt = task.result()
+                except asyncio.CancelledError:
+                    log.debug(f"{event_prefix}.flush_cancelled", session_key=session_key)
+                    return False
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        f"{event_prefix}.flush_failed",
+                        session_key=session_key,
+                        error=str(exc),
+                    )
+                    return False
+                self._consume_pre_compaction_flush_task(session_key, task, event_prefix)
+                return self._flush_receipt_allows_destructive_compaction(receipt)
+            else:
+                log.debug(
+                    f"{event_prefix}.flush_skipped",
+                    session_key=session_key,
+                    reason="already_running",
+                )
+                return False
+
+        from opensquilla.session.keys import parse_agent_id
+
+        background_timeout = self._pre_compaction_flush_background_timeout_seconds()
+        task = asyncio.create_task(
+            self._session_flush_service.execute(
+                transcript,
+                session_key,
+                agent_id=parse_agent_id(session_key),
+                message_window=0,
+                segment_mode="auto",
+                timeout=background_timeout,
+            )
+        )
+        self._active_pre_compaction_flush_tasks[session_key] = task
+        task.add_done_callback(
+            lambda completed: self._consume_pre_compaction_flush_task(
+                session_key,
+                completed,
+                event_prefix,
+                background=True,
+            )
+        )
+
+        grace_timeout = self._pre_compaction_flush_timeout_seconds()
+        flush_t0 = time.monotonic()
+        try:
+            receipt = await asyncio.wait_for(asyncio.shield(task), timeout=grace_timeout)
+        except TimeoutError:
+            log.warning(
+                f"{event_prefix}.flush_timed_out",
+                session_key=session_key,
+                timeout_seconds=grace_timeout,
+                background_timeout_seconds=background_timeout,
+            )
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            if self._active_pre_compaction_flush_tasks.get(session_key) is task:
+                self._active_pre_compaction_flush_tasks.pop(session_key, None)
+            log.warning(
+                f"{event_prefix}.flush_failed",
+                session_key=session_key,
+                error=str(exc),
+            )
+            return False
+
+        if self._active_pre_compaction_flush_tasks.get(session_key) is task:
+            self._active_pre_compaction_flush_tasks.pop(session_key, None)
+        self._log_pre_compaction_flush_receipt(
+            event_prefix,
+            session_key,
+            receipt,
+            duration_ms=int((time.monotonic() - flush_t0) * 1000),
+            background=False,
+        )
+        return self._flush_receipt_allows_destructive_compaction(receipt)
+
+    def _consume_pre_compaction_flush_task(
+        self,
+        session_key: str,
+        task: asyncio.Task,
+        event_prefix: str,
+        *,
+        background: bool = False,
+    ) -> None:
+        if self._active_pre_compaction_flush_tasks.get(session_key) is not task:
+            return
+        self._active_pre_compaction_flush_tasks.pop(session_key, None)
+        try:
+            receipt = task.result()
+        except asyncio.CancelledError:
+            log.debug(f"{event_prefix}.flush_cancelled", session_key=session_key)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                f"{event_prefix}.flush_failed",
+                session_key=session_key,
+                error=str(exc),
+                background=background,
+            )
+        else:
+            self._log_pre_compaction_flush_receipt(
+                event_prefix,
+                session_key,
+                receipt,
+                duration_ms=getattr(receipt, "duration_ms", 0),
+                background=background,
+            )
+
+    def _log_pre_compaction_flush_receipt(
+        self,
+        event_prefix: str,
+        session_key: str,
+        receipt: Any,
+        *,
+        duration_ms: int,
+        background: bool,
+    ) -> None:
+        if self._flush_receipt_allows_destructive_compaction(receipt):
+            log.info(
+                f"{event_prefix}.flush_done",
+                session_key=session_key,
+                mode=getattr(receipt, "mode", "unknown"),
+                message_count=getattr(receipt, "message_count", 0),
+                duration_ms=duration_ms,
+                background=background,
+            )
+            return
+
+        log.warning(
+            f"{event_prefix}.flush_degraded",
+            session_key=session_key,
+            error=getattr(receipt, "error", None) or "degraded_flush_receipt",
+            mode=getattr(receipt, "mode", "unknown"),
+            integrity_status=getattr(receipt, "integrity_status", None),
+            indexed_chunk_count=getattr(receipt, "indexed_chunk_count", None),
+            output_coverage_status=getattr(receipt, "output_coverage_status", None),
+            invalid_candidate_count=getattr(receipt, "invalid_candidate_count", None),
+            candidate_missing_ids=getattr(receipt, "candidate_missing_ids", None),
+            obligation_status=getattr(receipt, "obligation_status", None),
+            obligation_missing_ids=getattr(receipt, "obligation_missing_ids", None),
+            background=background,
+        )
 
     @staticmethod
     def _receipt_value(receipt: Any, name: str, default: Any) -> Any:
@@ -3894,31 +4402,7 @@ class TurnRunner:
             return 0
 
     def _flush_receipt_allows_destructive_compaction(self, receipt: Any) -> bool:
-        if self._receipt_value(receipt, "mode", None) != "llm":
-            return False
-        if self._receipt_int(self._receipt_value(receipt, "indexed_chunk_count", 0)) <= 0:
-            return False
-        integrity_status = str(
-            self._receipt_value(receipt, "integrity_status", "unverified") or "unverified"
-        )
-        if integrity_status != "ok":
-            return False
-        output_coverage_status = str(
-            self._receipt_value(receipt, "output_coverage_status", "unverified")
-            or "unverified"
-        )
-        if output_coverage_status not in _SAFE_FLUSH_OUTPUT_COVERAGE_STATUSES:
-            return False
-        if self._receipt_int(self._receipt_value(receipt, "invalid_candidate_count", 0)) > 0:
-            return False
-        if self._receipt_value(receipt, "candidate_missing_ids", []):
-            return False
-        obligation_status = str(
-            self._receipt_value(receipt, "obligation_status", "unverified") or "unverified"
-        )
-        if obligation_status not in _SAFE_FLUSH_OBLIGATION_STATUSES:
-            return False
-        return not self._receipt_value(receipt, "obligation_missing_ids", [])
+        return flush_receipt_allows_destructive_compaction(receipt)
 
     def _compaction_circuit_open(self, session_key: str) -> bool:
         state = getattr(self, "_compaction_failures", {}).get(session_key)

@@ -132,6 +132,8 @@ async def _enforce_context_overflow(
         session_key=session_key,
         session_manager=ctx.session_manager,
         compaction_config=await _build_context_overflow_compaction_config(ctx, session_key),
+        flush_service=getattr(ctx, "flush_service", None),
+        compaction_marker=getattr(ctx, "turn_runner", None),
         policy_override=policy_override,
         budget_override=budget_override,
     )
@@ -144,6 +146,12 @@ async def _enforce_context_overflow(
             budget_tokens=outcome.budget_tokens,
         )
         return outcome.refusal
+
+    if outcome.compacted_this_turn:
+        marker = getattr(ctx, "turn_runner", None)
+        mark = getattr(marker, "mark_compacted_this_turn", None)
+        if callable(mark):
+            mark(session_key)
 
     return None
 
@@ -171,58 +179,67 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     if refusal is not None:
         return {"ok": False, "sessionKey": session_key, **refusal}
 
-    if intent != "new_chat":
-        # Ensure session exists — auto-create if needed
-        try:
-            await mgr.get_or_create(
-                session_key=session_key,
-                agent_id="main",
-                display_name="WebChat",
-            )
-        except Exception as exc:
-            raise RpcUnavailableError(f"Failed to initialize chat session: {exc}") from exc
+    try:
+        if intent != "new_chat":
+            # Ensure session exists — auto-create if needed
+            try:
+                await mgr.get_or_create(
+                    session_key=session_key,
+                    agent_id="main",
+                    display_name="WebChat",
+                )
+            except Exception as exc:
+                raise RpcUnavailableError(
+                    f"Failed to initialize chat session: {exc}"
+                ) from exc
 
-    from opensquilla.gateway.rpc_sessions import _handle_sessions_send
+        from opensquilla.gateway.rpc_sessions import _handle_sessions_send
 
-    incoming_source = params.get("_source")
-    if not isinstance(incoming_source, dict):
-        incoming_source = {}
+        incoming_source = params.get("_source")
+        if not isinstance(incoming_source, dict):
+            incoming_source = {}
 
-    send_params: dict = {
-        "key": session_key,
-        "message": message,
-        "_source": {
-            "caller_kind": "web",
-            "channel_kind": "webchat",
-            "channel_id": f"webchat:{session_key}",
-            "sender_id": ctx.principal.role,
-            "source_kind": "webui",
-            "source_name": "WebChat",
-        },
-    }
-    elevated_hint = incoming_source.get("elevated")
-    if elevated_hint in ("on", "bypass", "full"):
-        send_params["_source"]["elevated"] = elevated_hint
-    attachments = params.get("attachments")
-    if attachments:
-        send_params["attachments"] = attachments
-    if intent is not None:
-        send_params["intent"] = intent
-    for source_key, target_key in (
-        ("noMemoryCapture", "noMemoryCapture"),
-        ("no_memory_capture", "no_memory_capture"),
-        ("inputProvenance", "inputProvenance"),
-        ("input_provenance", "input_provenance"),
-        ("inputProvenanceKind", "inputProvenanceKind"),
-        ("input_provenance_kind", "input_provenance_kind"),
-        ("provenance_kind", "provenance_kind"),
-        ("runKind", "runKind"),
-        ("run_kind", "run_kind"),
-    ):
-        if source_key in params:
-            send_params[target_key] = params[source_key]
-    result = await _handle_sessions_send(send_params, ctx)
-    return {"ok": True, "sessionKey": session_key, **result}
+        send_params: dict = {
+            "key": session_key,
+            "message": message,
+            "_source": {
+                "caller_kind": "web",
+                "channel_kind": "webchat",
+                "channel_id": f"webchat:{session_key}",
+                "sender_id": ctx.principal.role,
+                "source_kind": "webui",
+                "source_name": "WebChat",
+            },
+        }
+        elevated_hint = incoming_source.get("elevated")
+        if elevated_hint in ("on", "bypass", "full"):
+            send_params["_source"]["elevated"] = elevated_hint
+        attachments = params.get("attachments")
+        if attachments:
+            send_params["attachments"] = attachments
+        if intent is not None:
+            send_params["intent"] = intent
+        for source_key, target_key in (
+            ("noMemoryCapture", "noMemoryCapture"),
+            ("no_memory_capture", "no_memory_capture"),
+            ("inputProvenance", "inputProvenance"),
+            ("input_provenance", "input_provenance"),
+            ("inputProvenanceKind", "inputProvenanceKind"),
+            ("input_provenance_kind", "input_provenance_kind"),
+            ("provenance_kind", "provenance_kind"),
+            ("runKind", "runKind"),
+            ("run_kind", "run_kind"),
+        ):
+            if source_key in params:
+                send_params[target_key] = params[source_key]
+        result = await _handle_sessions_send(send_params, ctx)
+        return {"ok": True, "sessionKey": session_key, **result}
+    except Exception:
+        marker = getattr(ctx, "turn_runner", None)
+        clear = getattr(marker, "clear_compacted_this_turn", None)
+        if callable(clear):
+            clear(session_key)
+        raise
 
 
 @_d.method("chat.abort", scope="operator.write")

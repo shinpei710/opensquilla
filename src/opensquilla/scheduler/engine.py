@@ -22,6 +22,7 @@ from .types import (
     ManualRunResult,
     ManualRunStatus,
     ReservationRejectionReason,
+    ScheduleKind,
     SessionTarget,
 )
 
@@ -111,7 +112,10 @@ class SchedulerEngine:
     async def add_job(
         self,
         name: str,
-        schedule_raw: str | None = None,
+        *,
+        schedule_kind: ScheduleKind | str,
+        schedule_value: str,
+        schedule_tz: str = "",
         handler_key: str = "agent_run",
         payload: dict | None = None,
         session_target: SessionTarget = SessionTarget.ISOLATED,
@@ -120,20 +124,22 @@ class SchedulerEngine:
         wake_mode: CronWakeMode | str = CronWakeMode.NOW,
         max_retries: int = 3,
         origin_session_key: str = "",
-        # Legacy kwarg — existing callers pass cron_expr=...
-        cron_expr: str | None = None,
         delivery: DeliveryConfig | None = None,
         tool_policy: dict[str, Any] | None = None,
+        tz: str = "",
+        jitter_seconds: float | None = None,
+        creator_session_key: str = "",
+        creator_sender_id: str = "",
+        creator_is_owner: bool = False,
     ) -> CronJob:
         """Create and persist a new job; compute initial next_run_at.
 
-        Accepts both ``schedule_raw`` (new) and ``cron_expr`` (legacy).
-        ``schedule_raw`` takes precedence if both are provided.
+        Schedule contract: ``schedule_kind`` + ``schedule_value`` (and optional
+        ``schedule_tz`` for CRON). The value is validated per kind via
+        ``parse_cron`` / ``parse_iso_at`` / integer check; no free-form text.
         """
-        raw = schedule_raw or cron_expr or ""
         job = await self._ops.add(
             name=name,
-            schedule_raw=raw,
             handler_key=handler_key,
             payload=payload,
             session_target=session_target,
@@ -144,12 +150,24 @@ class SchedulerEngine:
             delivery=delivery,
             origin_session_key=origin_session_key,
             tool_policy=tool_policy,
+            tz=tz,
+            jitter_seconds=jitter_seconds,
+            creator_session_key=creator_session_key,
+            creator_sender_id=creator_sender_id,
+            creator_is_owner=creator_is_owner,
+            schedule_kind=schedule_kind,
+            schedule_value=schedule_value,
+            schedule_tz=schedule_tz,
         )
         self._timer.nudge()
         return job
 
     async def update_job(self, job_id: str, **patch) -> CronJob | None:
-        """Apply a partial update to an existing job."""
+        """Apply a partial update to an existing job.
+
+        Schedule patch: ``schedule_kind`` + ``schedule_value`` (and optional
+        ``schedule_tz``).
+        """
         result = await self._ops.update(job_id, **patch)
         if result is not None:
             self._timer.nudge()

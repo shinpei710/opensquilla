@@ -7,9 +7,13 @@ import contextlib
 import contextvars
 import json
 import os
+import re
 import signal
+import subprocess
+import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -19,9 +23,15 @@ import structlog
 from opensquilla.gateway.approval_queue import get_approval_queue
 from opensquilla.sandbox.backend.bubblewrap import BubblewrapBackend, build_bwrap_argv
 from opensquilla.sandbox.backend.noop import NoopBackend
+from opensquilla.sandbox.backend.seatbelt import (
+    SeatbeltBackend,
+    build_seatbelt_argv,
+    render_seatbelt_profile,
+)
 from opensquilla.sandbox.governance import action_fingerprint
 from opensquilla.sandbox.integration import (
     build_request,
+    escalate_backend_denial,
     gate_action,
     get_runtime,
     run_under_backend,
@@ -29,6 +39,7 @@ from opensquilla.sandbox.integration import (
 from opensquilla.sandbox.policy import build_policy, select_level
 from opensquilla.sandbox.types import DenialReason, DenialResult, SandboxPolicy, SandboxRequest
 from opensquilla.tools.builtin.shell_policy import check_safe_bin
+from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
 from opensquilla.tools.types import (
     CallerKind,
@@ -48,6 +59,8 @@ _DEFAULT_BACKGROUND_TIMEOUT = 1800.0
 _MAX_BACKGROUND_TIMEOUT = 3600.0
 _BACKGROUND_TERMINATE_TIMEOUT = 1.0
 _BACKGROUND_KILL_TIMEOUT = 1.0
+_EXEC_TERMINATE_TIMEOUT = 0.25
+_EXEC_KILL_TIMEOUT = 0.25
 _COMMAND_AUDIT_MAX_CHARS = 4096
 _SANDBOX_NETWORK_HINT = (
     "Hint: sandboxed shell/code has no network. Use http_request or web_fetch, "
@@ -65,6 +78,9 @@ _SANDBOX_NETWORK_FAILURE_MARKERS: tuple[str, ...] = (
     "failed to resolve",
     "curl: (6)",
 )
+_SHELL_NULL_REDIRECT_RE = re.compile(
+    r"(?:(?<=^)|(?<=[\s;|&]))\d*[<>]{1,2}\s*/dev/null(?=$|[\s;|&])"
+)
 PROCESS_ACTIONS: frozenset[str] = frozenset(
     {"eof", "kill", "list", "log", "poll", "remove", "submit", "write"}
 )
@@ -81,6 +97,7 @@ class _BgSession:
     session_key: str | None = None
     agent_id: str | None = None
     is_owner_run: bool = False
+    local_urls: list[str] = field(default_factory=list)
     output_lines: list[str] = field(default_factory=list)
     done: bool = False
     timed_out: bool = False
@@ -89,6 +106,13 @@ class _BgSession:
     ended_at: float | None = None
     returncode: int | None = None
     collector_task: asyncio.Task[None] | None = None
+    cleanup_callbacks: list[Callable[[], None]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _SpawnedBackgroundProcess:
+    process: asyncio.subprocess.Process
+    cleanup_callbacks: list[Callable[[], None]] = field(default_factory=list)
 
 
 # Task-local flag: set inside _check_exec_approval when the user actually
@@ -154,6 +178,10 @@ def _elevated_mode() -> str | None:
     return _context_elevated_mode()
 
 
+def _without_shell_null_redirections(command: str) -> str:
+    return _SHELL_NULL_REDIRECT_RE.sub(" ", command)
+
+
 def _sensitive_shell_block(
     tool_name: str,
     command: str,
@@ -165,7 +193,8 @@ def _sensitive_shell_block(
 
     from opensquilla.sandbox.sensitive_paths import build_block_envelope, sensitive_path_in_text
 
-    checked_text = f"{workdir} {command}" if workdir else command
+    checked_command = _without_shell_null_redirections(command)
+    checked_text = f"{workdir} {checked_command}" if workdir else checked_command
     marker = sensitive_path_in_text(checked_text)
     if marker is not None:
         return json.dumps(
@@ -188,6 +217,72 @@ def _sensitive_shell_block(
     marker = _sensitive_body_marker(checked_text)
     if marker is not None:
         return _sensitive_body_block(tool_name, marker)
+    return None
+
+
+def _workspace_lockdown_roots() -> list[Path]:
+    ctx = current_tool_context.get()
+    if ctx is None or not ctx.workspace_lockdown:
+        return []
+    roots: list[Path] = []
+    if ctx.workspace_dir:
+        roots.append(Path(ctx.workspace_dir).expanduser().resolve(strict=False))
+    if ctx.scratch_dir:
+        roots.append(Path(ctx.scratch_dir).expanduser().resolve(strict=False))
+    return roots
+
+
+def _path_inside_any_root(path: Path, roots: list[Path]) -> bool:
+    candidate = path.expanduser().resolve(strict=False)
+    for root in roots:
+        try:
+            candidate.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _resolve_shell_write_target(raw_target: str, workdir: str | None) -> Path:
+    cleaned = raw_target.strip().strip("'\"")
+    path = Path(cleaned).expanduser()
+    if not path.is_absolute():
+        base = Path(workdir).expanduser() if workdir else Path.cwd()
+        path = base / path
+    return path.resolve(strict=False)
+
+
+def _workspace_lockdown_shell_block(
+    tool_name: str,
+    command: str,
+    workdir: str | None,
+) -> dict[str, object] | None:
+    roots = _workspace_lockdown_roots()
+    if not roots:
+        return None
+    targets: list[str] = []
+    redirection_pattern = r"(?:^|\s)(?:\d?>{1,2}|&>{1,2})\s*(['\"]?)([^'\"\s|&;]+)\1"
+    targets.extend(match.group(2) for match in re.finditer(redirection_pattern, command))
+    tee_pattern = r"(?:^|\s)tee(?:\s+-[A-Za-z]+)*\s+(['\"]?)([^'\"\s|&;]+)\1"
+    targets.extend(match.group(2) for match in re.finditer(tee_pattern, command))
+    for target in targets:
+        resolved = _resolve_shell_write_target(target, workdir)
+        if _path_inside_any_root(resolved, roots):
+            continue
+        return {
+            "status": "blocked",
+            "reason": "workspace_lockdown",
+            "tool": tool_name,
+            "command": command,
+            "target": target,
+            "resolved_path": str(resolved),
+            "allowed_roots": [str(root) for root in roots],
+            "message": (
+                f"{tool_name} blocked by workspace lockdown: shell write target "
+                f"{resolved} is outside allowed roots."
+            ),
+            "retryable": False,
+        }
     return None
 
 
@@ -222,6 +317,7 @@ def _resolve_background_timeout(timeout: float | int | None) -> float:
 def _effective_workdir(workdir: str | None) -> str | None:
     ctx = current_tool_context.get()
     if workdir:
+        reject_foreign_host_path(workdir, platform=os.name)
         raw = Path(workdir).expanduser()
         if not raw.is_absolute() and ctx and ctx.workspace_dir:
             return str((Path(ctx.workspace_dir).expanduser().resolve() / raw).resolve())
@@ -242,7 +338,7 @@ def _bg_status(session: _BgSession) -> str:
 
 
 def _bg_session_payload(session: _BgSession) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "session_id": session.session_id,
         "command": session.command,
         "status": _bg_status(session),
@@ -252,6 +348,48 @@ def _bg_session_payload(session: _BgSession) -> dict[str, object]:
         "killed": session.killed,
         "timed_out": session.timed_out,
     }
+    if session.local_urls:
+        payload["local_urls"] = list(session.local_urls)
+    return payload
+
+
+def _local_server_urls_from_command(command: str) -> list[str]:
+    urls: list[str] = []
+    url_pattern = r"https?://(?:127\.0\.0\.1|localhost):\d{2,5}(?:/[^\s\"']*)?"
+    for match in re.finditer(url_pattern, command):
+        urls.append(match.group(0).rstrip(".,;)"))
+
+    http_server = re.search(
+        r"(?:^|[\s;&|])python(?:3(?:\.\d+)?)?\s+-m\s+http\.server(?:\s+(?P<port>\d{2,5}))?",
+        command,
+    )
+    if http_server is not None:
+        port = http_server.group("port") or "8000"
+        urls.append(f"http://127.0.0.1:{port}/")
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for url in urls:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+    return unique
+
+
+def _background_process_result(session: _BgSession) -> str:
+    lines = [
+        f"session_id={session.session_id}",
+        f"command: {session.command}",
+        "status: running",
+    ]
+    if session.local_urls:
+        lines.append("local_urls:")
+        lines.extend(f"- {url}" for url in session.local_urls)
+        lines.append(
+            "note: If the user asked to view this in a browser, include the local URL "
+            "in your reply."
+        )
+    return "\n".join(lines)
 
 
 def _current_bg_context_is_admin() -> bool:
@@ -306,6 +444,11 @@ def _finalize_bg_session(session: _BgSession) -> None:
     if session.ended_at is None:
         session.ended_at = time.time()
     session.done = True
+    callbacks = list(session.cleanup_callbacks)
+    session.cleanup_callbacks.clear()
+    for callback in callbacks:
+        with contextlib.suppress(Exception):
+            callback()
 
 
 def _signal_bg_process(session: _BgSession, sig: signal.Signals) -> None:
@@ -345,6 +488,45 @@ async def _terminate_bg_session(session: _BgSession) -> None:
     _signal_bg_process(session, kill_signal)
     if not await _wait_bg_process(session, _BACKGROUND_KILL_TIMEOUT):
         log.warning("background_process_termination_timeout", session_id=session.session_id)
+
+
+async def _wait_exec_process(proc: Any, timeout: float) -> bool:
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
+    while proc.returncode is None:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return proc.returncode is not None
+        await asyncio.sleep(min(0.01, remaining))
+    return True
+
+
+def _signal_exec_process_tree(proc: Any, sig: signal.Signals) -> bool:
+    if os.name == "posix":
+        os_mod = cast(Any, os)
+        try:
+            os_mod.killpg(proc.pid, sig)
+            return True
+        except ProcessLookupError:
+            return True
+        except OSError:
+            pass
+    if proc.returncode is not None:
+        return False
+    if sig == signal.SIGTERM:
+        proc.terminate()
+    else:
+        proc.kill()
+    return True
+
+
+async def _terminate_exec_process_tree(proc: Any) -> None:
+    _signal_exec_process_tree(proc, signal.SIGTERM)
+    if await _wait_exec_process(proc, _EXEC_TERMINATE_TIMEOUT):
+        return
+    kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+    _signal_exec_process_tree(proc, kill_signal)
+    if not await _wait_exec_process(proc, _EXEC_KILL_TIMEOUT):
+        log.warning("exec_command_termination_timeout", pid=proc.pid)
 
 
 async def _await_bg_output_task(output_task: asyncio.Task[None]) -> None:
@@ -397,6 +579,9 @@ async def exec_command(
     sensitive_block = _sensitive_shell_block("exec_command", command, workdir=cwd)
     if sensitive_block is not None:
         return sensitive_block
+    lockdown_block = _workspace_lockdown_shell_block("exec_command", command, cwd)
+    if lockdown_block is not None:
+        return json.dumps(lockdown_block, ensure_ascii=False)
 
     # Warnlist: two-step approval flow
     if result.needs_approval:
@@ -450,6 +635,32 @@ async def exec_command(
             sandbox_result = await run_under_backend(backend_request, runtime=runtime)
         except Exception as exc:
             raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
+        if sandbox_result.backend_notes:
+            escalation = await escalate_backend_denial(
+                sandbox_result, request, policy, runtime=runtime
+            )
+            if isinstance(escalation, DenialResult):
+                return json.dumps(escalation.to_dict())
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=cwd,
+                    env=merged_env,
+                )
+                try:
+                    stdout_bytes, _ = await asyncio.wait_for(
+                        proc.communicate(), timeout=effective_timeout
+                    )
+                except TimeoutError:
+                    proc.kill()
+                    await proc.communicate()
+                    return f"[timeout after {effective_timeout}s]\ncommand: {command}"
+                output = stdout_bytes.decode("utf-8", errors="replace")
+                return f"exit_code={proc.returncode}\n{output}"
+            except Exception as e:
+                return f"[error] {e}"
         output = sandbox_result.stdout
         if sandbox_result.stderr:
             output += sandbox_result.stderr
@@ -460,22 +671,31 @@ async def exec_command(
         log.info("shell_exec_elevated_host", command=_audit_command(command))
 
     try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=cwd,
-            env=merged_env,
-        )
-        try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=effective_timeout)
-        except TimeoutError:
-            proc.kill()
-            await proc.communicate()
-            return f"[timeout after {effective_timeout}s]\ncommand: {command}"
+        with tempfile.TemporaryFile() as output_file:
+            subprocess_kwargs: dict[str, Any] = {
+                "stdout": output_file,
+                "stderr": asyncio.subprocess.STDOUT,
+                "cwd": cwd,
+                "env": merged_env,
+            }
+            if os.name == "posix":
+                subprocess_kwargs["start_new_session"] = True
+            else:
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                if creationflags:
+                    subprocess_kwargs["creationflags"] = creationflags
 
-        output = stdout.decode("utf-8", errors="replace")
-        return f"exit_code={proc.returncode}\n{output}"
+            proc = await asyncio.create_subprocess_shell(command, **subprocess_kwargs)
+            if not await _wait_exec_process(proc, effective_timeout):
+                await _terminate_exec_process_tree(proc)
+                return f"[timeout after {effective_timeout}s]\ncommand: {command}"
+            if os.name == "posix":
+                _signal_exec_process_tree(proc, signal.SIGTERM)
+
+            output_file.flush()
+            output_file.seek(0)
+            output = output_file.read().decode("utf-8", errors="replace")
+            return f"exit_code={proc.returncode}\n{output}"
     except Exception as e:
         return f"[error] {e}"
 
@@ -510,8 +730,13 @@ async def background_process(
     sensitive_block = _sensitive_shell_block("background_process", command, workdir=cwd)
     if sensitive_block is not None:
         return sensitive_block
+    lockdown_block = _workspace_lockdown_shell_block("background_process", command, cwd)
+    if lockdown_block is not None:
+        return json.dumps(lockdown_block, ensure_ascii=False)
     if result.needs_approval:
         prior_elevation = _approval_elevation_state()
+        approval_response: dict[str, object] | None = None
+        approval_granted = False
         try:
             approval_response = await _check_exec_approval(
                 tool_name="background_process",
@@ -521,8 +746,10 @@ async def background_process(
                 approval_id=approval_id,
                 background=True,
             )
+            approval_granted = approval_response is None and _approval_elevation_state()
         finally:
-            _restore_approval_elevation(prior_elevation)
+            if not approval_granted:
+                _restore_approval_elevation(prior_elevation)
         if approval_response is not None:
             status = approval_response.get("status")
             if status == "approval_denied":
@@ -543,7 +770,7 @@ async def background_process(
         )
         if isinstance(decision, DenialResult):
             return json.dumps(decision.to_dict())
-        proc = await _spawn_sandboxed_background_process(
+        spawned = await _spawn_sandboxed_background_process(
             runtime=runtime,
             request=SandboxRequest(
                 argv=("sh", "-lc", command),
@@ -558,10 +785,12 @@ async def background_process(
         session = _BgSession(
             session_id=session_id,
             command=command,
-            process=proc,
+            process=spawned.process,
             session_key=ctx.session_key if ctx is not None else None,
             agent_id=ctx.agent_id if ctx is not None else None,
             is_owner_run=bool(ctx.is_owner) if ctx is not None else False,
+            local_urls=_local_server_urls_from_command(command),
+            cleanup_callbacks=spawned.cleanup_callbacks,
         )
         _bg_sessions[session_id] = session
         effective_timeout = _resolve_background_timeout(timeout)
@@ -569,7 +798,7 @@ async def background_process(
         async def _collect_restricted() -> None:
             output_task = asyncio.create_task(_read_bg_output(session))
             try:
-                await asyncio.wait_for(proc.wait(), timeout=effective_timeout)
+                await asyncio.wait_for(spawned.process.wait(), timeout=effective_timeout)
             except TimeoutError:
                 session.timed_out = True
                 await _terminate_bg_session(session)
@@ -579,7 +808,7 @@ async def background_process(
                 _finalize_bg_session(session)
 
         session.collector_task = asyncio.create_task(_collect_restricted())
-        return f"session_id={session_id}\ncommand: {command}\nstatus: running"
+        return _background_process_result(session)
 
     if elevated_bypass:
         log.info("background_process_elevated_host", command=_audit_command(command))
@@ -614,6 +843,7 @@ async def background_process(
         session_key=ctx.session_key if ctx is not None else None,
         agent_id=ctx.agent_id if ctx is not None else None,
         is_owner_run=bool(ctx.is_owner) if ctx is not None else False,
+        local_urls=_local_server_urls_from_command(command),
     )
     _bg_sessions[session_id] = session
     effective_timeout = _resolve_background_timeout(timeout)
@@ -632,26 +862,27 @@ async def background_process(
 
     session.collector_task = asyncio.create_task(_collect_host())
 
-    return f"session_id={session_id}\ncommand: {command}\nstatus: running"
+    return _background_process_result(session)
 
 
 async def _spawn_sandboxed_background_process(
     *,
     runtime,
     request: SandboxRequest,
-) -> asyncio.subprocess.Process:
+) -> _SpawnedBackgroundProcess:
     backend = runtime.backend
     if isinstance(backend, BubblewrapBackend):
         argv = build_bwrap_argv(request)
-        return await asyncio.create_subprocess_exec(
+        process = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
         )
+        return _SpawnedBackgroundProcess(process=process)
     if isinstance(backend, NoopBackend):
-        return await asyncio.create_subprocess_exec(
+        process = await asyncio.create_subprocess_exec(
             *request.argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -660,6 +891,48 @@ async def _spawn_sandboxed_background_process(
             env=request.env,
             start_new_session=True,
         )
+        return _SpawnedBackgroundProcess(process=process)
+    if isinstance(backend, SeatbeltBackend):
+        tmp_ctx: tempfile.TemporaryDirectory[str] | None = None
+        profile_path: Path | None = None
+
+        def cleanup() -> None:
+            if profile_path is not None:
+                with contextlib.suppress(OSError):
+                    os.unlink(profile_path)
+            if tmp_ctx is not None:
+                tmp_ctx.cleanup()
+
+        try:
+            tmp_dir: Path | None = None
+            if request.policy.tmp_writable:
+                tmp_ctx = tempfile.TemporaryDirectory(prefix="opensquilla-seatbelt-tmp-")
+                tmp_dir = Path(tmp_ctx.name)
+            profile = render_seatbelt_profile(request, tmp_dir=tmp_dir)
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                prefix="opensquilla-seatbelt-",
+                suffix=".sb",
+                delete=False,
+            ) as profile_file:
+                profile_file.write(profile)
+                profile_file.flush()
+                profile_path = Path(profile_file.name)
+            argv = build_seatbelt_argv(request, profile_path)
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(request.cwd),
+                env=request.env,
+                start_new_session=True,
+            )
+            return _SpawnedBackgroundProcess(process=process, cleanup_callbacks=[cleanup])
+        except Exception:
+            cleanup()
+            raise
     raise ToolError(f"Sandbox backend {backend.name!r} does not support background shell")
 
 
@@ -965,6 +1238,16 @@ async def _check_exec_approval(
                 sensitive=sensitive,
             )
             return build_block_envelope(command, sensitive, tool_name=tool_name)
+
+    lockdown_block = _workspace_lockdown_shell_block(tool_name, command, workdir)
+    if lockdown_block is not None:
+        log.warning(
+            "shell_workspace_lockdown_blocked",
+            command=_audit_command(command),
+            tool=tool_name,
+            resolved_path=lockdown_block.get("resolved_path"),
+        )
+        return lockdown_block
 
     # /elevated full — trusted operator has taken explicit responsibility.
     # Approvals are skipped entirely.

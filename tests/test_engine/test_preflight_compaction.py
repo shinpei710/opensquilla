@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -37,6 +38,28 @@ def _make_entry(content: str, role: str = "user") -> TranscriptEntry:
         session_key="test:key",
         role=role,
         content=content,
+    )
+
+
+def _make_assistant_tool_entry(content: str, tool_calls: list[dict[str, Any]]) -> TranscriptEntry:
+    return TranscriptEntry(
+        session_id="test-session-id",
+        session_key="test:key",
+        role="assistant",
+        content=content,
+        tool_calls=tool_calls,
+        token_count=1,
+    )
+
+
+def _make_assistant_reasoning_entry(content: str, reasoning_content: str) -> TranscriptEntry:
+    return TranscriptEntry(
+        session_id="test-session-id",
+        session_key="test:key",
+        role="assistant",
+        content=content,
+        reasoning_content=reasoning_content,
+        token_count=1,
     )
 
 
@@ -251,6 +274,62 @@ async def test_preflight_above_threshold_triggers_compact() -> None:
 
 
 @pytest.mark.asyncio
+async def test_preflight_counts_tool_call_arguments_when_deciding_to_compact() -> None:
+    context_window = 1000
+    entries = [
+        _make_assistant_tool_entry(
+            "small visible answer",
+            [
+                {
+                    "type": "tool_use",
+                    "tool_use_id": "write-stale",
+                    "name": "write_file",
+                    "input": {
+                        "path": "index.html",
+                        "content": "x" * 5000,
+                    },
+                }
+            ],
+        )
+    ]
+    mock_sm = MagicMock()
+    mock_sm.compact = AsyncMock(return_value="summary text")
+    mock_sm.get_transcript = AsyncMock(return_value=entries)
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
+
+    with patch(
+        "opensquilla.session.tokenizer.estimate_tokens",
+        side_effect=lambda text: max(1, len(str(text)) // 4),
+    ):
+        await runner._maybe_preflight_compact("user:session", context_window)
+
+    mock_sm.compact.assert_called_once_with("user:session", context_window)
+
+
+@pytest.mark.asyncio
+async def test_preflight_counts_reasoning_content_when_deciding_to_compact() -> None:
+    context_window = 1000
+    entries = [
+        _make_assistant_reasoning_entry(
+            "small visible answer",
+            "reasoning " + ("r" * 5000),
+        )
+    ]
+    mock_sm = MagicMock()
+    mock_sm.compact = AsyncMock(return_value="summary text")
+    mock_sm.get_transcript = AsyncMock(return_value=entries)
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
+
+    with patch(
+        "opensquilla.session.tokenizer.estimate_tokens",
+        side_effect=lambda text: max(1, len(str(text)) // 4),
+    ):
+        await runner._maybe_preflight_compact("user:session", context_window)
+
+    mock_sm.compact.assert_called_once_with("user:session", context_window)
+
+
+@pytest.mark.asyncio
 async def test_preflight_flushes_full_transcript_before_compact() -> None:
     """Preflight compaction must give durable memory a full-coverage chance first."""
 
@@ -291,7 +370,7 @@ async def test_preflight_flushes_full_transcript_before_compact() -> None:
         agent_id="ops",
         message_window=0,
         segment_mode="auto",
-        timeout=5.0,
+        timeout=120.0,
     )
     mock_sm.compact.assert_awaited_once_with("agent:ops:long-session", context_window)
 
@@ -308,7 +387,9 @@ async def test_preflight_flushes_full_transcript_before_compact() -> None:
     ],
 )
 @pytest.mark.asyncio
-async def test_preflight_degraded_flush_receipts_skip_compact(receipt: SimpleNamespace) -> None:
+async def test_preflight_degraded_flush_receipts_do_not_block_compaction(
+    receipt: SimpleNamespace,
+) -> None:
     context_window = 1000
     entries = [_make_entry("early durable fact " + ("a" * 4000))]
     mock_sm = MagicMock()
@@ -327,7 +408,7 @@ async def test_preflight_degraded_flush_receipts_skip_compact(receipt: SimpleNam
         await runner._maybe_preflight_compact("agent:ops:long-session", context_window)
 
     flush_service.execute.assert_awaited_once()
-    mock_sm.compact.assert_not_called()
+    mock_sm.compact.assert_awaited_once_with("agent:ops:long-session", context_window)
 
 
 @pytest.mark.asyncio
@@ -354,7 +435,7 @@ async def test_preflight_backfilled_flush_receipt_allows_compact() -> None:
 
 
 @pytest.mark.asyncio
-async def test_preflight_uses_configured_memory_flush_timeout() -> None:
+async def test_preflight_uses_background_timeout_for_flush_service() -> None:
     context_window = 1000
     entries = [_make_entry("early durable fact " + ("a" * 4000))]
     mock_sm = MagicMock()
@@ -368,14 +449,55 @@ async def test_preflight_uses_configured_memory_flush_timeout() -> None:
         session_manager=mock_sm,
         session_flush_service=flush_service,
         config=SimpleNamespace(
-            memory=SimpleNamespace(flush_enabled=True, flush_timeout_seconds=0.25)
+            memory=SimpleNamespace(
+                flush_enabled=True,
+                flush_timeout_seconds=0.25,
+                flush_background_timeout_seconds=42.0,
+            )
         ),
     )
 
     with patch("opensquilla.session.tokenizer.estimate_tokens", return_value=1000):
         await runner._maybe_preflight_compact("agent:ops:long-session", context_window)
 
-    assert flush_service.execute.await_args.kwargs["timeout"] == 0.25
+    assert flush_service.execute.await_args.kwargs["timeout"] == 42.0
+    mock_sm.compact.assert_awaited_once_with("agent:ops:long-session", context_window)
+
+
+@pytest.mark.asyncio
+async def test_preflight_flush_grace_timeout_does_not_block_compaction() -> None:
+    context_window = 1000
+    entries = [_make_entry("early durable fact " + ("a" * 4000))]
+    mock_sm = MagicMock()
+    mock_sm.get_transcript = AsyncMock(return_value=entries)
+    mock_sm.compact = AsyncMock(return_value="summary text")
+
+    flush_service = MagicMock()
+
+    async def slow_flush(*_args, **_kwargs):
+        import asyncio
+
+        await asyncio.sleep(0.05)
+        return _flush_receipt()
+
+    flush_service.execute = AsyncMock(side_effect=slow_flush)
+    runner = TurnRunner(
+        provider_selector=MagicMock(),
+        session_manager=mock_sm,
+        session_flush_service=flush_service,
+        config=SimpleNamespace(
+            memory=SimpleNamespace(
+                flush_enabled=True,
+                flush_timeout_seconds=0.001,
+                flush_background_timeout_seconds=42.0,
+            )
+        ),
+    )
+
+    with patch("opensquilla.session.tokenizer.estimate_tokens", return_value=1000):
+        await runner._maybe_preflight_compact("agent:ops:long-session", context_window)
+
+    assert flush_service.execute.await_args.kwargs["timeout"] == 42.0
     mock_sm.compact.assert_awaited_once_with("agent:ops:long-session", context_window)
 
 
@@ -437,7 +559,7 @@ async def test_preflight_env_flush_disabled_compacts_without_flush(
 
 
 @pytest.mark.asyncio
-async def test_preflight_flush_service_unavailable_skips_compact_when_enabled() -> None:
+async def test_preflight_flush_service_unavailable_does_not_block_compaction() -> None:
     context_window = 1000
     entries = [_make_entry("early durable fact " + ("a" * 4000))]
     mock_sm = MagicMock()
@@ -456,7 +578,7 @@ async def test_preflight_flush_service_unavailable_skips_compact_when_enabled() 
     with patch("opensquilla.session.tokenizer.estimate_tokens", return_value=1000):
         await runner._maybe_preflight_compact("agent:ops:long-session", context_window)
 
-    mock_sm.compact.assert_not_called()
+    mock_sm.compact.assert_awaited_once_with("agent:ops:long-session", context_window)
 
 
 @pytest.mark.asyncio

@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
-import re as _re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .types import ScheduleKind
+
+def validate_tz(tz: str) -> None:
+    """Raise ValueError if ``tz`` is set but not a valid IANA timezone name."""
+    if not tz:
+        return
+    try:
+        ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"Unknown timezone: {tz!r}") from exc
 
 
 class CronParseError(ValueError):
@@ -146,119 +154,22 @@ def _to_int(s: str, field_name: str, lo: int, hi: int) -> int:
     return v
 
 
-_EVERY_RE = _re.compile(r"^every\s+(\d+)\s*(m|min|h|hr|d|day)s?$", _re.IGNORECASE)
-_RELATIVE_RE = _re.compile(r"^(\d+)\s*(m|min|h|hr|d|day)s?$", _re.IGNORECASE)
-_UNIT_SECONDS = {"m": 60, "min": 60, "h": 3600, "hr": 3600, "d": 86400, "day": 86400}
-_ZH_EVERY_MINUTE_RE = _re.compile(r"^每\s*(?:(\d+)\s*)?分钟$")
-_ZH_RELATIVE_MINUTE_RE = _re.compile(r"^(\d+)\s*分钟后$")
-_ZH_DAILY_HOUR_RE = _re.compile(r"^每天\s*(\d{1,2})\s*点$")
-_ZH_DAILY_TIME_RE = _re.compile(r"^每天\s*(\d{1,2})\s*[:：]\s*(\d{1,2})$")
-
-
-def _reference_now(reference_now: datetime | None) -> datetime:
-    if reference_now is None:
-        return datetime.now().astimezone()
-    if reference_now.tzinfo is None:
-        raise CronParseError("reference_now must be timezone-aware")
-    return reference_now
-
-
-def _parse_chinese_schedule(raw: str, reference_now: datetime) -> tuple[ScheduleKind, str] | None:
-    m = _ZH_EVERY_MINUTE_RE.match(raw)
-    if m:
-        amount = int(m.group(1) or "1")
-        if amount <= 0:
-            raise CronParseError("Minute interval must be > 0")
-        if 60 % amount == 0:
-            return ScheduleKind.EVERY, f"*/{amount} * * * *"
-        return ScheduleKind.EVERY, str(amount * 60)
-
-    m = _ZH_RELATIVE_MINUTE_RE.match(raw)
-    if m:
-        amount = int(m.group(1))
-        if amount <= 0:
-            raise CronParseError("Relative minute delay must be > 0")
-        target = reference_now.astimezone(UTC) + timedelta(minutes=amount)
-        return ScheduleKind.AT, target.isoformat()
-
-    m = _ZH_DAILY_HOUR_RE.match(raw)
-    if m:
-        hour = int(m.group(1))
-        minute = 0
-    else:
-        m = _ZH_DAILY_TIME_RE.match(raw)
-        if not m:
-            return None
-        hour = int(m.group(1))
-        minute = int(m.group(2))
-
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
-        raise CronParseError("Daily time out of range")
-    local_wall_time = reference_now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    utc_wall_time = local_wall_time.astimezone(UTC)
-    return ScheduleKind.CRON, f"{utc_wall_time.minute} {utc_wall_time.hour} * * *"
-
-
-def parse_schedule(
-    raw: str,
-    *,
-    reference_now: datetime | None = None,
-) -> tuple[ScheduleKind, str]:
-    """Parse user input into (kind, normalized_expression)."""
-    raw = raw.strip()
-    now = _reference_now(reference_now)
-
-    chinese = _parse_chinese_schedule(raw, now)
-    if chinese is not None:
-        return chinese
-
-    # 1. "every Nm/Nh"
-    m = _EVERY_RE.match(raw)
-    if m:
-        amount = int(m.group(1))
-        unit = m.group(2).lower()
-        if unit in ("m", "min"):
-            if amount > 0 and 60 % amount == 0:
-                return ScheduleKind.EVERY, f"*/{amount} * * * *"
-            else:
-                return ScheduleKind.EVERY, str(amount * 60)
-        elif unit in ("h", "hr"):
-            if amount > 0 and 24 % amount == 0:
-                return ScheduleKind.EVERY, f"0 */{amount} * * *"
-            else:
-                return ScheduleKind.EVERY, str(amount * 3600)
-        elif unit in ("d", "day"):
-            return ScheduleKind.EVERY, str(amount * 86400)
-
-    # 2. Relative delay "30m"
-    m = _RELATIVE_RE.match(raw)
-    if m:
-        amount = int(m.group(1))
-        unit = m.group(2).lower()
-        secs = amount * _UNIT_SECONDS.get(unit, 60)
-        target = now.astimezone(UTC) + timedelta(seconds=secs)
-        return ScheduleKind.AT, target.isoformat()
-
-    # 3. ISO-8601
+def parse_iso_at(raw: str) -> datetime:
+    """Parse a tz-aware ISO-8601 timestamp; raise CronParseError otherwise."""
+    if not isinstance(raw, str):
+        raise CronParseError(f"Expected ISO-8601 string, got {type(raw).__name__}")
+    text = raw.strip()
+    if not text:
+        raise CronParseError("ISO-8601 timestamp must not be empty")
     try:
-        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return ScheduleKind.AT, dt.isoformat()
-    except ValueError:
-        pass
-
-    # 4. @preset
-    if raw.startswith("@"):
-        if raw not in _PRESETS:
-            raise ValueError(f"Unknown preset: {raw}")
-        return ScheduleKind.CRON, _PRESETS[raw]
-
-    # 5. Standard cron
-    fields = raw.split()
-    if len(fields) == 5:
-        parse_cron(raw)  # validate
-        return ScheduleKind.CRON, raw
-
-    raise ValueError(f"Cannot parse schedule: {raw!r}")
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise CronParseError(f"Invalid ISO-8601 timestamp: {raw!r}") from exc
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise CronParseError(
+            f"ISO-8601 timestamp must include a timezone offset: {raw!r}"
+        )
+    return dt
 
 
 def parse_cron(expr: str) -> CronExpression:

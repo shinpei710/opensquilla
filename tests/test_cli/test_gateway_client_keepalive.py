@@ -93,7 +93,19 @@ def test_session_error_payload_is_normalized_for_gateway_client() -> None:
 
     assert payload["message"] == "The task timed out before it could finish."
     assert payload["terminal_message"] == "The task timed out before it could finish."
-    assert payload["error_message"] == "Iteration 1 exceeded iteration_timeout"
+    assert payload["error_message"] == "The task timed out before it could finish."
+
+
+def test_gateway_client_error_normalization_preserves_generic_error_detail() -> None:
+    payload = _normalize_session_error_payload(
+        {
+            "message": "Tool failed with exit code 2",
+            "code": "agent_error",
+        }
+    )
+
+    assert payload["message"] == "The task failed before it could finish."
+    assert payload["error_message"] == "Tool failed with exit code 2"
 
 
 def _handshake_frames(*, keepalive_ms: int = 60_000) -> list[dict[str, Any]]:

@@ -19,6 +19,7 @@ from opensquilla.gateway.attachment_ingest import (
 )
 from opensquilla.gateway.channel_dispatch import (
     _artifact_fallback_lines,
+    _build_reply_message,
     _deliver_artifacts_as_channel_files,
     _deliver_runtime_channel_reply,
     _dispatch_combined_message_after_debounce,
@@ -60,6 +61,18 @@ def _tool_ctx(agent_id: str = "main") -> SimpleNamespace:
 def _exact_pdf(size: int) -> bytes:
     header = b"%PDF-1.4\n"
     return header + b"a" * (size - len(header))
+
+
+def test_channel_reply_sanitizes_provider_compaction_markers() -> None:
+    reply = _build_reply_message(
+        _FakeChannel(),
+        "Reply to user:\n[opensquilla_compacted:assistant_content:165:82bb251511c20cec]\n?",
+        _message(),
+    )
+
+    assert "opensquilla_compacted" not in reply.content
+    assert "assistant_content" not in reply.content
+    assert reply.content == "Reply to user:\n?"
 
 
 def test_channel_stream_policy_prefers_adapter_stream_updates() -> None:
@@ -834,6 +847,172 @@ async def test_direct_channel_turn_honors_final_only_stream_policy() -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_streaming_path_falls_back_when_adapter_stream_fails() -> None:
+    class FailingStreamingChannel(_FakeChannel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delivered_chunks: list[str] = []
+
+        async def send_streaming(self, chunks, **kwargs):
+            async for chunk in chunks:
+                self.delivered_chunks.append(chunk)
+                raise RuntimeError("stream edit failed")
+
+    class FakeTurnRunner:
+        async def run(self, message: str, session_key: str, **kwargs):
+            yield TextDeltaEvent(text="part-one")
+            yield TextDeltaEvent(text="part-two")
+            yield DoneEvent()
+
+    channel = FailingStreamingChannel()
+    config = SimpleNamespace(
+        agent_stream_heartbeat_interval_seconds=0.0,
+        agent_stream_idle_timeout_seconds=1.0,
+    )
+
+    await _run_turn_with_streaming(
+        channel,
+        FakeTurnRunner(),
+        _message(),
+        "agent:main:stream-fallback",
+        _FakeEventBridge(),
+        None,
+        config,
+    )
+
+    assert channel.delivered_chunks == ["part-one"]
+    assert channel.sent
+    assert "part-one" in channel.sent[-1].content
+    assert "part-two" in channel.sent[-1].content
+
+
+@pytest.mark.asyncio
+async def test_direct_streaming_path_fallback_skips_delivered_chunks() -> None:
+    class FailingLateStreamingChannel(_FakeChannel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delivered_chunks: list[str] = []
+
+        async def send_streaming(self, chunks, **kwargs):
+            count = 0
+            async for chunk in chunks:
+                count += 1
+                if count == 3:
+                    raise RuntimeError("late stream edit failed")
+                self.delivered_chunks.append(chunk)
+
+    class FakeTurnRunner:
+        async def run(self, message: str, session_key: str, **kwargs):
+            for chunk in ("alpha", "beta", "gamma", "delta"):
+                yield TextDeltaEvent(text=chunk)
+            yield DoneEvent()
+
+    channel = FailingLateStreamingChannel()
+    config = SimpleNamespace(
+        agent_stream_heartbeat_interval_seconds=0.0,
+        agent_stream_idle_timeout_seconds=1.0,
+    )
+
+    await _run_turn_with_streaming(
+        channel,
+        FakeTurnRunner(),
+        _message(),
+        "agent:main:stream-fallback-late",
+        _FakeEventBridge(),
+        None,
+        config,
+    )
+
+    assert channel.delivered_chunks == ["alpha", "beta"]
+    assert channel.sent
+    fallback = channel.sent[-1].content
+    assert "gamma" in fallback
+    assert "delta" in fallback
+    assert "alpha" not in fallback
+    assert "beta" not in fallback
+
+
+@pytest.mark.asyncio
+async def test_direct_streaming_fallback_sanitizes_queued_directive_tags() -> None:
+    class FailingStreamingChannel(_FakeChannel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delivered_chunks: list[str] = []
+
+        async def send_streaming(self, chunks, **kwargs):
+            async for chunk in chunks:
+                self.delivered_chunks.append(chunk)
+                raise RuntimeError("stream edit failed")
+
+    class FakeTurnRunner:
+        async def run(self, message: str, session_key: str, **kwargs):
+            yield TextDeltaEvent(text="visible ")
+            yield TextDeltaEvent(text="[[reply_to_current]]hidden")
+            yield DoneEvent()
+
+    channel = FailingStreamingChannel()
+    config = SimpleNamespace(
+        agent_stream_heartbeat_interval_seconds=0.0,
+        agent_stream_idle_timeout_seconds=1.0,
+    )
+
+    await _run_turn_with_streaming(
+        channel,
+        FakeTurnRunner(),
+        _message(),
+        "agent:main:stream-fallback-directive",
+        _FakeEventBridge(),
+        None,
+        config,
+    )
+
+    assert channel.delivered_chunks == ["visible "]
+    assert channel.sent
+    fallback = channel.sent[-1].content
+    assert "[[reply_to_current]]" not in fallback
+    assert "hidden" in fallback
+
+
+@pytest.mark.asyncio
+async def test_direct_streaming_sanitizes_split_provider_compaction_marker() -> None:
+    class StreamingChannel(_FakeChannel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delivered_chunks: list[str] = []
+
+        async def send_streaming(self, chunks, **kwargs):
+            async for chunk in chunks:
+                self.delivered_chunks.append(chunk)
+
+    class FakeTurnRunner:
+        async def run(self, message: str, session_key: str, **kwargs):
+            yield TextDeltaEvent(text="Visible\n[opensquilla_")
+            yield TextDeltaEvent(text="compacted:assistant_content:165:abc]\nDone")
+            yield DoneEvent()
+
+    channel = StreamingChannel()
+    config = SimpleNamespace(
+        agent_stream_heartbeat_interval_seconds=0.0,
+        agent_stream_idle_timeout_seconds=1.0,
+    )
+
+    await _run_turn_with_streaming(
+        channel,
+        FakeTurnRunner(),
+        _message(),
+        "agent:main:stream-marker",
+        _FakeEventBridge(),
+        None,
+        config,
+    )
+
+    delivered = "".join(channel.delivered_chunks)
+    assert "opensquilla_compacted" not in delivered
+    assert "assistant_content" not in delivered
+    assert delivered == "Visible\nDone"
+
+
+@pytest.mark.asyncio
 async def test_channel_batch_turn_uses_agent_registry_model() -> None:
     class RecordingTurnRunner:
         def __init__(self) -> None:
@@ -1339,3 +1518,300 @@ async def test_runtime_reply_delivers_file_artifact_with_adapter_upload(tmp_path
 
     assert channel.sent[-1].content == "报告已生成。"
     assert channel.files == [("c1", "report.pdf")]
+
+
+# ── Stream relay coalescing + per-event fallback ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_runtime_channel_stream_relay_coalesces_consecutive_deltas() -> None:
+    """Consecutive text deltas are batched into a single chunk under the
+    char threshold once the window expires.
+    """
+
+    class StreamingChannel:
+        def __init__(self) -> None:
+            self.chunks: list[str] = []
+
+        async def send_streaming(self, chunks, **kwargs):
+            async for chunk in chunks:
+                self.chunks.append(chunk)
+
+    class FakeTaskRuntime:
+        async def enqueue(self, envelope, message: str, *, stream_event_sink=None):
+            return None
+
+    config = SimpleNamespace(
+        task_runtime=SimpleNamespace(
+            stream_relay_coalesce_ms=50.0,
+            stream_relay_coalesce_chars=256,
+        ),
+    )
+    channel = StreamingChannel()
+    relay = _RuntimeChannelStreamRelay.maybe_start(
+        channel,
+        _message(),
+        FakeTaskRuntime(),
+        config,
+    )
+
+    assert relay is not None
+
+    # Push four small deltas in quick succession then close. The relay
+    # must coalesce them rather than yield four separate chunks.
+    await relay.emit(TextDeltaEvent(text="hel"))
+    await relay.emit(TextDeltaEvent(text="lo "))
+    await relay.emit(TextDeltaEvent(text="wor"))
+    await relay.emit(TextDeltaEvent(text="ld"))
+    await relay.close()
+
+    full_text = "".join(channel.chunks)
+    assert full_text == "hello world"
+    # Coalescing should land them in a single chunk; allow up to two chunks
+    # in case scheduler latency split the batch in half.
+    assert len(channel.chunks) <= 2
+
+
+@pytest.mark.asyncio
+async def test_runtime_channel_stream_relay_coalesces_at_char_threshold() -> None:
+    """A single delta exceeding the char threshold yields immediately."""
+
+    class StreamingChannel:
+        def __init__(self) -> None:
+            self.chunks: list[str] = []
+
+        async def send_streaming(self, chunks, **kwargs):
+            async for chunk in chunks:
+                self.chunks.append(chunk)
+
+    class FakeTaskRuntime:
+        async def enqueue(self, envelope, message: str, *, stream_event_sink=None):
+            return None
+
+    config = SimpleNamespace(
+        task_runtime=SimpleNamespace(
+            stream_relay_coalesce_ms=10_000.0,  # very long window
+            stream_relay_coalesce_chars=8,
+        ),
+    )
+    channel = StreamingChannel()
+    relay = _RuntimeChannelStreamRelay.maybe_start(
+        channel,
+        _message(),
+        FakeTaskRuntime(),
+        config,
+    )
+
+    assert relay is not None
+
+    # Push enough characters to cross the char threshold without waiting
+    # for the time window. The relay must yield without delay.
+    for _ in range(4):
+        await relay.emit(TextDeltaEvent(text="abcd"))
+    await relay.close()
+
+    assert "".join(channel.chunks) == "abcdabcdabcdabcd"
+    # First chunk must have crossed the 8-char threshold.
+    assert len(channel.chunks[0]) >= 8
+
+
+@pytest.mark.asyncio
+async def test_runtime_channel_stream_relay_falls_back_on_mid_stream_failure() -> None:
+    """When send_streaming raises mid-stream, the relay flushes the
+    not-yet-delivered chunks via channel.send so the user still sees the
+    rest of the reply.
+    """
+
+    class FailingStreamingChannel(_FakeChannel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delivered_chunks: list[str] = []
+
+        async def send_streaming(self, chunks, **kwargs):
+            count = 0
+            async for chunk in chunks:
+                self.delivered_chunks.append(chunk)
+                count += 1
+                if count == 1:
+                    raise RuntimeError("network blip")
+
+    class FakeTaskRuntime:
+        async def enqueue(self, envelope, message: str, *, stream_event_sink=None):
+            return None
+
+    config = SimpleNamespace(
+        task_runtime=SimpleNamespace(
+            stream_relay_coalesce_ms=0.0,
+            stream_relay_coalesce_chars=0,
+        ),
+    )
+    channel = FailingStreamingChannel()
+    relay = _RuntimeChannelStreamRelay.maybe_start(
+        channel,
+        _message(),
+        FakeTaskRuntime(),
+        config,
+    )
+
+    assert relay is not None
+
+    await relay.emit(TextDeltaEvent(text="part-one"))
+    await relay.emit(TextDeltaEvent(text="part-two"))
+    await relay.emit(TextDeltaEvent(text="part-three"))
+    await relay.close()
+
+    # First chunk was consumed before the consumer raised — it appears in
+    # the consumer-side delivered list but the relay treats it as
+    # not-delivered because the consumer failed to fully process it.
+    assert channel.delivered_chunks == ["part-one"]
+    # Streaming error recorded.
+    assert isinstance(relay.stream_error, Exception)
+    # Fallback batch carries every chunk the consumer did not finish
+    # processing successfully — including the chunk that crashed it so the
+    # user does not lose content.
+    assert channel.sent, "fallback channel.send must fire when streaming fails"
+    fallback = channel.sent[-1].content
+    assert "part-one" in fallback
+    assert "part-two" in fallback
+    assert "part-three" in fallback
+
+
+@pytest.mark.asyncio
+async def test_runtime_channel_stream_relay_no_fallback_on_success() -> None:
+    """Successful streams must not trigger the fallback channel.send."""
+
+    class StreamingChannel(_FakeChannel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.chunks: list[str] = []
+
+        async def send_streaming(self, chunks, **kwargs):
+            async for chunk in chunks:
+                self.chunks.append(chunk)
+
+    class FakeTaskRuntime:
+        async def enqueue(self, envelope, message: str, *, stream_event_sink=None):
+            return None
+
+    config = SimpleNamespace(
+        task_runtime=SimpleNamespace(
+            stream_relay_coalesce_ms=0.0,
+            stream_relay_coalesce_chars=0,
+        ),
+    )
+    channel = StreamingChannel()
+    relay = _RuntimeChannelStreamRelay.maybe_start(
+        channel,
+        _message(),
+        FakeTaskRuntime(),
+        config,
+    )
+
+    assert relay is not None
+
+    await relay.emit(TextDeltaEvent(text="hello"))
+    await relay.close()
+
+    assert channel.chunks == ["hello"]
+    assert channel.sent == [], "no fallback send on a successful stream"
+    assert relay.stream_error is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_channel_stream_relay_disabled_coalescing_yields_each_delta() -> None:
+    """Both window=0 and chars=0 disables coalescing — each delta yields."""
+
+    class StreamingChannel(_FakeChannel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.chunks: list[str] = []
+
+        async def send_streaming(self, chunks, **kwargs):
+            async for chunk in chunks:
+                self.chunks.append(chunk)
+
+    class FakeTaskRuntime:
+        async def enqueue(self, envelope, message: str, *, stream_event_sink=None):
+            return None
+
+    config = SimpleNamespace(
+        task_runtime=SimpleNamespace(
+            stream_relay_coalesce_ms=0.0,
+            stream_relay_coalesce_chars=0,
+        ),
+    )
+    channel = StreamingChannel()
+    relay = _RuntimeChannelStreamRelay.maybe_start(
+        channel,
+        _message(),
+        FakeTaskRuntime(),
+        config,
+    )
+
+    assert relay is not None
+
+    for chunk in ("a", "b", "c"):
+        await relay.emit(TextDeltaEvent(text=chunk))
+    await relay.close()
+
+    assert channel.chunks == ["a", "b", "c"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_channel_stream_relay_handles_late_failure_gracefully() -> None:
+    """When the failure happens after most chunks delivered, only the
+    remaining slice is sent via fallback — already-delivered chunks are
+    not duplicated.
+    """
+
+    class FailingLateChannel(_FakeChannel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delivered: list[str] = []
+
+        async def send_streaming(self, chunks, **kwargs):
+            count = 0
+            async for chunk in chunks:
+                count += 1
+                if count == 3:
+                    raise RuntimeError("very late blip")
+                self.delivered.append(chunk)
+
+    class FakeTaskRuntime:
+        async def enqueue(self, envelope, message: str, *, stream_event_sink=None):
+            return None
+
+    config = SimpleNamespace(
+        task_runtime=SimpleNamespace(
+            stream_relay_coalesce_ms=0.0,
+            stream_relay_coalesce_chars=0,
+        ),
+    )
+    channel = FailingLateChannel()
+    relay = _RuntimeChannelStreamRelay.maybe_start(
+        channel,
+        _message(),
+        FakeTaskRuntime(),
+        config,
+    )
+
+    assert relay is not None
+
+    for chunk in ("alpha", "beta", "gamma", "delta"):
+        await relay.emit(TextDeltaEvent(text=chunk))
+    await relay.close()
+
+    # First two chunks reached the consumer (and were appended to delivered);
+    # gamma was pulled from the iterator but the consumer raised before
+    # appending it; delta never left the relay queue.
+    assert channel.delivered == ["alpha", "beta"]
+    # Fallback delivers the un-acknowledged slice. The chunk that crashed
+    # the consumer (gamma) and the queued tail (delta) must appear so the
+    # user does not lose content.
+    assert channel.sent, "fallback must fire on late mid-stream failure"
+    fallback = channel.sent[-1].content
+    assert "gamma" in fallback
+    assert "delta" in fallback
+    # Successfully-yielded chunks must NOT be duplicated.
+    assert "alpha" not in fallback
+    assert "beta" not in fallback

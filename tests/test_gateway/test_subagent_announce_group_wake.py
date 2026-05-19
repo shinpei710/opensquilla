@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from opensquilla.gateway.subagent_announce import (
+    _build_subagent_group_outcome,
     _build_terminal_group_payloads,
     _format_parent_wake_message,
     _tracker,
@@ -212,6 +213,111 @@ async def test_group_payloads_enrich_non_current_children_from_task_ledger() -> 
     assert "error_message=boom" in wake_message
 
 
+def test_parent_wake_bounds_aggregate_subagent_output() -> None:
+    payloads = []
+    for index in range(5):
+        payloads.append(
+            {
+                "child_session_key": f"agent:worker:subagent:{index}",
+                "task_id": f"task-{index}",
+                "agent_id": f"worker-{index}",
+                "status": "succeeded",
+                "terminal_reason": "completed",
+                "result": {"text": f"result-{index}-" + ("x" * 12_000)},
+            }
+        )
+
+    wake_message = _format_parent_wake_message(PARENT_TASK, payloads)
+
+    assert len(wake_message) < 20_000
+    assert wake_message.count("<untrusted_subagent_result>") == 5
+    assert "[subagent result truncated" in wake_message
+    assert "child_session_key=agent:worker:subagent:4" in wake_message
+    assert "task_id=task-4" in wake_message
+
+
+def test_group_outcome_summary_counts_and_bounds_non_success_children() -> None:
+    long_error = "boom-" * 200
+    payloads = [
+        {
+            "child_session_key": "agent:worker:subagent:done",
+            "task_id": "task-done",
+            "agent_id": "worker-a",
+            "status": "succeeded",
+            "terminal_reason": "completed",
+        },
+        {
+            "child_session_key": "agent:worker:subagent:failed",
+            "task_id": "task-failed",
+            "agent_id": "worker-b",
+            "status": "failed",
+            "terminal_reason": "tool_error",
+            "error_class": "RuntimeError",
+            "error_message": long_error,
+        },
+        {
+            "child_session_key": "agent:worker:subagent:timeout",
+            "task_id": "task-timeout",
+            "agent_id": "worker-c",
+            "status": "timeout",
+            "terminal_reason": "timeout",
+        },
+    ]
+
+    outcome = _build_subagent_group_outcome(payloads)
+
+    assert outcome["total"] == 3
+    assert outcome["succeeded"] == 1
+    assert outcome["failed"] == 1
+    assert outcome["timeout"] == 1
+    assert outcome["cancelled"] == 0
+    assert outcome["abandoned"] == 0
+    assert outcome["non_success"] == 2
+    assert outcome["runtime_partial_failure_disclosure_required"] is True
+    assert [child["child_session_key"] for child in outcome["failed_children"]] == [
+        "agent:worker:subagent:failed",
+        "agent:worker:subagent:timeout",
+    ]
+    failed = outcome["failed_children"][0]
+    assert failed["task_id"] == "task-failed"
+    assert failed["agent_id"] == "worker-b"
+    assert failed["status"] == "failed"
+    assert failed["terminal_reason"] == "tool_error"
+    assert failed["error_class"] == "RuntimeError"
+    assert failed["error_message"].startswith("boom-")
+    assert len(failed["error_message"]) < len(long_error)
+    assert failed["error_message_truncated"] is True
+
+
+def test_context_overflow_failure_is_sanitized_for_group_outcome_and_wake() -> None:
+    raw_error = (
+        "Context overflow is in the current turn's recent tool calls or "
+        "reasoning tail; history compaction cannot reduce it."
+    )
+    payloads = [
+        {
+            "child_session_key": "agent:worker:subagent:failed",
+            "task_id": "task-failed",
+            "agent_id": "worker-b",
+            "status": "failed",
+            "terminal_reason": "error",
+            "error_class": "current_turn_context_exhausted",
+            "error_message": raw_error,
+        }
+    ]
+
+    outcome = _build_subagent_group_outcome(payloads)
+    failed = outcome["failed_children"][0]
+    wake_message = _format_parent_wake_message(PARENT_TASK, payloads, outcome=outcome)
+
+    assert failed["error_class"] == "provider_request_too_large"
+    assert "too large" in failed["error_message"].lower()
+    assert raw_error not in failed["error_message"]
+    assert "current_turn_context_exhausted" not in wake_message
+    assert "history compaction cannot reduce it" not in wake_message
+    assert "too large" in wake_message.lower()
+
+
 @pytest.mark.asyncio
 async def test_group_payloads_fall_back_when_task_ledger_is_unavailable() -> None:
     child = "agent:worker:subagent:fallback"
@@ -306,6 +412,78 @@ async def test_parent_wake_is_deferred_until_yield_and_sent_once() -> None:
         task_runtime=runtime,
     )
     assert len(runtime.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_parent_wake_provenance_carries_group_outcome_for_mixed_children() -> None:
+    child_done = "agent:worker:subagent:done"
+    child_failed = "agent:worker:subagent:failed"
+    manager = _SessionManager(
+        [
+            _SessionRow(child_done, status="done", agent_id="worker-a"),
+            _SessionRow(child_failed, status="failed", agent_id="worker-b"),
+        ],
+        tasks_by_session={
+            child_done: [
+                SimpleNamespace(
+                    task_id="task-done",
+                    agent_id="worker-a",
+                    status=AgentTaskStatus.SUCCEEDED,
+                    run_kind="subagent",
+                    terminal_reason="completed",
+                    created_at=1,
+                    updated_at=2,
+                    finished_at=3,
+                )
+            ],
+            child_failed: [
+                SimpleNamespace(
+                    task_id="task-failed",
+                    agent_id="worker-b",
+                    status=AgentTaskStatus.FAILED,
+                    run_kind="subagent",
+                    terminal_reason="tool_error",
+                    error_class="RuntimeError",
+                    error_message="boom",
+                    created_at=1,
+                    updated_at=2,
+                    finished_at=3,
+                )
+            ],
+        },
+        transcripts={child_done: "done result", child_failed: "failed details"},
+    )
+    runtime = _TaskRuntime()
+
+    assert await close_subagent_spawn_group(
+        PARENT,
+        PARENT_TASK,
+        session_manager=manager,
+        task_runtime=runtime,
+    )
+
+    assert len(runtime.sent) == 1
+    _, wake_message, provenance = runtime.sent[0]
+    assert "Subagents: 1/2 succeeded" in wake_message
+    assert provenance is not None
+    assert provenance["runtime_partial_failure_disclosure_required"] is True
+    outcome = provenance["subagent_group_outcome"]
+    assert outcome["total"] == 2
+    assert outcome["succeeded"] == 1
+    assert outcome["failed"] == 1
+    assert outcome["non_success"] == 1
+    assert outcome["failed_children"] == [
+        {
+            "child_session_key": child_failed,
+            "task_id": "task-failed",
+            "agent_id": "worker-b",
+            "status": "failed",
+            "terminal_reason": "tool_error",
+            "error_class": "RuntimeError",
+            "error_message": "boom",
+            "error_message_truncated": False,
+        }
+    ]
 
 
 @pytest.mark.asyncio

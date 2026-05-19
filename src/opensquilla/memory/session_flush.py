@@ -89,6 +89,7 @@ DEFAULT_FLUSH_EXTRACTION_MAX_TOKENS = 3072
 DEFAULT_SEGMENT_EXTRACTION_CONCURRENCY = 4
 DEFAULT_TEMPORAL_SOURCE_BACKFILL_LIMIT = 50
 FLUSH_OBLIGATION_POLICY_VERSION = "temporal-source-obligation-v1"
+RAW_FALLBACK_DEDUPE_MAX_ENTRIES = 256
 _RAW_ERROR_MESSAGE_LIMIT = 2_000
 _ALLOWED_CANDIDATE_KINDS: set[str] = {
     "fact",
@@ -1870,6 +1871,7 @@ class SessionFlushService:
         self._default_timeout = default_timeout
         self._extraction_stats_by_session: dict[tuple[str, str], dict[str, Any]] = {}
         self._last_extraction_stats: dict[str, Any] = {}
+        self._raw_fallback_receipts: dict[tuple[str, str, str, str], FlushReceipt] = {}
 
     def last_extraction_stats(
         self,
@@ -1881,6 +1883,31 @@ class SessionFlushService:
         if agent_id is not None and session_key is not None:
             return dict(self._extraction_stats_by_session.get((agent_id, session_key), {}))
         return dict(self._last_extraction_stats)
+
+    def _record_flush_done(
+        self,
+        receipt: FlushReceipt,
+        *,
+        agent_id: str,
+        session_key: str,
+    ) -> None:
+        logger.info(
+            "session_flush.done",
+            extra={
+                "agent_id": agent_id,
+                "session_key": session_key,
+                "flush_mode": receipt.mode,
+                "raw_reason": receipt.raw_reason,
+                "error": receipt.error,
+                "flushed_paths": list(receipt.flushed_paths),
+                "message_count": receipt.message_count,
+                "duration_ms": receipt.duration_ms,
+                "integrity_status": receipt.integrity_status,
+                "indexed_chunk_count": receipt.indexed_chunk_count,
+                "output_coverage_status": receipt.output_coverage_status,
+                "obligation_status": receipt.obligation_status,
+            },
+        )
 
     async def execute(
         self,
@@ -1895,15 +1922,25 @@ class SessionFlushService:
         segment_max_chars: int | None = None,
         segment_overlap_messages: int = 0,
     ) -> FlushReceipt:
+        def _done(receipt: FlushReceipt) -> FlushReceipt:
+            self._record_flush_done(
+                receipt,
+                agent_id=agent_id,
+                session_key=session_key,
+            )
+            return receipt
+
         if not transcript:
-            return FlushReceipt(
-                mode="skipped",
-                flushed_paths=[],
-                slug=None,
-                message_count=0,
-                duration_ms=0,
-                raw_reason=None,
-                error=None,
+            return _done(
+                FlushReceipt(
+                    mode="skipped",
+                    flushed_paths=[],
+                    slug=None,
+                    message_count=0,
+                    duration_ms=0,
+                    raw_reason=None,
+                    error=None,
+                )
             )
 
         window = message_window if message_window is not None else self._default_message_window
@@ -1930,50 +1967,57 @@ class SessionFlushService:
             has_memory_save = self._has_memory_save_tool()
 
             if provider is None:
-                return await self._raw_dump_fallback(
-                    messages,
-                    reason="no_provider",
-                    agent_id=agent_id,
-                    session_key=session_key,
-                    input_message_count=input_message_count,
-                    selected_start_index=selected_start_index,
-                )
-            if not has_memory_save:
-                return await self._raw_dump_fallback(
-                    messages,
-                    reason="no_tools",
-                    agent_id=agent_id,
-                    session_key=session_key,
-                    input_message_count=input_message_count,
-                    selected_start_index=selected_start_index,
-                )
-
-            try:
-                return await asyncio.wait_for(
-                    self._llm_flush(
+                return _done(
+                    await self._raw_dump_fallback(
                         messages,
-                        provider,
-                        agent_id,
+                        reason="no_provider",
+                        agent_id=agent_id,
                         session_key=session_key,
                         input_message_count=input_message_count,
                         selected_start_index=selected_start_index,
-                        full_transcript_requested=window == 0,
-                        flush_max_chars=flush_max_chars,
-                        segment_mode=segment_mode,
-                        segment_max_chars=segment_max_chars,
-                        segment_overlap_messages=segment_overlap_messages,
+                    )
+                )
+            if not has_memory_save:
+                return _done(
+                    await self._raw_dump_fallback(
+                        messages,
+                        reason="no_tools",
+                        agent_id=agent_id,
+                        session_key=session_key,
+                        input_message_count=input_message_count,
+                        selected_start_index=selected_start_index,
+                    )
+                )
+
+            try:
+                return _done(
+                    await asyncio.wait_for(
+                        self._llm_flush(
+                            messages,
+                            provider,
+                            agent_id,
+                            session_key=session_key,
+                            input_message_count=input_message_count,
+                            selected_start_index=selected_start_index,
+                            flush_max_chars=flush_max_chars,
+                            segment_mode=segment_mode,
+                            segment_max_chars=segment_max_chars,
+                            segment_overlap_messages=segment_overlap_messages,
+                        ),
+                        timeout=timeout_s,
                     ),
-                    timeout=timeout_s,
                 )
             except TimeoutError as exc:
-                return await self._raw_dump_fallback(
-                    messages,
-                    reason="timeout",
-                    raw_error=exc,
-                    agent_id=agent_id,
-                    session_key=session_key,
-                    input_message_count=input_message_count,
-                    selected_start_index=selected_start_index,
+                return _done(
+                    await self._raw_dump_fallback(
+                        messages,
+                        reason="timeout",
+                        raw_error=exc,
+                        agent_id=agent_id,
+                        session_key=session_key,
+                        input_message_count=input_message_count,
+                        selected_start_index=selected_start_index,
+                    )
                 )
             except asyncio.CancelledError:
                 raise
@@ -1986,14 +2030,16 @@ class SessionFlushService:
                         **error_payload,
                     },
                 )
-                return await self._raw_dump_fallback(
-                    messages,
-                    reason="llm_error",
-                    raw_error=exc,
-                    agent_id=agent_id,
-                    session_key=session_key,
-                    input_message_count=input_message_count,
-                    selected_start_index=selected_start_index,
+                return _done(
+                    await self._raw_dump_fallback(
+                        messages,
+                        reason="llm_error",
+                        raw_error=exc,
+                        agent_id=agent_id,
+                        session_key=session_key,
+                        input_message_count=input_message_count,
+                        selected_start_index=selected_start_index,
+                    )
                 )
         except asyncio.CancelledError:
             # Caller cancellation (e.g. compaction 5s outer budget, SIGINT,
@@ -2006,22 +2052,24 @@ class SessionFlushService:
                 "session_flush.error",
                 extra={"session_key": session_key, "error": str(exc)},
             )
-            return FlushReceipt(
-                mode="error",
-                flushed_paths=[],
-                slug=None,
-                message_count=len(messages),
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                raw_reason=None,
-                error=str(exc),
-                input_message_count=input_message_count,
-                prompt_message_count=0,
-                prompt_char_count=0,
-                truncated=False,
-                truncation_policy="error",
-                first_included_message=None,
-                last_included_message=None,
-                source_coverage=0.0,
+            return _done(
+                FlushReceipt(
+                    mode="error",
+                    flushed_paths=[],
+                    slug=None,
+                    message_count=len(messages),
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    raw_reason=None,
+                    error=str(exc),
+                    input_message_count=input_message_count,
+                    prompt_message_count=0,
+                    prompt_char_count=0,
+                    truncated=False,
+                    truncation_policy="error",
+                    first_included_message=None,
+                    last_included_message=None,
+                    source_coverage=0.0,
+                )
             )
 
     # --- internals ---
@@ -2471,7 +2519,6 @@ class SessionFlushService:
         session_key: str = "",
         input_message_count: int | None = None,
         selected_start_index: int | None = None,
-        full_transcript_requested: bool = False,
         flush_max_chars: int | None = None,
         segment_mode: SegmentMode = "off",
         segment_max_chars: int | None = None,
@@ -2813,9 +2860,23 @@ class SessionFlushService:
         excerpt = dump_transcript_excerpt_with_audit(messages, max_chars=32_000)
         body = excerpt.text
         header = f"# Raw flush ({reason})\n\n"
+        fingerprint = hashlib.sha256((header + body).encode("utf-8")).hexdigest()
+        cache_key = (agent_id, session_key or "", reason, fingerprint)
+        cached = self._raw_fallback_receipts.get(cache_key)
+        if cached is not None:
+            logger.info(
+                "session_flush.raw_fallback_deduped",
+                extra={
+                    "reason": reason,
+                    "agent_id": agent_id,
+                    "session_key": session_key,
+                    "path": cached.flushed_paths[0] if cached.flushed_paths else "",
+                },
+            )
+            return cached
         _ctx_token = current_tool_context.set(_flush_tool_context(agent_id, source_name="raw-dump"))
         try:
-            await self._tool_handler(
+            result = await self._tool_handler(
                 ToolCall(
                     tool_use_id=f"flush-raw-{ts}",
                     tool_name="memory_save",
@@ -2824,7 +2885,37 @@ class SessionFlushService:
             )
         finally:
             current_tool_context.reset(_ctx_token)
-        return FlushReceipt(
+        if getattr(result, "is_error", False):
+            result_text = str(
+                getattr(result, "content", "memory_save failed") or "memory_save failed"
+            )
+            logger.error(
+                "session_flush.raw_fallback_save_failed",
+                extra={
+                    "reason": reason,
+                    "agent_id": agent_id,
+                    "session_key": session_key,
+                    "path": path,
+                    "error": result_text,
+                },
+            )
+            return FlushReceipt(
+                mode="error",
+                flushed_paths=[],
+                slug=None,
+                message_count=len(messages),
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                raw_reason=None,
+                error=f"raw fallback memory_save failed: {result_text}",
+                **error_payload,
+                **_receipt_audit_kwargs(
+                    excerpt,
+                    input_message_count=input_message_count or len(messages),
+                    selected_start_index=selected_start_index,
+                    prompt_char_count=len(body),
+                ),
+            )
+        receipt = FlushReceipt(
             mode="raw",
             flushed_paths=[path],
             slug=None,
@@ -2840,3 +2931,7 @@ class SessionFlushService:
                 prompt_char_count=len(body),
             ),
         )
+        self._raw_fallback_receipts[cache_key] = receipt
+        if len(self._raw_fallback_receipts) > RAW_FALLBACK_DEDUPE_MAX_ENTRIES:
+            self._raw_fallback_receipts.pop(next(iter(self._raw_fallback_receipts)))
+        return receipt

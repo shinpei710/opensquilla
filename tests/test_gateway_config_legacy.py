@@ -13,13 +13,14 @@ from pathlib import Path
 import pytest
 
 import opensquilla.gateway.config as config_module
+import opensquilla.gateway.config_migration as migration_module
 from opensquilla.gateway.config import GatewayConfig
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-_ALL_16_DEPRECATED = {
+_ALL_DEPRECATED_MEMORY_FIELDS = {
     "memory.profile": "legacy_profile_value",
     "memory.cost.embedding_cache": "true",
     "memory.cost.rerank_cache": "false",
@@ -32,6 +33,11 @@ _ALL_16_DEPRECATED = {
     "memory.multi_hop_score_threshold": "0.7",
     "memory.recall_frequency": "always",
     "memory.recall_top_k_default": "10",
+    "memory.auto_recall_enabled": "true",
+    "memory.prefetch_enabled": "true",
+    "memory.prefetch_max_results": "3",
+    "memory.prefetch_min_score": "0.3",
+    "memory.prefetch_total_max_chars": "1500",
     "memory.semantic_chunking_enabled": "true",
     "memory.eviction_policy": "lru",
     "memory.summary_model": "gpt-4o-mini",
@@ -40,11 +46,11 @@ _ALL_16_DEPRECATED = {
 
 
 def _build_toml_with_deprecated(tmp_path: Path) -> Path:
-    """Write a minimal config.toml that contains all 16 deprecated fields."""
+    """Write a minimal config.toml that contains all deprecated fields."""
     lines = ["[memory]\n"]
     cost_lines = ["[memory.cost]\n"]
 
-    for dotted, val in _ALL_16_DEPRECATED.items():
+    for dotted, val in _ALL_DEPRECATED_MEMORY_FIELDS.items():
         parts = dotted.split(".")
         if parts[1] == "cost":
             leaf = parts[2]
@@ -63,12 +69,80 @@ def _build_toml_with_deprecated(tmp_path: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def test_load_with_all_16_deprecated_fields_does_not_raise(tmp_path: Path) -> None:
-    """GatewayConfig.load() must succeed even when all 16 deprecated memory
+def test_load_with_all_deprecated_fields_does_not_raise(tmp_path: Path) -> None:
+    """GatewayConfig.load() must succeed even when deprecated memory
     fields are present in the config file."""
     toml_path = _build_toml_with_deprecated(tmp_path)
     cfg = GatewayConfig.load(toml_path)
     assert isinstance(cfg, GatewayConfig)
+    backups = sorted(tmp_path.glob("config.toml.backup.*"))
+    assert backups
+    backup_text = backups[-1].read_text(encoding="utf-8")
+    assert "prefetch_enabled" in backup_text
+    assert "embedding_cache" in backup_text
+    text = toml_path.read_text(encoding="utf-8")
+    assert "prefetch_enabled" not in text
+    assert "embedding_cache" not in text
+
+
+def test_load_migrates_010_turn_capture_fields(tmp_path: Path) -> None:
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_text(
+        "\n".join(
+            [
+                "[memory]",
+                'capture_mode = "archive_turn_pair"',
+                "index_captured_turns = true",
+                "prefetch_enabled = true",
+                "prefetch_max_results = 3",
+                "prefetch_min_score = 0.3",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = GatewayConfig.load(toml_path)
+
+    assert cfg.memory.capture_mode == "turn_pair"
+    backups = sorted(tmp_path.glob("config.toml.backup.*"))
+    assert backups
+    backup_text = backups[-1].read_text(encoding="utf-8")
+    assert 'capture_mode = "archive_turn_pair"' in backup_text
+    assert "index_captured_turns = true" in backup_text
+    data = toml_path.read_text(encoding="utf-8")
+    assert 'capture_mode = "turn_pair"' in data
+    assert "archive_turn_pair" not in data
+    assert "index_captured_turns" not in data
+    assert "prefetch_enabled" not in data
+    assert "prefetch_max_results" not in data
+    assert "prefetch_min_score" not in data
+
+
+def test_load_from_toml_migrates_010_turn_capture_fields(tmp_path: Path) -> None:
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_text(
+        "\n".join(
+            [
+                "[memory]",
+                'capture_mode = "archive_turn_pair"',
+                "index_captured_turns = false",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = GatewayConfig.load_from_toml(toml_path)
+
+    assert cfg.memory.capture_mode == "turn_pair"
+    backups = sorted(tmp_path.glob("config.toml.backup.*"))
+    assert backups
+    backup_text = backups[-1].read_text(encoding="utf-8")
+    assert 'capture_mode = "archive_turn_pair"' in backup_text
+    data = toml_path.read_text(encoding="utf-8")
+    assert 'capture_mode = "turn_pair"' in data
+    assert "index_captured_turns" not in data
 
 
 # ---------------------------------------------------------------------------
@@ -82,8 +156,8 @@ def test_aggregate_deprecation_warning_emitted_once_per_process(
     """A single DeprecationWarning is emitted the first time deprecated memory
     fields are encountered; subsequent loads with the same fields are silent."""
     # Reset the process-level sentinels so this test is not affected by order.
-    monkeypatch.setattr(config_module, "_LEGACY_MEMORY_FIELDS_WARNED", False)
-    monkeypatch.setattr(config_module, "_LEGACY_MEMORY_FIELDS_SEEN", set())
+    monkeypatch.setattr(migration_module, "_LEGACY_MEMORY_FIELDS_WARNED", False)
+    monkeypatch.setattr(migration_module, "_LEGACY_MEMORY_FIELDS_SEEN", set())
 
     toml_path = _build_toml_with_deprecated(tmp_path)
 
@@ -101,7 +175,7 @@ def test_aggregate_deprecation_warning_emitted_once_per_process(
     )
     msg = str(deprecation_warnings[0].message)
     assert "memory" in msg.lower()
-    assert "16 legacy memory.* config field(s) ignored" in msg
+    assert f"{len(_ALL_DEPRECATED_MEMORY_FIELDS)} legacy memory.* config field(s) ignored" in msg
     assert "0.2.0" in msg
 
 
@@ -115,11 +189,11 @@ def test_log_file_written_with_per_field_detail(
 ) -> None:
     """After loading a config with deprecated fields, a .log file must exist
     under ~/.opensquilla/logs/ containing one JSON line per deprecated field."""
-    monkeypatch.setattr(config_module, "_LEGACY_MEMORY_FIELDS_WARNED", False)
-    monkeypatch.setattr(config_module, "_LEGACY_MEMORY_FIELDS_SEEN", set())
+    monkeypatch.setattr(migration_module, "_LEGACY_MEMORY_FIELDS_WARNED", False)
+    monkeypatch.setattr(migration_module, "_LEGACY_MEMORY_FIELDS_SEEN", set())
 
     # Redirect opensquilla home to tmp_path so the log lands there.
-    monkeypatch.setattr(config_module, "default_opensquilla_home", lambda: tmp_path)
+    monkeypatch.setattr(migration_module, "default_opensquilla_home", lambda: tmp_path)
 
     toml_path = _build_toml_with_deprecated(tmp_path)
 
@@ -136,7 +210,8 @@ def test_log_file_written_with_per_field_detail(
 
     log_file = log_files[-1]
     lines = [ln for ln in log_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    assert len(lines) == 16, f"Expected 16 log lines, got {len(lines)}"
+    expected_count = len(_ALL_DEPRECATED_MEMORY_FIELDS)
+    assert len(lines) == expected_count, f"Expected {expected_count} log lines, got {len(lines)}"
 
     for line in lines:
         entry = json.loads(line)

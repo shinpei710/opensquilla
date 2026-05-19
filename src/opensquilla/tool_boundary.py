@@ -6,6 +6,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from opensquilla.execution_status import ExecutionStatus
+
 
 @dataclass
 class ToolCall:
@@ -26,6 +28,7 @@ class ToolResult:
     content: str
     is_error: bool = False
     artifacts: list[dict[str, Any]] = field(default_factory=list)
+    execution_status: ExecutionStatus | None = None
 
 
 AgentToolHandler = Callable[[ToolCall], Awaitable[ToolResult]]

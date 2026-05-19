@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import os
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -15,8 +16,9 @@ from opensquilla.artifacts import (
     ArtifactStore,
     artifact_payload,
 )
+from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import ToolError, current_tool_context
+from opensquilla.tools.types import CallerKind, ToolContext, ToolError, current_tool_context
 
 _MAX_MISSING_FILE_CANDIDATES = 5
 _MAX_MISSING_FILE_SCAN = 2000
@@ -79,13 +81,61 @@ def _missing_artifact_error(path: str, workspace: Path, target: Path) -> ToolErr
     return ToolError(". ".join(details))
 
 
+def _should_expose_local_path(ctx: ToolContext) -> bool:
+    return bool(ctx.is_owner and ctx.caller_kind in {CallerKind.CLI, CallerKind.WEB})
+
+
+def _llm_artifact_payload(
+    payload: dict[str, object],
+    *,
+    ctx: ToolContext,
+    workspace: Path,
+    target: Path,
+) -> dict[str, object]:
+    llm_artifact = {k: v for k, v in payload.items() if k != "download_url"}
+    if _should_expose_local_path(ctx):
+        workspace_path = target.relative_to(workspace).as_posix()
+        llm_artifact["workspace_path"] = workspace_path
+        llm_artifact["local_path"] = str(target)
+    return llm_artifact
+
+
+def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
+    final_response = (
+        "Do not run more tools for this deliverable unless the user explicitly "
+        "asked for another file or a specific verification step. Send the final response now."
+    )
+    if _should_expose_local_path(ctx):
+        prefix = (
+            "This file is already registered for the current surface in this turn. "
+            if already_published
+            else "The user already sees a clickable download button rendered by the UI. "
+        )
+        return (
+            prefix
+            + "Do not include any artifact URL in your reply. "
+            + "Mention the local_path as the local entry path when the user needs to open "
+            + f"the generated file on this machine. {final_response}"
+        )
+    if already_published:
+        return (
+            "This file is already registered for the current surface in this turn. "
+            "Do not call publish_artifact again for the same file; just confirm it is ready. "
+            + final_response
+        )
+    return (
+        "The active surface handles artifact download or native channel delivery. "
+        f"Do not include any URL in your reply. {final_response}"
+    )
+
+
 @tool(
     name="publish_artifact",
     description=(
-        "Publish an existing workspace file as a generated artifact for the user to download. "
+        "Register an existing workspace file as a generated artifact for the current surface. "
         "Only files inside the active workspace are allowed. "
-        "The user's UI shows a clickable download chip automatically; do not include any URL "
-        "in your reply — just confirm the file is ready."
+        "The active surface handles download chips or native channel delivery; do not include "
+        "any URL in your reply — just confirm the file is ready."
     ),
     params={
         "path": {
@@ -119,6 +169,7 @@ async def publish_artifact(
         raise ToolError("artifact session scope is not configured for this turn")
 
     workspace = Path(ctx.workspace_dir).resolve()
+    reject_foreign_host_path(path, platform=os.name, workspace=workspace)
     raw_path = Path(path)
     target = (raw_path if raw_path.is_absolute() else workspace / raw_path).resolve()
     try:
@@ -134,16 +185,17 @@ async def publish_artifact(
     for published in reversed(ctx.published_artifacts):
         if published.get("sha256") != target_sha256:
             continue
-        llm_artifact = {k: v for k, v in published.items() if k != "download_url"}
+        llm_artifact = _llm_artifact_payload(
+            published,
+            ctx=ctx,
+            workspace=workspace,
+            target=target,
+        )
         return json.dumps(
             {
                 "status": "already_published",
                 "artifact": llm_artifact,
-                "note": (
-                    "This file is already published for the user in this turn. "
-                    "Do not call publish_artifact again for the same file; "
-                    "just confirm it is ready."
-                ),
+                "note": _publish_note(ctx, already_published=True),
             },
             ensure_ascii=False,
         )
@@ -153,6 +205,31 @@ async def publish_artifact(
         artifact_mime = "application/octet-stream"
 
     store = ArtifactStore(ctx.artifact_media_root)
+    existing = store.find_existing_ref(
+        session_id=ctx.artifact_session_id,
+        session_key=ctx.session_key,
+        sha256=target_sha256,
+        name=name or target.name,
+        mime=artifact_mime,
+    )
+    if existing is not None:
+        payload = artifact_payload(existing)
+        if not any(item.get("id") == payload.get("id") for item in ctx.published_artifacts):
+            ctx.published_artifacts.append(payload)
+        llm_artifact = _llm_artifact_payload(
+            payload,
+            ctx=ctx,
+            workspace=workspace,
+            target=target,
+        )
+        return json.dumps(
+            {
+                "status": "already_published",
+                "artifact": llm_artifact,
+                "note": _publish_note(ctx, already_published=True),
+            },
+            ensure_ascii=False,
+        )
     try:
         ref = store.publish_file(
             target,
@@ -177,15 +254,17 @@ async def publish_artifact(
 
     payload = artifact_payload(ref)
     ctx.published_artifacts.append(payload)
-    llm_artifact = {k: v for k, v in payload.items() if k != "download_url"}
+    llm_artifact = _llm_artifact_payload(
+        payload,
+        ctx=ctx,
+        workspace=workspace,
+        target=target,
+    )
     return json.dumps(
         {
             "status": "published",
             "artifact": llm_artifact,
-            "note": (
-                "The user already sees a clickable download button rendered by the UI. "
-                "Do not include any URL in your reply."
-            ),
+            "note": _publish_note(ctx),
         },
         ensure_ascii=False,
     )

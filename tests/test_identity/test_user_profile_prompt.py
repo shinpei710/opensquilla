@@ -52,8 +52,41 @@ def test_system_prompt_routes_profile_to_user_md() -> None:
     assert "name, preferred address, pronouns, timezone" in prompt
     assert "Do not use `memory_save` for `USER.md`" in prompt
     assert "MEMORY.md` for durable non-profile facts" in prompt
+    assert "`MEMORY.md` + `memory/**/*.md`" in prompt
+    assert "relevant `USER.md`, `MEMORY.md`, or `memory/**/*.md` file" in prompt
     assert "decisions, dates, people, preferences, or todos" not in prompt
     assert "prior work, decisions, dated history, todos" in prompt
+
+
+def test_system_prompt_disambiguates_session_memory_results() -> None:
+    prompt = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode="full"),
+        tools=["memory_search", "memory_get"],
+    )
+
+    assert "plus indexed session snippets when available" in prompt
+    assert "raw turn captures or raw fallback files" in prompt
+    assert "For `source: memory` results, use `memory_get`" in prompt
+    assert "For `source: sessions` results, use the returned snippet" in prompt
+    assert "`sessions/...` paths are virtual index sources" in prompt
+    assert "Prefer curated `MEMORY.md`/`memory/**/*.md` facts" in prompt
+    assert "not automatically as current truth" in prompt
+    assert "include the returned citation or path#line" in prompt
+    assert "Do not invent citations" in prompt
+
+
+def test_system_prompt_routes_exact_transcript_search_to_session_search() -> None:
+    prompt = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode="full"),
+        tools=["memory_search", "memory_get", "session_search"],
+    )
+
+    assert "`session_search`" in prompt
+    assert "exact prior chat wording" in prompt
+    assert "transcript context" in prompt
+    assert "code snippets from persisted sessions" in prompt
+    assert "Ordinary recall should start with source-aware `memory_search`" in prompt
+    assert "debug" not in prompt.lower()
 
 
 def test_system_prompt_routes_agent_identity_away_from_memory_md() -> None:
@@ -100,7 +133,11 @@ def test_system_prompt_guides_generated_file_delivery() -> None:
     assert "## Generated File Delivery" in prompt
     assert "Do not paste full file source" in prompt
     assert "call `publish_artifact` for the final file" in prompt
+    assert "local entry path" in prompt
+    assert "Do not invent artifact download URLs" in prompt
     assert "do not call `publish_artifact` again" in prompt
+    assert "After `publish_artifact` succeeds" in prompt
+    assert "final response" in prompt
 
 
 def test_system_prompt_limits_file_delivery_when_no_file_authoring_tools() -> None:
@@ -115,6 +152,22 @@ def test_system_prompt_limits_file_delivery_when_no_file_authoring_tools() -> No
     assert "surface where file authoring is enabled" in prompt
     assert "Do not paste full file source" in prompt
     assert "create the file in the active workspace" not in prompt
+
+
+def test_system_prompt_describes_structured_artifact_fallback_limits() -> None:
+    prompt = assemble_system_prompt(
+        AgentProfile(agent_id="main", prompt_mode="full"),
+        tools=["publish_artifact", "create_pptx", "image_generate"],
+    )
+
+    assert "## Structured Generated File Delivery" in prompt
+    assert "only when the request fits the tool schema" in prompt
+    assert "`create_pptx` creates a basic text-only deck" in prompt
+    assert "create, send, deliver, or attach" in prompt
+    assert "call `create_pptx`" in prompt
+    assert "Do not substitute a PDF, CSV, XLSX, Python script, OOXML" in prompt
+    assert "full visual deck authoring is not enabled" in prompt
+    assert "file creation is not enabled for this session" not in prompt
 
 
 def test_legacy_image_alias_does_not_enable_image_generation_prompt() -> None:

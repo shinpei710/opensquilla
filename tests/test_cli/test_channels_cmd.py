@@ -237,8 +237,11 @@ def test_channels_types_lists_all_supported(tmp_path, monkeypatch):
     assert result.exit_code == 0
     out = result.stdout
     for t in ("slack", "telegram", "discord", "feishu",
-              "dingtalk", "wecom", "qq", "msteams", "matrix"):
+              "dingtalk", "wecom", "qq", "matrix"):
         assert t in out
+    # msteams is intentionally hidden from the channel catalog CLI surface
+    # until first-class support lands.
+    assert "msteams" not in out
     assert "transport" in out.lower()
 
 

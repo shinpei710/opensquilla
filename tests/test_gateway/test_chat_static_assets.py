@@ -59,6 +59,16 @@ def test_chat_input_accept_attribute_matches_allowlist() -> None:
     for mime in sorted(_ALLOWED_MIMES):
         assert mime in source, mime
 
+
+def test_chat_permission_pill_distinguishes_global_and_session_modes() -> None:
+    source = _read_chat_js()
+
+    assert "cfg?.permissions?.default_mode" in source
+    assert "Global ${_globalElevatedMode.toUpperCase()}" in source
+    assert "Session ${_elevatedMode.toUpperCase()}" in source
+    assert "Approvals bypassed by global default" in source
+    assert "opensquilla sandbox on|bypass|full|reset" in source
+
     # The legacy image-only `accept="image/*" multiple` literal must be gone:
     assert 'accept="image/*" multiple' not in source
 
@@ -208,6 +218,17 @@ def test_chat_js_has_document_level_escape_handler() -> None:
     assert "if (e.defaultPrevented) return;" in source
     assert "if (_chatOverlayVisible()) return;" in source
     assert "function _chatOverlayVisible" in source
+
+
+def test_chat_tool_rendering_is_idempotent_by_tool_use_id() -> None:
+    source = _read_chat_js()
+
+    assert "function _findToolDetailsById(root, toolId)" in source
+    assert "const existing = _findToolDetailsById(body, toolId);" in source
+    assert "if (existing) {" in source
+    assert "return;" in source
+    assert "data-tool-result-for" in source
+    assert "_findToolResultById" in source
 
 
 # ---------------------------------------------------------------------------

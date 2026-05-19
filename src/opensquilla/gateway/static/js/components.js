@@ -4,8 +4,12 @@ const UI = (() => {
 
   // -- Toast notifications --
   let _toastContainer = null;
+  const _visibleToasts = new Map();
 
   function toast(message, type = 'info', duration = 3000) {
+    const toastKey = `${type}\u0000${message}`;
+    if (_visibleToasts.has(toastKey)) return;
+
     if (!_toastContainer) {
       _toastContainer = document.createElement('div');
       _toastContainer.className = 'toast-stack';
@@ -14,8 +18,14 @@ const UI = (() => {
     const el = document.createElement('div');
     el.className = `toast ${type}`;
     el.textContent = message;
+    _visibleToasts.set(toastKey, el);
     _toastContainer.appendChild(el);
-    setTimeout(() => { el.remove(); }, duration);
+    setTimeout(() => {
+      el.remove();
+      if (_visibleToasts.get(toastKey) === el) {
+        _visibleToasts.delete(toastKey);
+      }
+    }, duration);
   }
 
   // -- Modal --
@@ -136,7 +146,13 @@ const UI = (() => {
 
   // -- Relative time --
   function relTime(isoOrTs) {
-    const d = typeof isoOrTs === 'number' ? new Date(isoOrTs * 1000) : new Date(isoOrTs);
+    const numeric = typeof isoOrTs === 'number'
+      ? isoOrTs
+      : (typeof isoOrTs === 'string' && isoOrTs.trim() !== '' ? Number(isoOrTs) : NaN);
+    const d = Number.isFinite(numeric)
+      ? new Date(Math.abs(numeric) < 10000000000 ? numeric * 1000 : numeric)
+      : new Date(isoOrTs);
+    if (Number.isNaN(d.getTime())) return '—';
     const diff = (Date.now() - d.getTime()) / 1000;
     if (diff < 60) return 'just now';
     if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;

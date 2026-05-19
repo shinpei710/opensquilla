@@ -12,7 +12,7 @@ from opensquilla.agents.limits import MAX_SPAWN_DEPTH
 from opensquilla.gateway.routing import build_subagent_route_envelope
 from opensquilla.session.keys import build_subagent_session_key, parse_agent_id
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import ToolError, current_tool_context
+from opensquilla.tools.types import SafeToolError, ToolError, current_tool_context
 
 _log = structlog.get_logger("opensquilla.tools.sessions")
 
@@ -20,10 +20,9 @@ _VALID_STATUSES = ("running", "done", "failed", "killed", "timeout")
 _TERMINAL_STATUSES = ("done", "failed", "killed", "timeout")
 _MAX_SPAWN_DEPTH = MAX_SPAWN_DEPTH
 
-# COMPACTION RISK: grounding is injected into the first user turn only.
-# If the subagent session is compacted before the task executes, this
-# prefix may be discarded with early history. For durable anti-injection
-# enforcement a system-prompt pipeline hook (applied on every turn) is required.
+# Subagent grounding also has a per-turn system-prompt fallback in
+# engine.steps.inject_subagent_grounding. Keep this spawn prompt text in
+# sync with that fallback so compaction cannot erase the subagent contract.
 _SUBAGENT_SYSTEM_PROMPT = (
     "You are a subagent. Execute the delegated task faithfully and return "
     "a structured result to your parent session."
@@ -243,26 +242,36 @@ def evict_spawn_lock(parent_session_key: str) -> bool:
 )
 async def sessions_send(session_key: str, message: str) -> str:
     if not message:
-        raise ToolError("Message must not be empty")
+        raise SafeToolError("Message must not be empty")
 
     try:
         mgr = _get_session_manager()
         session = await mgr.get_session(session_key)
         if session is None:
-            raise ToolError(f"Session not found: {session_key}")
+            raise SafeToolError(f"Session not found: {session_key}")
         status = getattr(session, "status", "unknown")
         if status in _TERMINAL_STATUSES:
-            raise ToolError(f"Session '{session_key}' is terminated (status={status})")
+            raise SafeToolError(
+                f"Session '{session_key}' is terminated (status={status})"
+            )
         try:
             runtime = _get_task_runtime()
         except ToolError:
             runtime = None
         if runtime is not None:
-            handle = await runtime.send(
-                session_key,
-                message,
-                provenance={"kind": "inter_session", "source_tool": "sessions_send"},
-            )
+            try:
+                handle = await runtime.send(
+                    session_key,
+                    message,
+                    provenance={"kind": "inter_session", "source_tool": "sessions_send"},
+                )
+            except Exception as exc:
+                if type(exc).__name__ == "TaskQueueFullError":
+                    raise SafeToolError(
+                        f"Session '{session_key}' task queue is full. "
+                        "Try again after queued work completes."
+                    ) from exc
+                raise
             return json.dumps(
                 {
                     "status": "queued",
@@ -272,6 +281,8 @@ async def sessions_send(session_key: str, message: str) -> str:
             )
         queued = await mgr.inject_message(session_key, message, provenance="inter_session")
         return json.dumps({"status": "delivered", "session_key": session_key, "queued": queued})
+    except SafeToolError:
+        raise
     except ToolError:
         raise
     except (ImportError, AttributeError, NotImplementedError) as exc:

@@ -8,8 +8,7 @@ to attach a :class:`SandboxSettings` submodel in a later integration step.
 The four-way truth table for the two feature switches is implemented in
 :meth:`SandboxSettings.validate_combination`, which returns an
 :class:`EffectiveMode` instead of mutating silently. The caller decides
-whether to log a warning or abort. The active behaviour contract is recorded
-in ``docs/adr/006-sandbox-governance.md``.
+whether to log a warning or abort.
 """
 
 from __future__ import annotations
@@ -65,15 +64,16 @@ class SandboxSettings(BaseSettings):
       active. When false, the system uses a fixed ``STANDARD`` policy with no
       dynamic escalation.
 
-    Both default to ``True``. Invalid combinations are coerced with an
-    explicit warning via :meth:`validate_combination`; the coercion is
-    deliberate so upgrades of existing deployments do not hard-fail.
+    Both default to ``False`` so fresh local/operator installs start in the
+    bypass posture. Invalid combinations are coerced with an explicit warning
+    via :meth:`validate_combination`; the coercion is deliberate so upgrades
+    of existing deployments do not hard-fail.
     """
 
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_SANDBOX_")
 
-    sandbox: bool = True
-    security_grading: bool = True
+    sandbox: bool = False
+    security_grading: bool = False
     default_level: SecurityLevel = SecurityLevel.STANDARD
     backend: BackendName = "auto"
     allow_legacy_mode: bool = False

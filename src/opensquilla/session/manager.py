@@ -703,13 +703,16 @@ class SessionManager:
         session_key: str,
         context_window_tokens: int,
         config: CompactionConfig | None = None,
+        custom_instructions: str | None = None,
     ) -> str:
         """
         Compact the session transcript when context is filling up.
         Summarizes older entries, keeps recent ones, stores summary out-of-band.
         Returns the summary string.
         """
-        result = await self.compact_with_result(session_key, context_window_tokens, config)
+        result = await self.compact_with_result(
+            session_key, context_window_tokens, config, custom_instructions
+        )
         return result.summary if result.removed_count else ""
 
     async def compact_with_result(
@@ -717,6 +720,7 @@ class SessionManager:
         session_key: str,
         context_window_tokens: int,
         config: CompactionConfig | None = None,
+        custom_instructions: str | None = None,
     ) -> CompactionResult:
         """Compact the session transcript and return full compaction metadata."""
 
@@ -731,6 +735,9 @@ class SessionManager:
                 "role": e.role,
                 "content": e.content or "",
                 "token_count": e.token_count,
+                "tool_calls": e.tool_calls,
+                "tool_call_id": e.tool_call_id,
+                "reasoning_content": e.reasoning_content,
             }
             for e in entries
         ]
@@ -741,10 +748,20 @@ class SessionManager:
                 entries=raw,
                 context_window_tokens=context_window_tokens,
                 config=config or CompactionConfig(),
+                custom_instructions=custom_instructions,
             )
         )
 
         if result.removed_count == 0:
+            return result
+        if not result.summary:
+            import structlog as _structlog
+
+            _structlog.get_logger(__name__).warning(
+                "session_compaction.empty_summary_not_persisted",
+                session_key=session_key,
+                removed_count=result.removed_count,
+            )
             return result
 
         removed_entries = entries[: len(entries) - len(result.kept_entries)]
@@ -791,6 +808,14 @@ class SessionManager:
         entries = await self._storage.get_transcript(node.session_id)
         removed_entries = entries[: max(0, len(entries) - len(kept_entries))]
         preserved_entries = entries[len(removed_entries) :]
+        if removed_entries and not summary:
+            _log.warning(
+                "persist_compaction.empty_summary_not_persisted",
+                session_key=session_key,
+                removed=len(removed_entries),
+                kept=len(kept_entries),
+            )
+            return
 
         # Store summary out-of-band. New compactions must not prepend a
         # transcript system marker because history loading would make that
@@ -820,6 +845,7 @@ class SessionManager:
                 role=raw.get("role", "user"),
                 content=raw.get("content", ""),
                 tool_calls=raw.get("tool_calls"),
+                tool_call_id=raw.get("tool_call_id"),
             )
             rewritten_entries.append(entry)
 

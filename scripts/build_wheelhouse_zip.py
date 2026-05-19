@@ -79,7 +79,6 @@ TEXT_RELEASE_SUFFIXES = {
     ".yaml",
     ".yml",
 }
-RECOMMENDED_PURE_SOURCE_WHEELS = ("jieba>=0.42",)
 
 
 @dataclass(frozen=True)
@@ -167,21 +166,6 @@ def python_runtime_target_triple(platform_tag: str) -> str:
         return triples[platform_tag]
     except KeyError as exc:
         raise SystemExit(f"No bundled Python runtime mapping for platform: {platform_tag}") from exc
-
-
-def pip_platform_tag(platform_tag: str) -> str:
-    tags = {
-        "linux-arm64": "manylinux2014_aarch64",
-        "linux-x64": "manylinux2014_x86_64",
-        "macos-arm64": "macosx_12_0_arm64",
-        "macos-x64": "macosx_10_13_x86_64",
-        "windows-arm64": "win_arm64",
-        "windows-x64": "win_amd64",
-    }
-    try:
-        return tags[platform_tag]
-    except KeyError as exc:
-        raise SystemExit(f"No pip platform mapping for platform: {platform_tag}") from exc
 
 
 def python_runtime_asset_name(
@@ -312,6 +296,10 @@ def build_wheel(repo_root: Path, wheel_dir: Path, env: dict[str, str]) -> Path:
     return find_built_wheel(wheel_dir)
 
 
+def pip_command(*args: str) -> list[str]:
+    return ["uv", "run", "--with", "pip", "python", "-m", "pip", *args]
+
+
 def build_wheelhouse_command(
     package_dir: Path,
     wheel_path: Path,
@@ -322,50 +310,21 @@ def build_wheelhouse_command(
     python_minor: int,
     extra_extras: tuple[str, ...] = (),
 ) -> list[str]:
+    validate_wheelhouse_target_platform(target_platform_tag)
     extras = tuple(extra for extra in (profile, *extra_extras) if extra != "core")
     target = str(wheel_path if not extras else f"{wheel_path}[{','.join(extras)}]")
-    if target_platform_tag == platform_tag():
-        return [sys.executable, "-m", "pip", "wheel", "--wheel-dir", str(package_dir), target]
-    python_version = f"{python_major}{python_minor}"
-    return [
-        sys.executable,
-        "-m",
-        "pip",
-        "download",
-        "--dest",
-        str(package_dir),
-        "--find-links",
-        str(package_dir),
-        "--only-binary=:all:",
-        "--platform",
-        pip_platform_tag(target_platform_tag),
-        "--implementation",
-        "cp",
-        "--python-version",
-        python_version,
-        "--abi",
-        f"cp{python_version}",
-        "--abi",
-        "abi3",
-        target,
-    ]
+    return pip_command("wheel", "--wheel-dir", str(package_dir), target)
 
 
-def cross_platform_seed_wheel_commands(package_dir: Path, profile: str) -> list[list[str]]:
-    if profile != "recommended":
-        return []
-    return [
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "wheel",
-            "--wheel-dir",
-            str(package_dir),
-            requirement,
-        ]
-        for requirement in RECOMMENDED_PURE_SOURCE_WHEELS
-    ]
+def validate_wheelhouse_target_platform(target_platform_tag: str) -> None:
+    host_platform_tag = platform_tag()
+    if target_platform_tag == host_platform_tag:
+        return
+    raise SystemExit(
+        "Wheelhouse builds must run on the target platform so dependency markers "
+        f"resolve correctly: host={host_platform_tag}, target={target_platform_tag}. "
+        "Use --skip-wheelhouse only for metadata/package-layout checks."
+    )
 
 
 def download_wheelhouse(
@@ -379,9 +338,7 @@ def download_wheelhouse(
     python_minor: int,
     extra_extras: tuple[str, ...] = (),
 ) -> None:
-    if target_platform_tag != platform_tag():
-        for command in cross_platform_seed_wheel_commands(package_dir, profile):
-            run(command, cwd=wheel_path.parent, env=env)
+    validate_wheelhouse_target_platform(target_platform_tag)
     run(
         build_wheelhouse_command(
             package_dir,
@@ -455,6 +412,33 @@ def extract_python_runtime_archive(archive_path: Path, runtime_root: Path) -> No
 
 
 def prune_portable_runtime(runtime_root: Path) -> None:
+    site_packages = runtime_root / "Lib" / "site-packages"
+    if site_packages.is_dir():
+        removable_names = {
+            "_distutils_hack",
+            "pip",
+            "pkg_resources",
+            "setuptools",
+            "wheel",
+        }
+        removable_globs = (
+            "pip-*.dist-info",
+            "setuptools-*.dist-info",
+            "wheel-*.dist-info",
+        )
+        for name in removable_names:
+            path = site_packages / name
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.is_file():
+                path.unlink()
+        for pattern in removable_globs:
+            for path in site_packages.glob(pattern):
+                if path.is_dir():
+                    shutil.rmtree(path)
+                elif path.is_file():
+                    path.unlink()
+
     for pycache in sorted(runtime_root.rglob("__pycache__"), reverse=True):
         if pycache.is_dir():
             shutil.rmtree(pycache)
@@ -600,7 +584,7 @@ echo "Start it with:"
 echo "  opensquilla gateway run"
 echo
 echo "Then open:"
-echo "  http://127.0.0.1:18790/control/"
+echo "  http://127.0.0.1:18791/control/"
 """
 
 
@@ -696,7 +680,7 @@ Write-Host "Start it with:"
 Write-Host "  opensquilla gateway run"
 Write-Host ""
 Write-Host "Then open:"
-Write-Host "  http://127.0.0.1:18790/control/"
+Write-Host "  http://127.0.0.1:18791/control/"
 """
 
 
@@ -837,7 +821,7 @@ fi
 
 echo
 echo "Starting OpenSquilla gateway."
-echo "Web UI: http://127.0.0.1:18790/control/"
+echo "Web UI: http://127.0.0.1:18791/control/"
 echo "Press Ctrl+C in this terminal to stop the gateway."
 if [[ -t 1 ]]; then
   exec "${OPENSQUILLA_BIN}" "${OPENSQUILLA_MODULE[@]}" gateway run
@@ -855,6 +839,7 @@ fi
 
 def render_start_ps1(profile: str = "recommended") -> str:
     target = _install_target("opensquilla", profile, _portable_profile_extras(profile))
+    requires_router_runtime = "$true" if profile == "recommended" else "$false"
     script = """param(
     [switch]$Cli,
     [Parameter(ValueFromRemainingArguments = $true)]
@@ -868,6 +853,7 @@ $PackageDir = Join-Path $ScriptDir 'packages'
 $PythonBin = Join-Path $ScriptDir 'runtime\\python\\python.exe'
 $VenvBase = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:TEMP }
 $VenvRoot = Join-Path $VenvBase 'OpenSquilla\\venvs'
+$RequiresRouterRuntime = __REQUIRES_ROUTER_RUNTIME__
 if ((-not $env:OPENSQUILLA_LLM_API_KEY) -and $env:OPENROUTER_API_KEY) {
     $env:OPENSQUILLA_LLM_API_KEY = $env:OPENROUTER_API_KEY
 }
@@ -878,6 +864,87 @@ if (-not (Test-Path $PythonBin)) {
 if (-not (Test-Path $PackageDir)) {
     throw "OpenSquilla package directory not found: $PackageDir"
 }
+
+function Test-WindowsVCRedistInstalled {
+    if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+        [System.Runtime.InteropServices.OSPlatform]::Windows
+    )) {
+        return $true
+    }
+    $runtimeKeys = @(
+        'HKLM:\\SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64',
+        'HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64'
+    )
+    foreach ($key in $runtimeKeys) {
+        if (-not (Test-Path $key)) {
+            continue
+        }
+        $runtime = Get-ItemProperty -Path $key -ErrorAction SilentlyContinue
+        if ($runtime -and $runtime.Installed -eq 1 -and $runtime.Major -ge 14) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Install-WindowsVCRedistIfNeeded {
+    if (-not $RequiresRouterRuntime) {
+        return
+    }
+    if ($env:OPENSQUILLA_SKIP_VC_REDIST -eq '1') {
+        Write-Host (
+            'OpenSquilla: skipping Microsoft Visual C++ Redistributable check ' +
+            'because OPENSQUILLA_SKIP_VC_REDIST=1.'
+        )
+        return
+    }
+    if (Test-WindowsVCRedistInstalled) {
+        return
+    }
+
+    $redistUrl = 'https://aka.ms/vs/17/release/vc_redist.x64.exe'
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) {
+        Write-Host (
+            'OpenSquilla: Microsoft Visual C++ Redistributable not detected; ' +
+            'installing with winget.'
+        )
+        $wingetArgs = @(
+            'install',
+            '--id',
+            'Microsoft.VCRedist.2015+.x64',
+            '--exact',
+            '--silent',
+            '--accept-package-agreements',
+            '--accept-source-agreements'
+        )
+        & winget @wingetArgs
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host 'OpenSquilla: Microsoft Visual C++ Redistributable installation completed.'
+            return
+        }
+        Write-Warning (
+            'OpenSquilla: winget could not install Microsoft Visual C++ ' +
+            "Redistributable (exit $LASTEXITCODE)."
+        )
+    }
+
+    Write-Warning (
+        'OpenSquilla: Microsoft Visual C++ Redistributable 2015-2022 x64 is ' +
+        'required for the bundled ONNX router.'
+    )
+    Write-Warning (
+        'OpenSquilla can still start with safe router fallback, but bundled ' +
+        'ONNX model routing is disabled until this runtime is installed.'
+    )
+    Write-Warning (
+        "If automatic installation fails, install it manually: $redistUrl"
+    )
+    Write-Warning (
+        'After installing, reopen PowerShell and restart OpenSquilla.'
+    )
+}
+
 if (-not (Test-Path $VenvRoot)) {
     New-Item -ItemType Directory -Path $VenvRoot -Force | Out-Null
 }
@@ -925,6 +992,7 @@ if (-not $env:OPENSQUILLA_GATEWAY_WORKSPACE_DIR) {
     $env:OPENSQUILLA_GATEWAY_WORKSPACE_DIR = Join-Path $env:OPENSQUILLA_STATE_DIR 'workspace'
 }
 New-Item -ItemType Directory -Path $env:OPENSQUILLA_STATE_DIR -Force | Out-Null
+Install-WindowsVCRedistIfNeeded
 
 if (-not (Test-Path $VenvPython)) {
     Write-Host "Creating local OpenSquilla environment..."
@@ -996,7 +1064,7 @@ if ($LASTEXITCODE -ne 0) {
 
 Write-Host ""
 Write-Host "Starting OpenSquilla gateway."
-Write-Host "Web UI: http://127.0.0.1:18790/control/"
+Write-Host "Web UI: http://127.0.0.1:18791/control/"
 Write-Host "Press Ctrl+C in this terminal to stop the gateway."
 $OutputRedirected = [Console]::IsOutputRedirected
 if (-not $OutputRedirected) {
@@ -1026,7 +1094,9 @@ if (-not $OutputRedirected) {
 }
 exit $GatewayExitCode
 """
-    return script.replace("__TARGET__", target)
+    return script.replace("__TARGET__", target).replace(
+        "__REQUIRES_ROUTER_RUNTIME__", requires_router_runtime
+    )
 
 
 def render_cli_sh() -> str:
@@ -1092,7 +1162,6 @@ def render_readme(
         windows_command = ".\\start.ps1"
         python_note = "Python is bundled in this zip."
         setup_note = (
-            "The recommended portable package includes Feishu websocket support. "
             "Config, workspace, logs, memory, and runtime state use the normal "
             "user-level OpenSquilla directory."
         )
@@ -1110,11 +1179,19 @@ def render_readme(
         if portable:
             command_section = f"""## Windows
 
-1. Double-click `Start OpenSquilla.cmd`.
-2. Keep the terminal open. Closing the terminal stops the gateway.
-3. Complete onboarding. On first run, choose a provider and paste the requested
-   keys; later starts let you review or change the config.
-4. Open `http://127.0.0.1:18790/control/`.
+1. Right-click `Start OpenSquilla.cmd` -> **Run as administrator**.
+2. Complete onboarding.
+3. Open `http://127.0.0.1:18791/control/`.
+
+Notes:
+- Keep the terminal open. Closing it stops the gateway.
+- OpenSquilla 0.1.0 preview builds are unsigned. The supported portable launch
+  path is administrator launch.
+- If SmartScreen appears, choose **More info** -> **Run anyway**.
+- If Smart App Control or enterprise policy blocks the unsigned app, use the
+  `uv tool install` wheel path instead.
+- Microsoft documents that SmartScreen checks downloaded apps and Smart App
+  Control can block unknown, unsigned code.
 
 <details>
 <summary>Advanced portable usage</summary>
@@ -1133,7 +1210,7 @@ writes an OpenRouter env-reference config and starts the gateway without asking
 you to paste the key.
 
 The portable package does not install a global `opensquilla` command. For a
-terminal where `opensquilla ...` commands work, double-click
+terminal where `opensquilla ...` commands work, run
 `OpenSquilla Shell.cmd`, or run commands from this folder:
 
 ```powershell
@@ -1163,7 +1240,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 2. Keep the terminal open. Closing the terminal stops the gateway.
 3. Complete onboarding. On first run, choose a provider and paste the requested
    keys; later starts let you review or change the config.
-4. Open `http://127.0.0.1:18790/control/`.
+4. Open `http://127.0.0.1:18791/control/`.
 """
         else:
             command_section = f"""## macOS / Linux
@@ -1176,7 +1253,7 @@ Set-ExecutionPolicy -Scope Process Bypass
     web_ui_note = (
         ""
         if portable
-        else "Open `http://127.0.0.1:18790/control/`.\n\n"
+        else "Open `http://127.0.0.1:18791/control/`.\n\n"
     )
 
     return f"""# OpenSquilla {app_version} {release_kind}
@@ -1449,6 +1526,8 @@ def main(argv: list[str] | None = None) -> int:
     env = build_subprocess_env(work_dir)
     wheel_dir = work_dir / "wheels"
     tag = args.platform_tag or platform_tag()
+    if not args.skip_wheelhouse:
+        validate_wheelhouse_target_platform(tag)
     name = release_name(
         app_version=app_version,
         platform_tag=tag,

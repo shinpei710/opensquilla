@@ -1,15 +1,14 @@
 """Unified slash-command registry.
 
-Source of truth for slash commands across the three chat surfaces (web RPC,
-TUI REPL, external channels). Per-surface adapters in
-``cli/repl/commands.py``, ``channels/command_registry.py``, and the web
+Source of truth for slash commands across chat surfaces. Per-surface adapters
+in ``cli/repl/commands.py``, ``channels/command_registry.py``, and the web
 frontend consume this single registry so the visible command set stays in
 lockstep across surfaces.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -18,15 +17,38 @@ from typing import Any
 class Surface(StrEnum):
     """Chat surface that may render a slash command.
 
-    Aligned with `opensquilla.tools.types.CallerKind` values where applicable
-    (CallerKind.WEB / CLI / CHANNEL). The TUI value is named "tui" rather
-    than "cli" because the registry's perspective is rendering surface,
-    not the broader caller-kind taxonomy.
+    Legacy names remain as enum aliases for existing in-process callers. Use
+    :func:`parse_surface` for user/input parsing so old values such as ``web``
+    and ``tui`` normalize to the canonical surface names.
     """
 
-    WEB = "web"
-    TUI = "tui"
+    WEB_CHAT = "web_chat"
+    CLI_GATEWAY = "cli_gateway"
+    CLI_STANDALONE = "cli_standalone"
     CHANNEL = "channel"
+
+    WEB = "web_chat"
+    TUI = "cli_gateway"
+    CLI = "cli_gateway"
+
+
+_SURFACE_ALIASES = {
+    "web": Surface.WEB_CHAT,
+    "tui": Surface.CLI_GATEWAY,
+    "cli": Surface.CLI_GATEWAY,
+}
+
+
+def parse_surface(value: str) -> Surface:
+    """Parse canonical and legacy surface names."""
+    normalized = value.strip().lower()
+    if normalized in _SURFACE_ALIASES:
+        return _SURFACE_ALIASES[normalized]
+    try:
+        return Surface(normalized)
+    except ValueError as exc:
+        valid = ", ".join(sorted({s.value for s in Surface} | set(_SURFACE_ALIASES)))
+        raise ValueError(f"unknown surface {value!r}; valid: {valid}") from exc
 
 
 # Per-envelope params builder for channel-mode dispatch. Kept as a generic
@@ -37,25 +59,67 @@ ParamsFactory = Callable[[Any], dict[str, Any]]
 
 
 @dataclass(frozen=True)
+class ArgumentChoice:
+    """One user-visible argument option for slash-command completion."""
+
+    value: str
+    description: str
+
+
+class ExecutionKind(StrEnum):
+    """How a surface executes a slash command."""
+
+    RPC = "rpc"
+    LOCAL = "local"
+
+
+@dataclass(frozen=True)
+class CommandExecution:
+    """Per-surface execution metadata for a slash command."""
+
+    kind: ExecutionKind
+    action: str
+    rpc_method: str | None = None
+    rpc_params: ParamsFactory | None = None
+
+
+@dataclass(frozen=True)
 class CommandDef:
     """One slash command as visible across all surfaces it supports.
 
-    The same `CommandDef` instance is shared by every surface that lists
-    the command — surfaces filter visibility via the `surfaces` field, but
-    the description and usage text are deliberately unified.
-
-    For channel-mode dispatch (RPC fan-out), `rpc_method` and `rpc_params`
-    are populated; both are required together. For TUI/web client-side
-    dispatch, leave them as None — the surface owns the handler.
+    The same `CommandDef` instance is shared by every surface that lists the
+    command. Per-surface execution metadata describes whether a surface calls
+    gateway RPC or handles the command locally.
     """
 
     name: str
     usage: str
     description: str
-    surfaces: frozenset[Surface]
+    execution: Mapping[Surface, CommandExecution]
     aliases: tuple[str, ...] = ()
-    rpc_method: str | None = None
-    rpc_params: ParamsFactory | None = None
+    argument_choices: tuple[ArgumentChoice, ...] = ()
+
+    @property
+    def surfaces(self) -> frozenset[Surface]:
+        """Return surfaces where this command has visible execution."""
+        return frozenset(self.execution.keys())
+
+    @property
+    def rpc_method(self) -> str | None:
+        """Deprecated channel RPC method compatibility projection."""
+        execution = self.execution_for(Surface.CHANNEL)
+        return execution.rpc_method if execution is not None else None
+
+    @property
+    def rpc_params(self) -> ParamsFactory | None:
+        """Deprecated channel RPC params compatibility projection."""
+        execution = self.execution_for(Surface.CHANNEL)
+        return execution.rpc_params if execution is not None else None
+
+    def execution_for(self, surface: Surface | str) -> CommandExecution | None:
+        """Return execution metadata for a surface, if visible there."""
+        parsed = parse_surface(surface) if isinstance(surface, str) else surface
+        return self.execution.get(parsed)
 
     def words(self) -> tuple[str, ...]:
         """Return name + aliases. Used by completion machinery."""
@@ -83,21 +147,22 @@ class SlashCommandRegistry:
                     )
                 self._by_word[lower] = cmd
 
-    def for_surface(self, surface: Surface) -> tuple[CommandDef, ...]:
-        return tuple(c for c in self._commands if surface in c.surfaces)
+    def for_surface(self, surface: Surface | str) -> tuple[CommandDef, ...]:
+        parsed = parse_surface(surface) if isinstance(surface, str) else surface
+        return tuple(c for c in self._commands if c.execution_for(parsed) is not None)
 
-    def find(self, value: str, surface: Surface | None = None) -> CommandDef | None:
+    def find(self, value: str, surface: Surface | str | None = None) -> CommandDef | None:
         head = value.strip().split(maxsplit=1)[0].lower() if value.strip() else ""
         if not head:
             return None
         cmd = self._by_word.get(head)
         if cmd is None:
             return None
-        if surface is not None and surface not in cmd.surfaces:
+        if surface is not None and cmd.execution_for(surface) is None:
             return None
         return cmd
 
-    def help_lines(self, surface: Surface) -> list[str]:
+    def help_lines(self, surface: Surface | str) -> list[str]:
         """Return ``["/name — description", ...]`` for the surface, sorted."""
         return [f"{c.name} — {c.description}" for c in self.for_surface(surface)]
 
@@ -125,9 +190,23 @@ def _empty(_envelope: Any) -> dict[str, Any]:
     return {}
 
 
-_W = Surface.WEB
-_T = Surface.TUI
+_W = Surface.WEB_CHAT
+_T = Surface.CLI_GATEWAY
+_S = Surface.CLI_STANDALONE
 _C = Surface.CHANNEL
+
+
+def _local(action: str) -> CommandExecution:
+    return CommandExecution(kind=ExecutionKind.LOCAL, action=action)
+
+
+def _rpc(method: str, params: ParamsFactory | None = None) -> CommandExecution:
+    return CommandExecution(
+        kind=ExecutionKind.RPC,
+        action=method,
+        rpc_method=method,
+        rpc_params=params,
+    )
 
 
 _COMMANDS: tuple[CommandDef, ...] = (
@@ -136,89 +215,116 @@ _COMMANDS: tuple[CommandDef, ...] = (
         name="/new",
         usage="/new [title]",
         description="Start a new chat session.",
-        surfaces=frozenset({_W, _T, _C}),
-        rpc_method="sessions.reset",
-        rpc_params=_key,
+        execution={
+            _W: _rpc("sessions.reset", _key),
+            _T: _local("session.new"),
+            _S: _local("session.new"),
+            _C: _rpc("sessions.reset", _key),
+        },
     ),
     CommandDef(
         name="/reset",
         usage="/reset",
         description="Clear the current conversation context.",
-        surfaces=frozenset({_W, _T, _C}),
+        execution={
+            _W: _rpc("sessions.reset", _key),
+            _T: _local("session.reset"),
+            _S: _local("session.reset"),
+            _C: _rpc("sessions.reset", _key),
+        },
         aliases=("/clear",),
-        rpc_method="sessions.reset",
-        rpc_params=_key,
     ),
     CommandDef(
         name="/compact",
         usage="/compact",
         description="Compact older context in the current session.",
-        surfaces=frozenset({_W, _T, _C}),
-        rpc_method="sessions.contextCompact",
-        rpc_params=_key,
+        execution={
+            _W: _rpc("sessions.contextCompact", _key),
+            _T: _local("session.compact"),
+            _S: _local("session.compact"),
+            _C: _rpc("sessions.contextCompact", _key),
+        },
     ),
     # ---- TUI + Channel ----------------------------------------------------
     CommandDef(
         name="/help",
         usage="/help",
         description="Show available commands.",
-        surfaces=frozenset({_T, _C}),
-        rpc_method="status",
-        rpc_params=_empty,
+        execution={_T: _local("help.show"), _S: _local("help.show"), _C: _rpc("status", _empty)},
     ),
     CommandDef(
         name="/status",
         usage="/status",
         description="Show current session, model, and mode.",
-        surfaces=frozenset({_T, _C}),
+        execution={
+            _T: _local("status.show"),
+            _S: _local("status.show"),
+            _C: _rpc("status", _empty),
+        },
         aliases=("/session",),
-        rpc_method="status",
-        rpc_params=_empty,
     ),
     CommandDef(
         name="/model",
         usage="/model [name]",
         description="List available models.",
-        surfaces=frozenset({_T, _C}),
-        rpc_method="models.list",
-        rpc_params=_empty,
+        execution={
+            _T: _local("model.list"),
+            _S: _local("model.list"),
+            _C: _rpc("models.list", _empty),
+        },
     ),
     # ---- TUI only ---------------------------------------------------------
     CommandDef(
         name="/models",
         usage="/models",
         description="List available models (TUI variant).",
-        surfaces=frozenset({_T}),
+        execution={_T: _local("models.list")},
     ),
     CommandDef(
         name="/cost",
         usage="/cost",
         description="Show current REPL session usage.",
-        surfaces=frozenset({_T}),
+        execution={_T: _local("usage.cost"), _S: _local("usage.cost")},
     ),
     CommandDef(
         name="/usage",
         usage="/usage",
         description="Show gateway aggregate usage.",
-        surfaces=frozenset({_T}),
+        execution={
+            _W: _rpc("usage.status"),
+            _T: _rpc("usage.status"),
+            _C: _rpc("usage.status", _empty),
+        },
+    ),
+    CommandDef(
+        name="/file",
+        usage="/file <path> [prompt]",
+        description="Upload a local file from this CLI machine.",
+        execution={_T: _local("cli.file")},
     ),
     CommandDef(
         name="/tool-compress",
         usage="/tool-compress [off|truncate|summarize|status]",
         description="Show or set tool result compression mode.",
-        surfaces=frozenset({_T}),
+        execution={_T: _local("tool-compress.status"), _S: _local("tool-compress.status")},
+        argument_choices=(
+            ArgumentChoice("off", "Disable tool result compression."),
+            ArgumentChoice("truncate", "Truncate long tool results."),
+            ArgumentChoice("status", "Show current compression mode."),
+            ArgumentChoice("summarize", "Summarize long tool results."),
+        ),
     ),
     CommandDef(
         name="/save",
         usage="/save [file]",
         description="Export the current REPL transcript as markdown.",
-        surfaces=frozenset({_T}),
+        execution={_T: _local("transcript.save"), _S: _local("transcript.save")},
     ),
     CommandDef(
         name="/image",
         usage="/image <path> [prompt]",
         description="Attach an image and send a prompt.",
-        surfaces=frozenset({_T}),
+        execution={_T: _local("image.attach"), _S: _local("image.attach")},
     ),
     CommandDef(
         name="/path",
@@ -227,50 +333,60 @@ _COMMANDS: tuple[CommandDef, ...] = (
             "Analyze a local path without uploading bytes; sends the path string "
             "as prompt text."
         ),
-        surfaces=frozenset({_T}),
+        execution={_T: _local("path.analyze"), _S: _local("path.analyze")},
     ),
     CommandDef(
         name="/approvals",
         usage="/approvals [reset]",
         description="Show or reset approval state.",
-        surfaces=frozenset({_T}),
+        execution={_T: _local("approvals.show")},
     ),
     CommandDef(
         name="/permissions",
         usage="/permissions [mode]",
-        description="Show or set host-exec approval mode.",
-        surfaces=frozenset({_T}),
+        description="Show or set the session permission override.",
+        execution={_T: _local("permissions.show")},
         aliases=("/elevated",),
+        argument_choices=(
+            ArgumentChoice("off", "Clear session override; configured default resumes."),
+            ArgumentChoice("on", "Host exec, approvals required."),
+            ArgumentChoice(
+                "bypass",
+                "Host exec, approvals auto-granted; sensitive paths still blocked.",
+            ),
+            ArgumentChoice("full", "Host exec, approvals skipped; sensitive paths bypassed."),
+            ArgumentChoice("status", "Show current session permissions override."),
+        ),
     ),
     CommandDef(
         name="/forget",
         usage="/forget [target]",
         description="Clear cached approval decisions.",
-        surfaces=frozenset({_T}),
+        execution={_T: _local("approvals.forget")},
     ),
     CommandDef(
         name="/sessions",
         usage="/sessions [limit]",
         description="List recent sessions.",
-        surfaces=frozenset({_T}),
+        execution={_T: _local("sessions.list")},
     ),
     CommandDef(
         name="/resume",
         usage="/resume <id>",
         description="Resume an existing session.",
-        surfaces=frozenset({_T}),
+        execution={_T: _local("sessions.resume")},
     ),
     CommandDef(
         name="/delete",
         usage="/delete <id>",
         description="Delete a session.",
-        surfaces=frozenset({_T}),
+        execution={_T: _local("sessions.delete")},
     ),
     CommandDef(
         name="/exit",
         usage="/exit",
         description="Exit the REPL.",
-        surfaces=frozenset({_T}),
+        execution={_T: _local("repl.exit"), _S: _local("repl.exit")},
         aliases=("/quit",),
     ),
     # ---- Channel only -----------------------------------------------------
@@ -278,33 +394,25 @@ _COMMANDS: tuple[CommandDef, ...] = (
         name="/abort",
         usage="/abort",
         description="Abort the in-progress turn.",
-        surfaces=frozenset({_C}),
-        rpc_method="sessions.abort",
-        rpc_params=_key,
+        execution={_C: _rpc("sessions.abort", _key)},
     ),
     CommandDef(
         name="/history",
         usage="/history",
         description="Show recent chat history.",
-        surfaces=frozenset({_C}),
-        rpc_method="chat.history",
-        rpc_params=_session_key,
+        execution={_C: _rpc("chat.history", _session_key)},
     ),
     CommandDef(
         name="/memory",
         usage="/memory",
         description="Show memory subsystem status.",
-        surfaces=frozenset({_C}),
-        rpc_method="doctor.memory.status",
-        rpc_params=_empty,
+        execution={_C: _rpc("doctor.memory.status", _empty)},
     ),
     CommandDef(
         name="/skills",
         usage="/skills",
         description="List loaded skills.",
-        surfaces=frozenset({_C}),
-        rpc_method="skills.list",
-        rpc_params=_empty,
+        execution={_C: _rpc("skills.list", _empty)},
     ),
 )
 
@@ -314,8 +422,11 @@ DEFAULT_REGISTRY = SlashCommandRegistry(_COMMANDS)
 
 __all__ = [
     "CommandDef",
+    "CommandExecution",
     "DEFAULT_REGISTRY",
+    "ExecutionKind",
     "ParamsFactory",
     "SlashCommandRegistry",
     "Surface",
+    "parse_surface",
 ]

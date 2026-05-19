@@ -4,10 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
+from opensquilla.execution_status import ExecutionStatus
 from opensquilla.tool_boundary import ToolCall as ToolCall
 from opensquilla.tool_boundary import ToolResult as ToolResult
+
+if TYPE_CHECKING:
+    from opensquilla.engine.usage import SessionTotalsSnapshot
 
 
 class ThinkingLevel(StrEnum):
@@ -81,6 +85,7 @@ class ToolResultEvent:
     result: str = ""
     is_error: bool = False
     arguments: dict[str, Any] | None = None
+    execution_status: ExecutionStatus | None = None
 
 
 @dataclass
@@ -145,6 +150,7 @@ class DoneEvent:
     # args.
     cache_write_tokens: int = 0
     reasoning_content: str | None = None
+    session_totals: SessionTotalsSnapshot | None = None
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -230,6 +236,9 @@ class AgentConfig:
     request_timeout: float = 120.0
     # Per-tool execution timeout
     tool_timeout: float = 60.0
+    # Upper bound for same-turn safe tool execution. Safe tools can overlap, but
+    # unbounded fan-out can overload local/network resources.
+    max_safe_tool_concurrency: int = 6
     max_tokens: int = 8192
     temperature: float | None = None
     thinking: bool | ThinkingLevel = False
@@ -259,10 +268,12 @@ class AgentConfig:
     skills_context_prompt: str | None = None
     # Pre-compaction memory flush
     flush_enabled: bool = True
-    flush_timeout_seconds: float = 5.0
+    flush_timeout_seconds: float = 15.0
+    flush_background_timeout_seconds: float = 120.0
     flush_backoff_initial_seconds: float = 30.0
     flush_backoff_max_seconds: float = 300.0
     flush_archive_max_bytes: int = 800_000
+    flush_compaction_requires_safe_receipt: bool = False
     flush_workspace_dir: str | None = None
     model_capabilities: Any | None = None  # ModelCapabilities from provider.types
     # Agent token saving: compress tool results before feeding them back to the LLM.
@@ -273,6 +284,19 @@ class AgentConfig:
     tool_result_compression_summary_max_tokens: int = 1024
     tool_result_compression_summary_timeout_seconds: float = 20.0
     tool_result_compression_summary_input_max_chars: int = 60_000
+    tool_result_provider_request_max_chars: int = 0
+    provider_request_proof_max_chars: int = 0
+    tool_use_argument_provider_request_max_chars: int = 0
+    tool_use_argument_projection_enabled: bool = False
+    tool_result_external_keep_recent: int = 2
+    tool_failure_loop_block_threshold: int = 3
+    tool_result_store_dir: str | None = None
+    tool_result_store_session_id: str | None = None
+    tool_result_store_session_key: str | None = None
+    tool_result_store_agent_id: str | None = None
+    tool_result_store_max_bytes: int | None = 8 * 1024 * 1024
+    tool_result_store_disk_budget_bytes: int | None = 256 * 1024 * 1024
+    tool_result_store_retention_seconds: int | None = 7 * 24 * 60 * 60
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def resolve_thinking(self, prompt: str | None = None) -> tuple[bool, int]:

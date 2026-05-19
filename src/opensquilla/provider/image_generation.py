@@ -11,6 +11,7 @@ import httpx
 
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.openrouter_attribution import openrouter_app_headers
+from opensquilla.secrets import clean_header_secret
 
 
 @dataclass
@@ -64,7 +65,10 @@ class OpenAIImageGenerationProvider:
         self._base_url = base_url.rstrip("/")
 
     def _resolve_api_key(self) -> str:
-        return self._api_key or os.environ.get(self._api_key_env, "")
+        return clean_header_secret(
+            self._api_key or os.environ.get(self._api_key_env, ""),
+            label=f"{self.provider_id} image API key",
+        )
 
     def _api_url(self, path: str) -> str:
         if self._base_url.endswith("/v1") and path.startswith("/v1/"):
@@ -131,7 +135,10 @@ class OpenRouterImageGenerationProvider:
         self._base_url = base_url.rstrip("/")
 
     def _resolve_api_key(self) -> str:
-        return self._api_key or os.environ.get(self._api_key_env, "")
+        return clean_header_secret(
+            self._api_key or os.environ.get(self._api_key_env, ""),
+            label=f"{self.provider_id} image API key",
+        )
 
     def _api_url(self, path: str) -> str:
         if self._base_url.endswith("/v1") and path.startswith("/v1/"):

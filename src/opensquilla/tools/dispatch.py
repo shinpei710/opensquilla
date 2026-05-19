@@ -1,51 +1,106 @@
-"""Tool dispatch: build an async tool handler from a ToolRegistry."""
+"""Tool dispatch orchestrator.
+
+This module exposes :func:`build_tool_handler`, the single entry point used
+by every caller (gateway, CLI, cron, channel adapters). The pipeline is:
+
+1. Ingress injection guard — before registry lookup.
+2. Registry lookup — before any policy check.
+3. Optional ``ToolHook.before_tool`` fan-out.
+4. Policy chain (:func:`opensquilla.tools.policy.run_chain_with_emit`) —
+   first denial wins; chain log emission flows through one site.
+5. Handler dispatch inside ``current_tool_context.set(effective_ctx)``.
+6. Optional ``ToolHook.after_tool`` fan-out with the raw outcome.
+7. Single finalisation point (:func:`opensquilla.tools.policy.finalize.finalize`).
+8. ``current_tool_context.reset(token)`` in ``finally``.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import weakref
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
 
+from opensquilla.engine.hooks import ToolHook, ToolHookCall, ToolHookResult
+from opensquilla.execution_status import normalize_execution_status
+from opensquilla.result_budget import (
+    DEFAULT_TOOL_RESULT_BUDGET_POLICY,
+    DEFAULT_TOOL_RUN_BUDGET_POLICY,
+    ToolResultBudgetPolicy,
+    ToolResultBudgetTracker,
+    ToolRunBudgetExceededError,
+    ToolRunBudgetPolicy,
+    ToolRunBudgetTracker,
+    clamp_tool_arguments,
+)
 from opensquilla.safety.injection_guard import (
     REFUSAL_REASON_TOOL_CALL_IN_UNTRUSTED,
     extract_tool_call_refusal_reason,
 )
-from opensquilla.safety.permission_matrix import Principal, is_tool_allowed
 from opensquilla.tool_boundary import AgentToolHandler, ToolCall, ToolResult
-from opensquilla.tools.envelope import build_tool_failure_envelope, is_denial_payload
+from opensquilla.tools.envelope import build_tool_failure_envelope
+from opensquilla.tools.policy import DispatchInput, finalize, run_chain_with_emit
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import (
     CallerKind,
-    InteractionMode,
+    InvalidToolArgumentsError,
+    ProjectedToolArgumentsError,
     ToolContext,
     current_tool_context,
 )
 
-log = structlog.get_logger(__name__)
+log = structlog.get_logger("opensquilla.tools.dispatch")
+
+__all__ = ["build_tool_handler"]
+
+_TOOL_ARGUMENT_PROJECTION_PREFIX = "[tool_use_argument_projection]\n"
+_HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX = "[historical_tool_argument_omitted]\n"
+_COMPACTED_TOOL_ARGUMENT_MARKERS = frozenset(
+    {
+        "_opensquilla_compacted_tool_arguments",
+        "_opensquilla_compacted_tool_input",
+    }
+)
 
 
-_PENDING_APPROVAL_STATUSES: frozenset[str] = frozenset({"approval_required", "approval_pending"})
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
 
-def _extract_pending_approval(content: Any) -> dict[str, Any] | None:
-    """Return the payload when ``content`` carries a pending-approval status."""
-    if isinstance(content, dict):
-        payload = content
-    elif isinstance(content, str):
-        try:
-            payload = json.loads(content)
-        except (TypeError, ValueError):
-            return None
-        if not isinstance(payload, dict):
-            return None
-    else:
-        return None
-    return payload if payload.get("status") in _PENDING_APPROVAL_STATUSES else None
+def _resolve_budget_policy(ctx: ToolContext | None) -> ToolResultBudgetPolicy:
+    policy = getattr(ctx, "tool_result_budget_policy", None) if ctx is not None else None
+    if isinstance(policy, ToolResultBudgetPolicy):
+        return policy
+    return DEFAULT_TOOL_RESULT_BUDGET_POLICY
 
 
-def _has_live_approval_surface(ctx: ToolContext | None) -> bool:
-    return ctx is None or ctx.interaction_mode is InteractionMode.INTERACTIVE
+def _build_budget_tracker(ctx: ToolContext | None) -> ToolResultBudgetTracker:
+    factory = getattr(ctx, "tool_result_budget_tracker_factory", None) if ctx else None
+    if callable(factory):
+        tracker = factory()
+        if isinstance(tracker, ToolResultBudgetTracker):
+            return tracker
+    return ToolResultBudgetTracker(_resolve_budget_policy(ctx))
+
+
+def _resolve_run_budget_policy(ctx: ToolContext | None) -> ToolRunBudgetPolicy:
+    policy = getattr(ctx, "tool_run_budget_policy", None) if ctx is not None else None
+    if isinstance(policy, ToolRunBudgetPolicy):
+        return policy
+    return DEFAULT_TOOL_RUN_BUDGET_POLICY
+
+
+def _build_run_budget_tracker(ctx: ToolContext | None) -> ToolRunBudgetTracker:
+    factory = getattr(ctx, "tool_run_budget_tracker_factory", None) if ctx else None
+    if callable(factory):
+        tracker = factory()
+        if isinstance(tracker, ToolRunBudgetTracker):
+            return tracker
+    return ToolRunBudgetTracker(_resolve_run_budget_policy(ctx))
 
 
 def _build_envelope_result(
@@ -55,7 +110,18 @@ def _build_envelope_result(
     policy_denial: bool = False,
     error_class_override: str | None = None,
     user_message_override: str | None = None,
+    reason_override: str | None = None,
 ) -> ToolResult:
+    status = {
+        "version": 1,
+        "status": "error",
+        "exit_code": None,
+        "timed_out": False,
+        "truncated": False,
+        "reason": reason_override or ("denied" if policy_denial else "runtime_error"),
+        "source": "tool_runtime",
+        "preservation_class": "diagnostic",
+    }
     return ToolResult(
         tool_use_id=tool_call.tool_use_id,
         tool_name=tool_call.tool_name,
@@ -69,7 +135,164 @@ def _build_envelope_result(
             )
         ),
         is_error=True,
+        execution_status=normalize_execution_status(status),
     )
+
+
+def _check_injection_guard(
+    tool_call: ToolCall, effective_ctx: ToolContext | None
+) -> ToolResult | None:
+    origin = tool_call.origin_trace
+    if not origin:
+        return None
+    reason = extract_tool_call_refusal_reason(origin)
+    if reason != REFUSAL_REASON_TOOL_CALL_IN_UNTRUSTED:
+        return None
+    log.warning(
+        "dispatch.injection_refused",
+        tool=tool_call.tool_name,
+        reason=reason,
+        tool_use_id=tool_call.tool_use_id,
+        agent_id=effective_ctx.agent_id if effective_ctx else None,
+        session_key=effective_ctx.session_key if effective_ctx else None,
+    )
+    return _build_envelope_result(
+        tool_call,
+        exc=ValueError("dispatch injection refused"),
+        policy_denial=True,
+        error_class_override="InjectionRefused",
+        user_message_override=str(reason),
+    )
+
+
+def _check_non_executable_arguments(
+    tool_call: ToolCall,
+    effective_ctx: ToolContext | None,
+) -> ToolResult | None:
+    arguments = tool_call.arguments
+    if set(arguments) == {"_raw"} and isinstance(arguments.get("_raw"), str):
+        log.warning(
+            "dispatch.invalid_tool_arguments",
+            tool=tool_call.tool_name,
+            tool_use_id=tool_call.tool_use_id,
+            agent_id=effective_ctx.agent_id if effective_ctx else None,
+            session_key=effective_ctx.session_key if effective_ctx else None,
+            reason="unparsed_raw_arguments",
+        )
+        return _build_envelope_result(
+            tool_call,
+            exc=InvalidToolArgumentsError(),
+        )
+
+    if any(arguments.get(marker) is True for marker in _COMPACTED_TOOL_ARGUMENT_MARKERS):
+        log.warning(
+            "dispatch.projected_tool_arguments_refused",
+            tool=tool_call.tool_name,
+            tool_use_id=tool_call.tool_use_id,
+            agent_id=effective_ctx.agent_id if effective_ctx else None,
+            session_key=effective_ctx.session_key if effective_ctx else None,
+            reason="compacted_argument_marker",
+        )
+        return _build_envelope_result(
+            tool_call,
+            exc=ProjectedToolArgumentsError(),
+            reason_override="provider_context_projection_reused",
+        )
+
+    for argument_name, value in arguments.items():
+        if isinstance(value, str) and value.startswith(
+            (_TOOL_ARGUMENT_PROJECTION_PREFIX, _HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX)
+        ):
+            log.warning(
+                "dispatch.projected_tool_arguments_refused",
+                tool=tool_call.tool_name,
+                tool_use_id=tool_call.tool_use_id,
+                agent_id=effective_ctx.agent_id if effective_ctx else None,
+                session_key=effective_ctx.session_key if effective_ctx else None,
+                reason="projection_string",
+                field=argument_name,
+            )
+            return _build_envelope_result(
+                tool_call,
+                exc=ProjectedToolArgumentsError(),
+                reason_override="provider_context_projection_reused",
+            )
+
+    return None
+
+
+def _is_untrusted_caller(ctx: ToolContext | None) -> bool:
+    """Return True when the caller cannot be trusted with tool-name disclosure.
+
+    Untrusted callers (CHANNEL surfaces without owner standing, or anonymous
+    callers with no ``ToolContext`` at all) must receive an opaque envelope on
+    a registry miss so they cannot enumerate the tool catalogue by probing
+    names. Owner CHANNEL traffic is treated as trusted because owner promotion
+    happens upstream and the owner already sees the full tool surface.
+    """
+    if ctx is None:
+        return True
+    return ctx.caller_kind is CallerKind.CHANNEL and not ctx.is_owner
+
+
+def _resolve_registry_miss(
+    tool_call: ToolCall,
+    known_skill_names: frozenset[str],
+    ctx: ToolContext | None,
+) -> ToolResult:
+    untrusted = _is_untrusted_caller(ctx)
+    is_skill = tool_call.tool_name in known_skill_names
+
+    # Always record the actual tool name in the structured log so operators
+    # retain debug visibility regardless of what the caller is allowed to see.
+    log.warning(
+        "dispatch.registry_miss",
+        tool=tool_call.tool_name,
+        tool_use_id=tool_call.tool_use_id,
+        is_skill=is_skill,
+        untrusted_caller=untrusted,
+        agent_id=ctx.agent_id if ctx else None,
+        session_key=ctx.session_key if ctx else None,
+    )
+
+    if untrusted:
+        # Opaque envelope: do NOT echo tool_call.tool_name. A bare CHANNEL
+        # caller could otherwise enumerate the registry by probing names and
+        # observing which ones come back as ToolNotFound vs. UnsupportedSurface.
+        return _build_envelope_result(
+            tool_call,
+            exc=PermissionError("tool unavailable for this surface"),
+            policy_denial=True,
+            error_class_override="PolicyDenied",
+            user_message_override="Tool unavailable for this surface.",
+        )
+
+    if is_skill:
+        skill_name = tool_call.tool_name
+        user_message = (
+            f"{skill_name} is a skill, not a tool. Do not call skill names as tools. "
+            f'Use skill_view(name="{skill_name}") to read the skill instructions, '
+            "then continue using only tools listed in Available Tools."
+        )
+        return _build_envelope_result(
+            tool_call,
+            exc=ValueError("skill call mismatch"),
+            policy_denial=True,
+            error_class_override="UnsupportedSurface",
+            user_message_override=user_message,
+        )
+    return _build_envelope_result(
+        tool_call,
+        exc=KeyError(tool_call.tool_name),
+        policy_denial=True,
+        error_class_override="ToolNotFound",
+        user_message_override=f"Tool not found: {tool_call.tool_name}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public factory
+# ---------------------------------------------------------------------------
 
 
 def build_tool_handler(
@@ -77,224 +300,210 @@ def build_tool_handler(
     ctx: ToolContext | None = None,
     *,
     known_skill_names: set[str] | None = None,
+    tool_hooks: Sequence[ToolHook] | None = None,
 ) -> AgentToolHandler:
-    """Build an async tool handler function from a ToolRegistry.
+    """Build an async tool handler from a :class:`ToolRegistry`.
 
     The returned handler:
-    1. Looks up the tool by name in the registry
-    2. Defense-in-depth: rejects owner_only tools for non-owner ctx
-    3. Defense-in-depth: rejects tools in ctx.denied_tools
-    4. Dispatches to the registered handler
-    5. Wraps results and errors into ToolResult
+
+    1. Injection-guard check before registry lookup.
+    2. Registry lookup; returns structured error on miss.
+    3. ``ToolHook.before_tool`` fan-out (no-op if ``tool_hooks`` is empty).
+    4. Policy chain; first denial returns immediately.
+    5. Reserves run budget, including external call counts and text caps.
+    6. Dispatches to the registered handler inside the request-scoped contextvar.
+    7. Commits or aborts the run-budget reservation.
+    8. ``ToolHook.after_tool`` fan-out with the raw outcome.
+    9. Finalises the result (execution status, budget, artefacts) via
+       :func:`opensquilla.tools.policy.finalize`.
+    10. Resets ``current_tool_context`` unconditionally in ``finally``.
+
+    ``tool_hooks`` defaults to empty so callers that do not pass hooks are
+    bit-for-bit equivalent to the legacy path.
     """
+    known = frozenset(known_skill_names or ())
+    hooks: tuple[ToolHook, ...] = tuple(tool_hooks or ())
+    fallback_budget_tracker = _build_budget_tracker(ctx)
+    scoped_budget_trackers: dict[
+        int,
+        tuple[weakref.ReferenceType[ToolContext], ToolResultBudgetTracker],
+    ] = {}
+    keyed_run_budget_trackers: dict[str, ToolRunBudgetTracker] = {}
 
-    async def _handler(tool_call: ToolCall) -> ToolResult:
+    def _budget_tracker_for(effective_ctx: ToolContext | None) -> ToolResultBudgetTracker:
+        if effective_ctx is None or effective_ctx is ctx:
+            return fallback_budget_tracker
+        key = id(effective_ctx)
+        entry = scoped_budget_trackers.get(key)
+        if entry is not None:
+            context_ref, tracker = entry
+            if context_ref() is effective_ctx:
+                return tracker
+        tracker = _build_budget_tracker(effective_ctx)
+        scoped_budget_trackers[key] = (weakref.ref(effective_ctx), tracker)
+        return tracker
+
+    def _run_budget_tracker_for(
+        effective_ctx: ToolContext | None,
+    ) -> ToolRunBudgetTracker:
+        run_budget_key = (
+            getattr(effective_ctx, "tool_run_budget_key", None)
+            if effective_ctx is not None
+            else None
+        )
+        if isinstance(run_budget_key, str) and run_budget_key:
+            tracker = keyed_run_budget_trackers.get(run_budget_key)
+            if tracker is not None:
+                return tracker
+            tracker = _build_run_budget_tracker(effective_ctx)
+            keyed_run_budget_trackers[run_budget_key] = tracker
+            return tracker
+        tracker = _build_run_budget_tracker(effective_ctx)
+        return tracker
+
+    async def _handler(tool_call: ToolCall) -> ToolResult:  # type: ignore[return]
         effective_ctx = current_tool_context.get() or ctx
+        budget_policy = _resolve_budget_policy(effective_ctx)
 
-        # Ingress-path injection guard:
-        # if the tool-call origin trace lies inside an <untrusted> block,
-        # refuse immediately with a structured JSON payload.
-        origin = tool_call.origin_trace
-        if origin:
-            reason = extract_tool_call_refusal_reason(origin)
-            if reason == REFUSAL_REASON_TOOL_CALL_IN_UNTRUSTED:
-                log.warning(
-                    "dispatch.injection_refused",
-                    tool=tool_call.tool_name,
-                    reason=reason,
-                    tool_use_id=tool_call.tool_use_id,
-                    agent_id=effective_ctx.agent_id if effective_ctx else None,
-                    session_key=effective_ctx.session_key if effective_ctx else None,
-                )
-                return _build_envelope_result(
-                    tool_call,
-                    exc=ValueError("dispatch injection refused"),
-                    policy_denial=True,
-                    error_class_override="InjectionRefused",
-                    user_message_override=str(reason),
-                )
+        # 1. Ingress injection guard.
+        injection_envelope = _check_injection_guard(tool_call, effective_ctx)
+        if injection_envelope is not None:
+            return injection_envelope
 
+        # 2. Registry lookup.
         registered = registry.get(tool_call.tool_name)
         if registered is None:
-            if tool_call.tool_name in (known_skill_names or set()):
-                skill_name = tool_call.tool_name
-                user_message = (
-                    f"{skill_name} is a skill, not a tool. Do not call skill names as tools. "
-                    f'Use skill_view(name="{skill_name}") to read the skill instructions, '
-                    "then continue using only tools listed in Available Tools."
-                )
-                return _build_envelope_result(
-                    tool_call,
-                    exc=ValueError("skill call mismatch"),
-                    policy_denial=True,
-                    error_class_override="UnsupportedSurface",
-                    user_message_override=user_message,
-                )
-            return _build_envelope_result(
-                tool_call,
-                exc=KeyError(tool_call.tool_name),
-                policy_denial=True,
-                error_class_override="ToolNotFound",
-                user_message_override=f"Tool not found: {tool_call.tool_name}",
-            )
+            return _resolve_registry_miss(tool_call, known, effective_ctx)
 
-        # Defense-in-depth: reject owner_only tools if context says non-owner
-        if effective_ctx and registered.spec.owner_only and not effective_ctx.is_owner:
-            log.warning(
-                "dispatch.defense_in_depth_block",
-                tool=tool_call.tool_name,
-                reason="owner_only",
-                tool_use_id=tool_call.tool_use_id,
-                agent_id=effective_ctx.agent_id if effective_ctx else None,
-                session_key=effective_ctx.session_key if effective_ctx else None,
-            )
-            return _build_envelope_result(
-                tool_call,
-                exc=PermissionError("owner-only tool"),
-                policy_denial=True,
-                error_class_override="OwnerOnly",
-                user_message_override=f"Tool '{tool_call.tool_name}' restricted to owner.",
-            )
+        non_executable_arguments = _check_non_executable_arguments(tool_call, effective_ctx)
+        if non_executable_arguments is not None:
+            return non_executable_arguments
 
-        # Defense-in-depth: reject denied tools
-        if effective_ctx and tool_call.tool_name in effective_ctx.denied_tools:
-            log.warning(
-                "dispatch.defense_in_depth_block",
-                tool=tool_call.tool_name,
-                reason="denied",
-                tool_use_id=tool_call.tool_use_id,
-                agent_id=effective_ctx.agent_id if effective_ctx else None,
-                session_key=effective_ctx.session_key if effective_ctx else None,
-            )
-            return _build_envelope_result(
-                tool_call,
-                exc=PermissionError("tool blocked"),
-                policy_denial=True,
-                error_class_override="PolicyDenied",
-                user_message_override=(
-                    f"Tool '{tool_call.tool_name}' not available in this context."
-                ),
-            )
-
-        if (
-            effective_ctx
-            and effective_ctx.allowed_tools is not None
-            and tool_call.tool_name not in effective_ctx.allowed_tools
-        ):
-            log.warning(
-                "dispatch.defense_in_depth_block",
-                tool=tool_call.tool_name,
-                reason="not_allowed",
-                tool_use_id=tool_call.tool_use_id,
-                agent_id=effective_ctx.agent_id if effective_ctx else None,
-                session_key=effective_ctx.session_key if effective_ctx else None,
-            )
-            return _build_envelope_result(
-                tool_call,
-                exc=PermissionError("tool blocked"),
-                policy_denial=True,
-                error_class_override="PolicyDenied",
-                user_message_override=(
-                    f"Tool '{tool_call.tool_name}' not available in this context."
-                ),
-            )
-
-        if effective_ctx and effective_ctx.caller_kind is CallerKind.CHANNEL:
-            principal = Principal(
-                role="operator" if effective_ctx.is_owner else "user",
-                channel_id=effective_ctx.session_key,
-            )
-            decision = is_tool_allowed(tool_call.tool_name, "dm", principal)
-            if not decision.allowed:
-                log.warning(
-                    "dispatch.permission_matrix_block",
-                    tool=tool_call.tool_name,
-                    reason=decision.reason,
-                    tool_use_id=tool_call.tool_use_id,
-                    agent_id=effective_ctx.agent_id if effective_ctx else None,
-                    session_key=effective_ctx.session_key if effective_ctx else None,
-                )
-                return _build_envelope_result(
-                    tool_call,
-                    exc=PermissionError("tool denied"),
-                    policy_denial=True,
-                    error_class_override="UnsupportedSurface",
-                    user_message_override=(
-                        f"Tool '{tool_call.tool_name}' denied: {decision.reason}."
-                    ),
-                )
-
-        # Dispatch to handler — set request-scoped context for tools that need agent_id
-        token = current_tool_context.set(effective_ctx)
-        try:
-            artifact_start = (
-                len(effective_ctx.published_artifacts) if effective_ctx is not None else 0
-            )
-            result = await registered.handler(**tool_call.arguments)
-            if not _has_live_approval_surface(effective_ctx):
-                pending = _extract_pending_approval(result)
-                if pending is not None:
-                    surface = effective_ctx.caller_kind.value if effective_ctx else "unknown"
+        # 3. ToolHook.before_tool — optional observability hook.
+        hook_call = ToolHookCall(tool_call=tool_call, ctx=effective_ctx) if hooks else None
+        if hook_call is not None:
+            for hook in hooks:
+                try:
+                    hook.before_tool(hook_call)
+                except Exception as exc:  # noqa: BLE001 - hooks must not break dispatch
                     log.warning(
-                        "dispatch.approval_required_unsupported_surface",
-                        tool=tool_call.tool_name,
-                        surface=surface,
-                        approval_id=pending.get("approval_id"),
-                        tool_use_id=tool_call.tool_use_id,
-                        agent_id=effective_ctx.agent_id if effective_ctx else None,
-                        session_key=effective_ctx.session_key if effective_ctx else None,
-                    )
-                    user_message = (
-                        f"Tool '{tool_call.tool_name}' requires human approval, but the {surface} "
-                        "surface has no interactive approval path. Re-run with --interactive "
-                        "or from an interactive operator surface."
-                    )
-                    envelope = build_tool_failure_envelope(
-                        ValueError("approval required"),
-                        tool_call.tool_name,
-                        policy_denial=True,
-                        error_class_override="UnsupportedSurface",
-                        user_message_override=user_message,
-                    )
-                    return ToolResult(
-                        tool_use_id=tool_call.tool_use_id,
-                        tool_name=tool_call.tool_name,
-                        content=json.dumps(envelope),
-                        is_error=True,
+                        "dispatch.tool_hook_failed",
+                        hook=getattr(hook, "name", type(hook).__name__),
+                        phase="before_tool",
+                        error=str(exc),
                     )
 
-            denial = is_denial_payload(result)
-            artifacts = (
-                list(effective_ctx.published_artifacts[artifact_start:])
-                if effective_ctx is not None
-                else []
-            )
-            return ToolResult(
-                tool_use_id=tool_call.tool_use_id,
+        # 4. Policy chain — first denial wins. Single emission site via run_chain_with_emit.
+        dispatch_input = DispatchInput(
+            tool_call=tool_call,
+            ctx=effective_ctx,
+            registered=registered,
+            known_skill_names=known,
+            registry=registry,
+        )
+
+        def _emit_policy_log(log_event: dict) -> None:
+            event = log_event.get("event", "dispatch.policy_block")
+            fields = {k: v for k, v in log_event.items() if k != "event"}
+            log.warning(event, **fields)
+
+        decision = run_chain_with_emit(dispatch_input, emit=_emit_policy_log)
+        if not decision.allowed:
+            if decision.envelope is None:
+                raise RuntimeError(
+                    "PolicyCheck returned a denial without an envelope"
+                )
+            if hook_call is not None:
+                for hook in hooks:
+                    try:
+                        hook.after_tool(
+                            hook_call,
+                            ToolHookResult(result=decision.envelope),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "dispatch.tool_hook_failed",
+                            hook=getattr(hook, "name", type(hook).__name__),
+                            phase="after_tool",
+                            error=str(exc),
+                        )
+            return decision.envelope
+
+        # 5. Handler dispatch inside the request-scoped contextvar.
+        run_budget_tracker = _run_budget_tracker_for(effective_ctx)
+        try:
+            reservation = await run_budget_tracker.reserve_tool_call(
                 tool_name=tool_call.tool_name,
-                content=result,
-                is_error=denial,
-                artifacts=artifacts,
+                arguments=clamp_tool_arguments(
+                    tool_call.tool_name,
+                    dict(tool_call.arguments),
+                    budget_policy,
+                ),
             )
-        except Exception as exc:
-            # Stable failure envelope, no raw exception leakage.
-            envelope = build_tool_failure_envelope(exc, tool_call.tool_name)
-            log.warning(
-                "dispatch.tool_failed",
-                tool=tool_call.tool_name,
-                tool_use_id=tool_call.tool_use_id,
-                agent_id=effective_ctx.agent_id if effective_ctx else None,
-                session_key=effective_ctx.session_key if effective_ctx else None,
-                error_class=envelope["error_class"],
-                retry_allowed=envelope["retry_allowed"],
+        except ToolRunBudgetExceededError as exc:
+            envelope = _build_envelope_result(
+                tool_call,
+                exc=exc,
+                reason_override="tool_run_budget_exhausted",
             )
-            return ToolResult(
-                tool_use_id=tool_call.tool_use_id,
-                tool_name=tool_call.tool_name,
-                content=json.dumps(envelope),
-                is_error=True,
-            )
+            if hook_call is not None:
+                for hook in hooks:
+                    try:
+                        hook.after_tool(hook_call, ToolHookResult(result=envelope))
+                    except Exception as hook_exc:  # noqa: BLE001
+                        log.warning(
+                            "dispatch.tool_hook_failed",
+                            hook=getattr(hook, "name", type(hook).__name__),
+                            phase="after_tool",
+                            error=str(hook_exc),
+                        )
+            return envelope
+
+        token = current_tool_context.set(effective_ctx)
+        raw_result: Any = None
+        exception: BaseException | None = None
+        artifact_start = (
+            len(effective_ctx.published_artifacts) if effective_ctx is not None else 0
+        )
+        try:
+            raw_result = await registered.handler(**reservation.arguments)
+            await run_budget_tracker.commit_tool_result(reservation, raw_result)
+        except asyncio.CancelledError as exc:
+            exception = exc
+            await run_budget_tracker.abort_tool_result(reservation)
+            raise
+        except ToolRunBudgetExceededError as exc:
+            exception = exc
+        except Exception as exc:  # noqa: BLE001
+            exception = exc
+            await run_budget_tracker.abort_tool_result(reservation)
         finally:
-            current_tool_context.reset(token)
+            try:
+                # 6. ToolHook.after_tool — observability seam.
+                if hook_call is not None:
+                    outcome = ToolHookResult(result=raw_result, exception=exception)
+                    for hook in hooks:
+                        try:
+                            hook.after_tool(hook_call, outcome)
+                        except Exception as hook_exc:  # noqa: BLE001
+                            log.warning(
+                                "dispatch.tool_hook_failed",
+                                hook=getattr(hook, "name", type(hook).__name__),
+                                phase="after_tool",
+                                error=str(hook_exc),
+                            )
+                if not isinstance(exception, asyncio.CancelledError):
+                    # 7. Single finalisation point.
+                    return await finalize(
+                        tool_call,
+                        effective_ctx,
+                        raw_result,
+                        exception,
+                        artifact_start,
+                        _budget_tracker_for(effective_ctx),
+                        registered,
+                    )
+            finally:
+                current_tool_context.reset(token)
 
     return _handler

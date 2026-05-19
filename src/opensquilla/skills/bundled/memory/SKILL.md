@@ -32,9 +32,12 @@ OpenSquilla's memory source files; it does not make hidden tools available.
   and constraints.
 - `memory/YYYY-MM-DD.md` and `memory/**/*.md`: daily, session, or named memory
   notes.
+- `turns/**/*.md`: private auto-captured turn state. These files are for
+  audit/future processing and are not indexed or returned by ordinary
+  `memory_search`.
 
 The Markdown files are the source of truth. The memory index/database is derived
-from those files.
+from curated `MEMORY.md` and `memory/**/*.md` files only.
 
 ## Recall
 

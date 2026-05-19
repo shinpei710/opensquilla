@@ -38,6 +38,18 @@ def test_upsert_provider_persists_fields():
     assert res.changed is True
 
 
+def test_upsert_provider_strips_trailing_paste_punctuation_from_api_key():
+    cfg = GatewayConfig()
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openrouter",
+        model="deepseek/deepseek-v4-flash",
+        api_key="sk-test、",
+    )
+
+    assert res.config.llm.api_key == "sk-test"
+
+
 def test_provider_payload_redacts_api_key():
     cfg = GatewayConfig()
     res = upsert_llm_provider(cfg, provider_id="openrouter", model="x", api_key="sk-test")
@@ -416,6 +428,13 @@ def test_upsert_search_provider_configures_brave():
     assert res.config.search_fallback_policy == "network"
     assert res.config.search_diagnostics is True
     assert res.public_payload["api_key"] == REDACTED_PLACEHOLDER
+
+
+def test_upsert_search_provider_strips_trailing_paste_punctuation_from_api_key():
+    cfg = GatewayConfig()
+    res = upsert_search_provider(cfg, provider_id="brave", api_key="brave-key、")
+
+    assert res.config.search_api_key == "brave-key"
 
 
 def test_upsert_search_provider_can_use_env_key_reference():

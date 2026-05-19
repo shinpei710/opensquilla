@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from opensquilla.channels.types import OutgoingMessage
-from opensquilla.engine.commands import DEFAULT_REGISTRY, ParamsFactory, Surface
+from opensquilla.engine.commands import DEFAULT_REGISTRY, ExecutionKind, ParamsFactory, Surface
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext
@@ -33,6 +33,10 @@ class CommandRegistry:
 
     def __init__(self, commands: dict[str, tuple[str, ParamsFactory]]) -> None:
         self._commands = commands
+
+    @property
+    def command_names(self) -> set[str]:
+        return set(self._commands)
 
     def match(self, envelope: RouteEnvelope, content: str) -> tuple[str, str, ParamsFactory] | None:
         head = content.strip().split(maxsplit=1)[0] if content.strip() else ""
@@ -109,10 +113,16 @@ def _build_default_command_table() -> dict[str, tuple[str, ParamsFactory]]:
     """
     table: dict[str, tuple[str, ParamsFactory]] = {}
     for cmd in DEFAULT_REGISTRY.for_surface(Surface.CHANNEL):
-        if cmd.rpc_method is None or cmd.rpc_params is None:
+        execution = cmd.execution_for(Surface.CHANNEL)
+        if (
+            execution is None
+            or execution.kind is not ExecutionKind.RPC
+            or execution.rpc_method is None
+            or execution.rpc_params is None
+        ):
             continue
         for word in cmd.words():
-            table[word.lstrip("/").lower()] = (cmd.rpc_method, cmd.rpc_params)
+            table[word.lstrip("/").lower()] = (execution.rpc_method, execution.rpc_params)
     return table
 
 

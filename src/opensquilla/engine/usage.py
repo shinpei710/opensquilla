@@ -16,6 +16,12 @@ class ModelUsage:
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    # Provider-billed cost accumulated across every raw provider call attributed
+    # to this model. New field appended at the end so existing positional
+    # callers (ModelUsage(model_id, in, out)) continue to align. When > 0 the
+    # model_breakdown serializer prefers this over the pricing-table estimate,
+    # avoiding cache-discount drift in the per-model split.
+    billed_cost: float = 0.0
 
     @property
     def cost(self) -> float:
@@ -48,6 +54,58 @@ class SessionUsage:
         output_cost = self.output_tokens * price.output_per_m
         return (input_cost + output_cost) / 1_000_000
 
+    @property
+    def billed_cost(self) -> float:
+        """Sum of provider-billed cost across every model in this session.
+
+        Returns 0.0 when no per-model billed data has been captured (e.g.
+        provider returned no cost, or session is estimate-only). Callers
+        use this to decide whether the session-level row should display
+        the actual billed total or fall back to the pricing-table estimate.
+        """
+        if not self._per_model:
+            return 0.0
+        return sum(float(getattr(m, "billed_cost", 0.0) or 0.0) for m in self._per_model.values())
+
+    @property
+    def total_cost(self) -> float:
+        """Best per-session cost: real billed where available, estimate elsewhere.
+
+        Mixed-source sessions need this so the row total doesn't under-report
+        the unbilled portion. For each model: prefer ``mu.billed_cost`` when
+        > 0, otherwise contribute the pricing-table estimate ``mu.cost``.
+        Sum equals the breakdown's per-model ``costUsd`` sum by construction
+        (since the breakdown serializer makes the same per-model decision).
+        """
+        if not self._per_model:
+            return self.cost
+        return sum(
+            (float(getattr(m, "billed_cost", 0.0) or 0.0) or m.cost)
+            for m in self._per_model.values()
+        )
+
+    @property
+    def cost_source(self) -> str:
+        """Aggregate cost source for the session row.
+
+        - ``provider_billed``: every per-model entry has a real billed total.
+        - ``mixed``: some models billed, others estimate-only.
+        - ``opensquilla_estimate``: no billed data at all, or provider returned
+          no cost for any call.
+        """
+        if not self._per_model:
+            return "opensquilla_estimate"
+        billed_count = sum(
+            1
+            for m in self._per_model.values()
+            if float(getattr(m, "billed_cost", 0.0) or 0.0) > 0
+        )
+        if billed_count == 0:
+            return "opensquilla_estimate"
+        if billed_count == len(self._per_model):
+            return "provider_billed"
+        return "mixed"
+
     def add(
         self,
         input_tokens: int,
@@ -56,8 +114,15 @@ class SessionUsage:
         *,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
+        billed_cost: float = 0.0,
     ) -> None:
-        """Accumulate token counts, tracking per-model breakdown."""
+        """Accumulate token counts, tracking per-model breakdown.
+
+        ``billed_cost`` is the provider-reported real billed cost for this
+        accumulation (typically one provider call). Forwarded into the per-model
+        ``ModelUsage`` so the breakdown serializer can return the actual billed
+        figure instead of the cache-blind pricing-table estimate.
+        """
         self.input_tokens += input_tokens
         self.output_tokens += output_tokens
         self.cache_read_tokens += cache_read_tokens
@@ -74,6 +139,31 @@ class SessionUsage:
             mu.output_tokens += output_tokens
             mu.cache_read_tokens += cache_read_tokens
             mu.cache_write_tokens += cache_write_tokens
+            mu.billed_cost += billed_cost
+
+    @staticmethod
+    def _breakdown_cost_fields(mu_or_self: ModelUsage | SessionUsage) -> dict:
+        """Pick the canonical cost + source for a single breakdown row.
+
+        Prefer the real provider-billed cost when present; otherwise fall back
+        to the local pricing-table estimate. This is what lets the WebUI show
+        per-model values that actually sum to the row total without prorating.
+        """
+        billed = float(getattr(mu_or_self, "billed_cost", 0.0) or 0.0)
+        estimate = float(mu_or_self.cost or 0.0)
+        if billed > 0:
+            return {
+                "costUsd": round(billed, 6),
+                "billedCostUsd": round(billed, 6),
+                "estimatedCostUsd": round(estimate, 6),
+                "costSource": "provider_billed",
+            }
+        return {
+            "costUsd": round(estimate, 6),
+            "billedCostUsd": 0.0,
+            "estimatedCostUsd": round(estimate, 6),
+            "costSource": "opensquilla_estimate" if estimate > 0 else "unavailable",
+        }
 
     @property
     def model_breakdown(self) -> list[dict]:
@@ -87,7 +177,7 @@ class SessionUsage:
                         "outputTokens": self.output_tokens,
                         "cacheReadTokens": self.cache_read_tokens,
                         "cacheWriteTokens": self.cache_write_tokens,
-                        "costUsd": round(self.cost, 6),
+                        **SessionUsage._breakdown_cost_fields(self),
                     }
                 ]
             return []
@@ -98,10 +188,46 @@ class SessionUsage:
                 "outputTokens": mu.output_tokens,
                 "cacheReadTokens": mu.cache_read_tokens,
                 "cacheWriteTokens": mu.cache_write_tokens,
-                "costUsd": round(mu.cost, 6),
+                **SessionUsage._breakdown_cost_fields(mu),
             }
-            for mu in sorted(self._per_model.values(), key=lambda m: m.cost, reverse=True)
+            # Sort by the canonical cost (billed when present, estimate otherwise)
+            # so the row order stays predictable even when some models lack
+            # billed data.
+            for mu in sorted(
+                self._per_model.values(),
+                key=lambda m: float(getattr(m, "billed_cost", 0.0) or 0.0) or m.cost,
+                reverse=True,
+            )
         ]
+
+
+@dataclass
+class SessionTotalsSnapshot:
+    """Point-in-time aggregate of a session's token usage and cost.
+
+    Embedded in `DoneEvent` so consumers do not need a follow-up
+    `usage.status` RPC to render session totals. `None` on `DoneEvent`
+    means "no snapshot available" (legacy replay), distinct from a
+    populated snapshot whose numeric fields happen to be zero.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    cost_usd: float = 0.0
+    billed_cost: float = 0.0
+
+    @classmethod
+    def from_session(cls, usage: SessionUsage) -> SessionTotalsSnapshot:
+        return cls(
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+            cache_read_tokens=usage.cache_read_tokens,
+            cache_write_tokens=usage.cache_write_tokens,
+            cost_usd=usage.total_cost,
+            billed_cost=usage.billed_cost,
+        )
 
 
 class UsageTracker:
@@ -119,8 +245,14 @@ class UsageTracker:
         *,
         cache_read_tokens: int = 0,
         cache_write_tokens: int = 0,
+        billed_cost: float = 0.0,
     ) -> None:
-        """Record token usage for a session."""
+        """Record token usage for a session.
+
+        ``billed_cost`` flows through to :py:attr:`ModelUsage.billed_cost` so
+        the per-model breakdown can report real provider-billed figures
+        instead of the cache-blind pricing-table estimate.
+        """
         usage = self._sessions.get(session_key)
         if usage is None:
             usage = SessionUsage(model_id=model_id)
@@ -131,6 +263,7 @@ class UsageTracker:
             model_id=model_id,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
+            billed_cost=billed_cost,
         )
         if model_id:
             usage.model_id = model_id
@@ -138,6 +271,13 @@ class UsageTracker:
     def get(self, session_key: str) -> SessionUsage | None:
         """Return accumulated usage for a session, or None."""
         return self._sessions.get(session_key)
+
+    def session_snapshot(self, session_key: str) -> SessionTotalsSnapshot | None:
+        """Return the current SessionTotalsSnapshot for *session_key*, or None if unknown."""
+        usage = self._sessions.get(session_key)
+        if usage is None:
+            return None
+        return SessionTotalsSnapshot.from_session(usage)
 
     def get_cost(self, session_key: str) -> float:
         """Return accumulated cost in USD for a session."""

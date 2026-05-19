@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from typing import Any
 from urllib.parse import urljoin
 
@@ -13,10 +14,14 @@ import structlog
 from cachetools import TTLCache
 
 from opensquilla.env import trust_env as _trust_env
+from opensquilla.result_budget import (
+    DEFAULT_TOOL_RESULT_BUDGET_POLICY,
+    ToolResultBudgetPolicy,
+)
 from opensquilla.sandbox.integration import sandboxed
 from opensquilla.tools.registry import tool
 from opensquilla.tools.ssrf import validate_http_url_for_fetch
-from opensquilla.tools.types import SSRFBlockedError
+from opensquilla.tools.types import SSRFBlockedError, current_tool_context
 
 log = structlog.get_logger(__name__)
 
@@ -49,6 +54,14 @@ _RETRY_DELAY_SECONDS = 0.25
 _WEB_FETCH_DEFAULT_MAX_CHARS = 20_000
 _WEB_FETCH_MAX_CHARS_ENV = "OPENSQUILLA_WEB_FETCH_MAX_CHARS"
 _MAX_REDIRECTS = 5
+
+_XML_ATTR_ESCAPES = {
+    "<": "&lt;",
+    ">": "&gt;",
+    "&": "&amp;",
+    '"': "&quot;",
+    "'": "&apos;",
+}
 
 
 def _check_ssrf(url: str) -> None:
@@ -132,9 +145,18 @@ def _resolve_default_max_chars() -> int:
 
 def _resolve_effective_max_chars(max_chars: int | None) -> int | None:
     """Resolve explicit max_chars or the default cap for omitted values."""
+    max_allowed = _active_budget_policy().max_web_fetch_chars
     if max_chars is not None:
-        return max_chars if max_chars >= 100 else None
-    return _resolve_default_max_chars()
+        return min(max_chars, max_allowed) if max_chars >= 100 else None
+    return min(_resolve_default_max_chars(), max_allowed)
+
+
+def _active_budget_policy() -> ToolResultBudgetPolicy:
+    ctx = current_tool_context.get()
+    policy = getattr(ctx, "tool_result_budget_policy", None) if ctx is not None else None
+    if isinstance(policy, ToolResultBudgetPolicy):
+        return policy
+    return DEFAULT_TOOL_RESULT_BUDGET_POLICY
 
 
 @tool(
@@ -165,6 +187,7 @@ def _resolve_effective_max_chars(max_chars: int | None) -> int | None:
         },
     },
     required=["url"],
+    result_budget_class="external",
 )
 @sandboxed(
     kind="web.fetch",
@@ -366,7 +389,28 @@ async def web_fetch(
 
 
 def _wrap_content(source: str, content: str) -> str:
-    return f'<external-content source="{source}">{content}</external-content>'
+    safe_source = _xml_escape_attr(source)
+    safe_content = _escape_external_content_boundaries(content)
+    return f'<external-content source="{safe_source}">{safe_content}</external-content>'
+
+
+def _xml_escape_attr(value: str) -> str:
+    return "".join(_XML_ATTR_ESCAPES.get(ch, ch) for ch in value)
+
+
+def _escape_external_content_boundaries(value: str) -> str:
+    out = re.sub(
+        r"<\s*/\s*external-content\s*>",
+        "&lt;/external-content&gt;",
+        value,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(
+        r"<\s*external-content\b",
+        "&lt;external-content",
+        out,
+        flags=re.IGNORECASE,
+    )
 
 
 def _extract_inner(wrapped: str) -> str:
@@ -390,10 +434,14 @@ def _apply_max_chars(result: dict[str, Any], max_chars: int | None) -> dict[str,
     output = dict(result)
     inner = _extract_inner(str(output.get("text", "")))
     if len(inner) <= max_chars:
+        output["original_length"] = len(inner)
+        output["returned_length"] = len(inner)
         return output
 
     source = str(output.get("final_url") or output.get("url") or "")
     output["text"] = _wrap_content(source, inner[:max_chars])
     output["truncated"] = True
-    output["length"] = max_chars
+    output["original_length"] = len(inner)
+    output["returned_length"] = max_chars
+    output["length"] = len(inner)
     return output

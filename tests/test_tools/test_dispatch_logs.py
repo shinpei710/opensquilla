@@ -78,7 +78,10 @@ async def test_dispatch_unsupported_surface_log_includes_approval_id() -> None:
                 ToolCall(tool_use_id="tc-2", tool_name="pending", arguments={}),
             )
 
-        assert result.is_error is True
+        assert result.is_error is False
+        assert result.execution_status is not None
+        assert result.execution_status["status"] == "unknown"
+        assert result.execution_status["reason"] == "approval_pending"
         assert any(
             event["event"] == "dispatch.approval_required_unsupported_surface"
             for event in captured

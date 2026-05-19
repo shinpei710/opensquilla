@@ -9,7 +9,7 @@ from rich.table import Table
 
 from opensquilla.cli.gateway_rpc import run_gateway_sync
 from opensquilla.cli.output import print_json
-from opensquilla.cli.ui import console
+from opensquilla.cli.ui import ACCENT_HEADER, console
 
 app = typer.Typer(help="Inspect available models.")
 
@@ -35,7 +35,7 @@ def models_list(
         print_json(rows)
         return
 
-    table = Table(title="Models", show_header=True, header_style="bold cyan")
+    table = Table(title="Models", show_header=True, header_style=ACCENT_HEADER)
     table.add_column("ID")
     table.add_column("Provider")
     table.add_column("Context", justify="right")

@@ -31,7 +31,7 @@ const ConfigView = (() => {
     'host':
       'Network interface the gateway binds to. Defaults to 127.0.0.1 (loopback). Use 0.0.0.0 to expose on all interfaces — opt-in only, never on an untrusted network.',
     'port':
-      'TCP port for the ASGI gateway. Default 18790. Pick a free port; the WebSocket and REST endpoints share it.',
+      'TCP port for the ASGI gateway. Default 18791. Pick a free port; the WebSocket and REST endpoints share it.',
     'debug':
       'Security-sensitive developer mode. Auth scope expansion can take effect immediately for new connections; Starlette debug, uvicorn log level, and some startup wiring need a gateway restart. Keep it off in shared deployments.',
     'diagnostics_enabled':
@@ -67,9 +67,11 @@ const ConfigView = (() => {
     'memory.retrieval_mode':
       'Memory retrieval mode. "hybrid" uses vectors when an embedding provider is available; "fts_only" disables vectors.',
     'sandbox.sandbox':
-      'Wrap tool execution in Bubblewrap (Linux) or Seatbelt (macOS). Strongly recommended whenever the agent runs untrusted code.',
+      'Runtime sandbox switch. The out-of-box posture keeps this false; use opensquilla sandbox on|bypass|full to change sandbox and permission defaults together.',
     'sandbox.security_grading':
-      'Tag tools and shell commands with a risk grade and gate dangerous ones behind approval prompts.',
+      'Risk grading and approval gate for tool actions. Keep this paired with sandbox.sandbox unless using the sandbox CLI posture commands.',
+    'permissions.default_mode':
+      'Default owner/operator permission mode: bypass is the out-of-box local posture, off keeps sandboxed execution, on uses host execution with approvals, and full bypasses sensitive-path gates too.',
     'prompt_cache.mode':
       'Anthropic prompt cache control. "auto" (default) lets the provider decide; "on" forces caching; "off" disables it entirely.',
     'context_budget_tokens':

@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import mimetypes
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -30,6 +32,15 @@ from starlette.routing import Route
 
 from opensquilla.channels._util import ChannelAccessPolicy, EventDedupeCache
 from opensquilla.channels._wecom_crypto import WeComCrypto
+from opensquilla.channels.contract import (
+    ChannelCapabilities,
+    ChannelCapabilityProfile,
+    ChannelPlatformCapability,
+    ChannelPlatformCapabilityStatus,
+    ChannelPlatformCategories,
+    ChannelPlatformManifest,
+    ChannelSendResult,
+)
 from opensquilla.channels.types import (
     ChannelHealth,
     IncomingMessage,
@@ -143,6 +154,42 @@ class WeComChannel:
                 encoding_aes_key=self.config.encoding_aes_key,
                 receiver_id=self.config.corp_id,
             )
+
+    @property
+    def capability_profile(self) -> ChannelCapabilityProfile:
+        return ChannelCapabilityProfile(
+            channel_type="wecom",
+            group_chat=True,
+            mentions=True,
+            native_file_upload=True,
+            media=True,
+            reply=True,
+            transports=("webhook",),
+        )
+
+    @property
+    def platform_capability_manifest(self) -> ChannelPlatformManifest:
+        return ChannelPlatformManifest.from_channel_profile(
+            self.capability_profile,
+            has_send_file=True,
+        ).with_capabilities(
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.FILES,
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=("media/upload", "message/send:file"),
+                mutates=True,
+                notes=("WeCom file delivery uploads media then sends a file message.",),
+            ),
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.ATTACHMENTS,
+                status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
+                notes=("Inbound WeCom attachment resolution is not implemented in this adapter.",),
+            ),
+        )
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self.capability_profile.capability_tags()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -437,6 +484,71 @@ class WeComChannel:
         if data.get("errcode", 0) != 0:
             raise WeComApiError(data.get("errmsg", "send failed"), code=data.get("errcode"))
         log.info("wecom.outbound_sent", touser=payload.get("touser"))
+
+    async def send_file(
+        self,
+        target_id: str,
+        file_path: str,
+        content: str = "",
+    ) -> ChannelSendResult:
+        token = await self._get_token()
+        client = self._get_client()
+        path = Path(file_path)
+        media_type = self._wecom_media_type(path)
+        with path.open("rb") as f:
+            upload_resp = await client.post(
+                "/cgi-bin/media/upload",
+                params={"access_token": token, "type": media_type},
+                files={"media": (path.name, f)},
+            )
+        upload_resp.raise_for_status()
+        upload_data = upload_resp.json()
+        if upload_data.get("errcode", 0) != 0:
+            raise WeComApiError(
+                upload_data.get("errmsg", "media upload failed"),
+                code=upload_data.get("errcode"),
+            )
+        media_id = str(upload_data.get("media_id", ""))
+        if not media_id:
+            raise WeComApiError("media upload returned no media_id")
+        payload = {
+            "touser": str(target_id),
+            "msgtype": media_type,
+            "agentid": self.config.agent_id_int,
+            media_type: {"media_id": media_id},
+            "safe": 0,
+        }
+        if content:
+            await self.send(OutgoingMessage(content=content, reply_to=target_id))
+        send_resp = await client.post(
+            "/cgi-bin/message/send",
+            params={"access_token": token},
+            json=payload,
+        )
+        send_resp.raise_for_status()
+        send_data = send_resp.json()
+        if send_data.get("errcode", 0) != 0:
+            raise WeComApiError(
+                send_data.get("errmsg", "send failed"),
+                code=send_data.get("errcode"),
+            )
+        return ChannelSendResult.sent(
+            capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+            target_id=str(target_id),
+            provider_message_id=str(send_data.get("msgid", "")),
+            provider_file_id=media_id,
+        )
+
+    @staticmethod
+    def _wecom_media_type(path: Path) -> str:
+        mime_type = mimetypes.guess_type(path.name)[0] or ""
+        if mime_type.startswith("image/"):
+            return "image"
+        if mime_type.startswith("video/"):
+            return "video"
+        if mime_type.startswith("audio/"):
+            return "voice"
+        return "file"
 
     async def edit(self, message_id: str, content: str) -> None:
         raise UnsupportedChannelOperation(

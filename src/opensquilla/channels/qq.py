@@ -29,6 +29,13 @@ import structlog
 from pydantic import BaseModel
 
 from opensquilla.channels._util import EventDedupeCache
+from opensquilla.channels.contract import (
+    ChannelCapabilityProfile,
+    ChannelPlatformCapability,
+    ChannelPlatformCapabilityStatus,
+    ChannelPlatformCategories,
+    ChannelPlatformManifest,
+)
 from opensquilla.channels.types import (
     ChannelHealth,
     IncomingMessage,
@@ -98,7 +105,7 @@ class _QQClientFallback:
     """
 
     async def start(self, *args: Any, **kwargs: Any) -> None:  # noqa: D401
-        raise RuntimeError("qq-botpy is not installed; install opensquilla[qq]")
+        raise RuntimeError("QQ adapter dependency missing — reinstall OpenSquilla")
 
     async def close(self) -> None:  # noqa: D401
         return None
@@ -162,6 +169,41 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         self._msg_count: int = 0
         self._connected: bool = False
         self._msg_seq: dict[str, int] = {}
+
+    @property
+    def capability_profile(self) -> ChannelCapabilityProfile:
+        return ChannelCapabilityProfile(
+            channel_type="qq",
+            group_chat=True,
+            mentions=True,
+            reply=True,
+            transports=("websocket",),
+            notes=(
+                "QQ Bot Platform rich-media APIs exist, but this adapter currently "
+                "sends text replies only.",
+            ),
+        )
+
+    @property
+    def platform_capability_manifest(self) -> ChannelPlatformManifest:
+        return ChannelPlatformManifest.from_channel_profile(
+            self.capability_profile,
+        ).with_capabilities(
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.FILES,
+                status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
+                notes=("QQ official bot file delivery is not implemented in this adapter.",),
+            ),
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.MEDIA,
+                status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
+                notes=("QQ official bot rich media is not implemented in this adapter.",),
+            ),
+        )
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self.capability_profile.capability_tags()
 
     # ------------------------------------------------------------------
     # Lifecycle

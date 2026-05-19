@@ -140,6 +140,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.reset": WRITE_SCOPE,
     "sessions.contextCompact": WRITE_SCOPE,
     "sessions.compact": WRITE_SCOPE,
+    "sessions.truncate": WRITE_SCOPE,
     # OpenSquilla-only; explicit override of `config.` admin prefix.
     "config.patch.safe": WRITE_SCOPE,
     # ----- approvals -----
@@ -180,6 +181,9 @@ METHOD_SCOPES: dict[str, str] = {
     "cron.run": ADMIN_SCOPE,
     "sessions.patch": ADMIN_SCOPE,
     "sessions.delete": ADMIN_SCOPE,
+    "memory.index": ADMIN_SCOPE,
+    "memory.raw_fallbacks.list": ADMIN_SCOPE,
+    "memory.raw_fallbacks.show": ADMIN_SCOPE,
     # OpenSquilla-only — onboarding mutations require admin scope.
     "onboarding.provider.configure": ADMIN_SCOPE,
     "onboarding.router.configure": ADMIN_SCOPE,

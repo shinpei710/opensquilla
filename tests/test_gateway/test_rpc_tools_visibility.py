@@ -164,3 +164,25 @@ async def test_default_tools_rpc_hides_owner_only_tools_from_non_owner(method: s
     assert "spawn_subagent" not in owner_names
     assert "send_message" not in owner_names
     assert "generate_image" not in owner_names
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["tools.catalog", "tools.effective"])
+async def test_default_channel_tools_rpc_exposes_structured_file_authoring(method: str) -> None:
+    import opensquilla.tools.builtin  # noqa: F401
+    from opensquilla.tools.registry import get_default_registry
+
+    result = await get_dispatcher().dispatch(
+        "r1",
+        method,
+        {"callerKind": "channel"},
+        _ctx(tool_registry=get_default_registry(), is_owner=False),
+    )
+
+    assert result.error is None, result.error
+    names = _tool_names(result.payload)
+
+    assert {"create_csv", "create_xlsx", "create_pdf_report", "create_pptx"} <= names
+    assert "write_file" not in names
+    assert "execute_code" not in names
+    assert "apply_patch" not in names

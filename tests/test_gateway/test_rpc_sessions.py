@@ -14,6 +14,7 @@ import pytest
 
 from opensquilla.agents.registry import AgentRegistry
 from opensquilla.engine.types import DoneEvent
+from opensquilla.gateway import rpc_sessions
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.attachment_ingest import (
     MAX_STAGED_PDF_BYTES,
@@ -116,14 +117,26 @@ class FakeSessionManager:
     def __init__(self, sessions: list[FakeSession] | None = None):
         self._storage = FakeStorage(sessions)
         self.created_messages: list[tuple[str, str, str]] = []
+        self.removed_messages: list[tuple[str, str]] = []
         self.applied_intents: list[tuple[str, str]] = []
         self.truncate_calls: list[tuple[str, int]] = []
         self.compact_calls: list[tuple[str, int, object | None]] = []
+        self.compact_instructions: list[str | None] = []
         self.compact_summary = "summary for compacted context"
         self.compact_summary_source = "fallback"
+        self.transcript: list[Any] = []
 
-    async def append_message(self, key: str, role: str = "user", content: str = "") -> None:
+    async def append_message(self, key: str, role: str = "user", content: str = "") -> Any:
         self.created_messages.append((key, role, content))
+        return SimpleNamespace(
+            message_id=f"msg-{len(self.created_messages)}",
+            role=role,
+            content=content,
+        )
+
+    async def remove_message(self, key: str, message_id: str) -> bool:
+        self.removed_messages.append((key, message_id))
+        return True
 
     async def create(
         self,
@@ -143,7 +156,7 @@ class FakeSessionManager:
         return session
 
     async def get_transcript(self, key: str) -> list:
-        return []
+        return list(self.transcript)
 
     async def truncate(self, session_key: str, max_messages: int = 20) -> dict:
         session = await self._storage.get_session(session_key)
@@ -159,12 +172,23 @@ class FakeSessionManager:
         self.compact_calls.append((session_key, context_window_tokens, config))
         return self.compact_summary
 
-    async def compact_with_result(self, session_key: str, context_window_tokens: int, config=None):
+    async def compact_with_result(
+        self,
+        session_key: str,
+        context_window_tokens: int,
+        config=None,
+        custom_instructions: str | None = None,
+    ):
+        self.compact_instructions.append(custom_instructions)
         summary = await self.compact(session_key, context_window_tokens, config)
         return SimpleNamespace(
             summary=summary,
             removed_count=1 if summary else 0,
+            kept_entries=[],
             summary_source=self.compact_summary_source if summary else "skipped",
+            tokens_before=1200,
+            tokens_after=400,
+            remaining_budget_tokens=max(context_window_tokens - 400, 0),
         )
 
     async def apply_intent(self, session_key: str, intent: str, **kwargs):
@@ -185,6 +209,20 @@ class FakeSessionManager:
         return session, True
 
 
+class SlowCompactionSessionManager(FakeSessionManager):
+    def __init__(self, sessions: list[FakeSession] | None = None):
+        super().__init__(sessions)
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def compact(
+        self, session_key: str, context_window_tokens: int, config=None
+    ) -> str:
+        self.started.set()
+        await self.release.wait()
+        return await super().compact(session_key, context_window_tokens, config)
+
+
 def make_ctx(session_manager=None, **kwargs) -> RpcContext:
     role = kwargs.pop("role", "operator")
     scopes = kwargs.pop("scopes", None)
@@ -197,7 +235,7 @@ def make_ctx(session_manager=None, **kwargs) -> RpcContext:
     defaults = {
         "conn_id": "test-conn",
         "principal": principal,
-        "config": GatewayConfig(),
+        "config": GatewayConfig(memory={"flush_enabled": False}),
     }
     defaults.update(kwargs)
     ctx = RpcContext(**defaults)
@@ -266,10 +304,15 @@ class _LegacyCompactManager:
 class _ReplayConn:
     def __init__(self, conn_id: str) -> None:
         self.conn_id = conn_id
-        self.events: list[tuple[str, dict]] = []
+        self.events: list[tuple[str, dict, dict | None]] = []
 
-    async def send_event(self, event: str, payload: dict | None = None) -> None:
-        self.events.append((event, payload or {}))
+    async def send_event(
+        self,
+        event: str,
+        payload: dict | None = None,
+        meta: dict | None = None,
+    ) -> None:
+        self.events.append((event, payload or {}, meta))
 
 
 class _RecordingTurnRunner:
@@ -612,6 +655,41 @@ class TestSessionsSend:
             (session.session_key, "continue")
         ]
 
+    @pytest.mark.asyncio
+    async def test_send_passes_persisted_user_message_id_to_task_runtime(
+        self, dispatcher, session
+    ):
+        class RecordingTaskRuntime:
+            def __init__(self) -> None:
+                self.enqueue_calls: list[dict[str, Any]] = []
+
+            async def enqueue(self, envelope, message: str, **kwargs: Any):
+                self.enqueue_calls.append(
+                    {"envelope": envelope, "message": message, **kwargs}
+                )
+                return SimpleNamespace(
+                    task_id="task-1",
+                    session_key=envelope.session_key,
+                    status="queued",
+                )
+
+        runtime = RecordingTaskRuntime()
+        manager = FakeSessionManager([session])
+        ctx = make_ctx(session_manager=manager, task_runtime=runtime)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.send",
+            {"key": session.session_key, "message": "hello"},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert runtime.enqueue_calls[0]["persisted_user_message_id"] == "msg-1"
+        assert runtime.enqueue_calls[0]["envelope"].metadata.get(
+            "persisted_user_message_id"
+        ) is None
+
     def test_legacy_session_error_payload_is_terminal_message_normalized(self):
         payload = _normalize_terminal_event_payload(
             "session.event.error",
@@ -624,7 +702,7 @@ class TestSessionsSend:
         assert payload["message"] == "The task timed out before it could finish."
         assert payload["terminal_message"] == "The task timed out before it could finish."
         assert payload["terminal_reason"] == "timeout"
-        assert payload["error_message"] == "Session event stream idle before terminal event"
+        assert payload["error_message"] == "The task timed out before it could finish."
 
     @pytest.mark.asyncio
     async def test_send_reset_same_key_intent_applies_before_append(
@@ -1022,11 +1100,20 @@ class TestSessionsDelete:
 
 class TestSessionsCompact:
     @pytest.mark.asyncio
-    async def test_compact_valid(self, dispatcher, ctx_with_sessions, session):
+    async def test_compact_valid_uses_summary_compaction(
+        self, dispatcher, ctx_with_sessions, session
+    ):
         res = await dispatcher.dispatch(
             "r1", "sessions.compact", {"key": session.session_key}, ctx_with_sessions
         )
         assert res.ok is True
+        assert res.payload["mode"] == "summary"
+        assert res.payload["compacted"] is True
+        assert ctx_with_sessions.session_manager.compact_calls[0][:2] == (
+            session.session_key,
+            ctx_with_sessions.config.context_budget_tokens,
+        )
+        assert ctx_with_sessions.session_manager.truncate_calls == []
 
     @pytest.mark.asyncio
     async def test_compact_allowed_for_operator_write_scope(self, dispatcher, session):
@@ -1038,6 +1125,7 @@ class TestSessionsCompact:
         res = await dispatcher.dispatch("r1", "sessions.compact", {"key": session.session_key}, ctx)
 
         assert res.ok is True
+        assert ctx.session_manager.compact_calls
 
     @pytest.mark.asyncio
     async def test_compact_not_found(self, dispatcher, ctx_with_sessions):
@@ -1046,6 +1134,51 @@ class TestSessionsCompact:
         )
         assert res.ok is False
         assert res.error.code == "NOT_FOUND"
+
+
+class TestSessionsTruncate:
+    @pytest.mark.asyncio
+    async def test_truncate_valid_preserves_hard_truncate_semantics(
+        self, dispatcher, ctx_with_sessions, session
+    ):
+        res = await dispatcher.dispatch(
+            "r1", "sessions.truncate", {"key": session.session_key}, ctx_with_sessions
+        )
+
+        assert res.ok is True
+        assert res.payload["mode"] == "truncate"
+        assert ctx_with_sessions.session_manager.truncate_calls == [
+            (session.session_key, 20)
+        ]
+        assert ctx_with_sessions.session_manager.compact_calls == []
+
+    @pytest.mark.asyncio
+    async def test_truncate_refuses_degraded_flush_receipt(
+        self, dispatcher, session
+    ):
+        manager = FakeSessionManager([session])
+        manager.transcript = [SimpleNamespace(content="message to preserve")]
+        flush_service = SimpleNamespace(
+            execute=AsyncMock(
+                return_value=SimpleNamespace(
+                    mode="raw",
+                    integrity_ok=True,
+                    output_coverage_status="ok",
+                    missing_candidate_count=0,
+                    invalid_candidate_count=0,
+                    obligation_status="ok",
+                )
+            )
+        )
+        ctx = make_ctx(session_manager=manager, flush_service=flush_service)
+
+        res = await dispatcher.dispatch(
+            "r1", "sessions.truncate", {"key": session.session_key}, ctx
+        )
+
+        assert res.ok is False
+        assert res.error.code == "CONTEXT_FLUSH_FAILED"
+        assert manager.truncate_calls == []
 
 
 class TestSessionsContextCompact:
@@ -1069,6 +1202,240 @@ class TestSessionsContextCompact:
         compact_call = ctx_with_sessions.session_manager.compact_calls[0]
         assert compact_call[:2] == (session.session_key, 1234)
         assert ctx_with_sessions.session_manager.truncate_calls == []
+        assert res.payload["tokens_before"] == 1200
+        assert res.payload["tokens_after"] == 400
+        assert res.payload["remaining_budget_tokens"] == 834
+        assert res.payload["removed_count"] == 1
+        assert res.payload["kept_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_context_compact_emits_started_and_completed_events(
+        self,
+        dispatcher,
+        ctx_with_sessions,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        events: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            rpc_sessions,
+            "notify_compaction",
+            lambda session_key, **payload: events.append((session_key, payload)),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.contextCompact",
+            {"key": session.session_key, "contextWindowTokens": 1234},
+            ctx_with_sessions,
+        )
+
+        assert res.ok is True
+        assert [(key, payload["status"]) for key, payload in events] == [
+            (session.session_key, "started"),
+            (session.session_key, "completed"),
+        ]
+        assert all(payload["source"] == "manual" for _, payload in events)
+        assert all(payload["phase"] == "manual" for _, payload in events)
+
+    @pytest.mark.asyncio
+    async def test_context_compact_emits_started_while_slow_compaction_is_running(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        manager = SlowCompactionSessionManager([session])
+        ctx = make_ctx(session_manager=manager)
+        events: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            rpc_sessions,
+            "notify_compaction",
+            lambda session_key, **payload: events.append((session_key, payload)),
+        )
+
+        task = asyncio.create_task(
+            dispatcher.dispatch(
+                "r1",
+                "sessions.contextCompact",
+                {"key": session.session_key, "contextWindowTokens": 1234},
+                ctx,
+            )
+        )
+
+        await asyncio.wait_for(manager.started.wait(), timeout=1.0)
+        assert [payload["status"] for _, payload in events] == ["started"]
+        assert task.done() is False
+
+        manager.release.set()
+        res = await asyncio.wait_for(task, timeout=1.0)
+
+        assert res.ok is True
+        assert [payload["status"] for _, payload in events] == [
+            "started",
+            "completed",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_context_compact_emits_cancelled_when_slow_compaction_is_cancelled(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        manager = SlowCompactionSessionManager([session])
+        ctx = make_ctx(session_manager=manager)
+        events: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            rpc_sessions,
+            "notify_compaction",
+            lambda session_key, **payload: events.append((session_key, payload)),
+        )
+
+        task = asyncio.create_task(
+            dispatcher.dispatch(
+                "r1",
+                "sessions.contextCompact",
+                {"key": session.session_key, "contextWindowTokens": 1234},
+                ctx,
+            )
+        )
+        await asyncio.wait_for(manager.started.wait(), timeout=1.0)
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert [payload["status"] for _, payload in events] == [
+            "started",
+            "cancelled",
+        ]
+        assert manager.compact_calls == []
+
+    @pytest.mark.asyncio
+    async def test_context_compact_emits_skipped_when_nothing_removed(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        manager = FakeSessionManager([session])
+        manager.compact_summary = ""
+        ctx = make_ctx(session_manager=manager)
+        events: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            rpc_sessions,
+            "notify_compaction",
+            lambda session_key, **payload: events.append((session_key, payload)),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1", "sessions.contextCompact", {"key": session.session_key}, ctx
+        )
+
+        assert res.ok is True
+        assert res.payload["compacted"] is False
+        assert [payload["status"] for _, payload in events] == ["started", "skipped"]
+
+    @pytest.mark.asyncio
+    async def test_context_compact_emits_failed_when_compaction_raises(
+        self,
+        dispatcher,
+        session,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        manager = FakeSessionManager([session])
+
+        async def _boom(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("compact boom")
+
+        manager.compact_with_result = _boom  # type: ignore[method-assign]
+        ctx = make_ctx(session_manager=manager)
+        events: list[tuple[str, dict[str, Any]]] = []
+        monkeypatch.setattr(
+            rpc_sessions,
+            "notify_compaction",
+            lambda session_key, **payload: events.append((session_key, payload)),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1", "sessions.contextCompact", {"key": session.session_key}, ctx
+        )
+
+        assert res.ok is False
+        assert [payload["status"] for _, payload in events] == ["started", "failed"]
+        assert "compact boom" in events[-1][1]["message"]
+
+    @pytest.mark.asyncio
+    async def test_context_compact_passes_custom_instructions(
+        self, dispatcher, ctx_with_sessions, session
+    ):
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.contextCompact",
+            {
+                "key": session.session_key,
+                "contextWindowTokens": 1234,
+                "instructions": "Preserve architecture decisions.",
+            },
+            ctx_with_sessions,
+        )
+
+        assert res.ok is True
+        assert ctx_with_sessions.session_manager.compact_instructions == [
+            "Preserve architecture decisions."
+        ]
+
+    @pytest.mark.asyncio
+    async def test_context_compact_missing_flush_service_does_not_block_compaction(
+        self, dispatcher, session
+    ):
+        manager = FakeSessionManager([session])
+        manager.transcript = [SimpleNamespace(content="message to preserve")]
+        ctx = make_ctx(
+            session_manager=manager,
+            config=GatewayConfig(memory={"flush_enabled": True}),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1", "sessions.contextCompact", {"key": session.session_key}, ctx
+        )
+
+        assert res.ok is True
+        assert len(manager.compact_calls) == 1
+        assert manager.compact_calls[0][:2] == (session.session_key, 100000)
+
+    @pytest.mark.asyncio
+    async def test_context_compact_degraded_flush_receipt_does_not_block_compaction(
+        self, dispatcher, session
+    ):
+        manager = FakeSessionManager([session])
+        manager.transcript = [SimpleNamespace(content="message to preserve")]
+        flush_service = SimpleNamespace(
+            execute=AsyncMock(
+                return_value=SimpleNamespace(
+                    mode="raw",
+                    integrity_ok=True,
+                    output_coverage_status="ok",
+                    missing_candidate_count=0,
+                    invalid_candidate_count=0,
+                    obligation_status="ok",
+                )
+            )
+        )
+        ctx = make_ctx(
+            session_manager=manager,
+            flush_service=flush_service,
+            config=GatewayConfig(memory={"flush_enabled": True}),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1", "sessions.contextCompact", {"key": session.session_key}, ctx
+        )
+
+        assert res.ok is True
+        assert len(manager.compact_calls) == 1
+        assert manager.compact_calls[0][:2] == (session.session_key, 100000)
 
     @pytest.mark.asyncio
     async def test_context_compact_allowed_for_operator_write_scope(self, dispatcher, session):
@@ -1229,7 +1596,7 @@ class TestSessionsMessagesSubscribe:
         assert res.payload["current_stream_seq"] == second["stream_seq"]
         assert res.payload["replay_complete"] is True
         assert res.payload["replayed_count"] == 1
-        assert conn.events == [("session.event.done", second)]
+        assert conn.events == [("session.event.done", second, {"replayed": True})]
 
     @pytest.mark.asyncio
     async def test_messages_subscribe_replays_task_group_events(self, dispatcher):
@@ -1273,7 +1640,9 @@ class TestSessionsMessagesSubscribe:
 
         assert res.ok is True
         assert res.payload["replayed_count"] == 1
-        assert conn.events == [("session.event.task_group.done", done)]
+        assert conn.events == [
+            ("session.event.task_group.done", done, {"replayed": True})
+        ]
 
     @pytest.mark.asyncio
     async def test_messages_subscribe_reports_persisted_task_state_and_replay_gap(

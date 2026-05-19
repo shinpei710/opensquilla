@@ -1,8 +1,8 @@
 """inject_subagent_grounding pipeline step survives compaction.
 
 Idempotently re-injects the subagent system-prompt grounding for any
-session whose key contains ``:subagent:``. No-op for main sessions and
-when the grounding text is already present.
+recognized subagent session key. No-op for main sessions and when the
+grounding text is already present.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from opensquilla.engine.steps.inject_subagent_grounding import (
     _SUBAGENT_GROUNDING,
     inject_subagent_grounding,
 )
+from opensquilla.tools.builtin.sessions import _SUBAGENT_SYSTEM_PROMPT
 
 
 @dataclass
@@ -43,6 +44,19 @@ async def test_subagent_session_re_injects_when_missing() -> None:
     assert _SUBAGENT_GROUNDING in out.system_prompt
     assert "Be helpful." in out.system_prompt
     assert out.metadata.get("inject_subagent_grounding__applied") is True
+
+
+@pytest.mark.asyncio
+async def test_bare_subagent_session_key_re_injects_when_missing() -> None:
+    ctx = _ctx("subagent:abcd1234", "Be helpful.")
+    out = await inject_subagent_grounding(ctx)
+    assert _SUBAGENT_GROUNDING in out.system_prompt
+    assert "Be helpful." in out.system_prompt
+    assert out.metadata.get("inject_subagent_grounding__applied") is True
+
+
+def test_fallback_grounding_matches_spawn_prompt() -> None:
+    assert _SUBAGENT_GROUNDING == _SUBAGENT_SYSTEM_PROMPT
 
 
 @pytest.mark.asyncio

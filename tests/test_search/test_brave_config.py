@@ -19,6 +19,14 @@ def test_brave_provider_prefers_explicit_api_key(monkeypatch) -> None:
     assert provider._api_key == "brave-test-key"
 
 
+def test_brave_provider_strips_trailing_paste_punctuation(monkeypatch) -> None:
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+
+    provider = BraveSearchProvider(api_key="brave-test-key、")
+
+    assert provider._api_key == "brave-test-key"
+
+
 def test_web_search_kwargs_pass_brave_api_key() -> None:
     web.configure_search("brave", api_key="brave-test-key")
 

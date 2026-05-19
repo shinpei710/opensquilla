@@ -10,7 +10,7 @@ import typer
 from rich.markup import escape
 from rich.table import Table
 
-from opensquilla.cli.ui import console
+from opensquilla.cli.ui import ACCENT_HEADER, ACCENT_MARKUP, console
 
 app = typer.Typer(help="Manage OpenSquilla configuration.")
 
@@ -32,9 +32,9 @@ def config_get(
         if val is _MISSING:
             console.print(f"[red]Key not found: {key}[/red]")
             raise typer.Exit(1)
-        console.print(f"[cyan]{escape(key)}[/cyan] = [green]{escape(repr(val))}[/green]")
+        console.print(f"[{ACCENT_MARKUP}]{escape(key)}[/] = [green]{escape(repr(val))}[/green]")
     else:
-        table = Table(title="Gateway Config", show_header=True, header_style="bold cyan")
+        table = Table(title="Gateway Config", show_header=True, header_style=ACCENT_HEADER)
         table.add_column("Key")
         table.add_column("Value")
         _add_flat(table, data)

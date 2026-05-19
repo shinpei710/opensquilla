@@ -15,6 +15,8 @@ from opensquilla.cli.channel_fields import (
 )
 from opensquilla.cli.gateway_rpc import confirm_or_exit, run_gateway_sync
 from opensquilla.cli.output import print_json
+from opensquilla.cli.ui import ACCENT_HEADER, ACCENT_MARKUP
+from opensquilla.cli.ui import console as ui_console
 from opensquilla.onboarding.channel_specs import (
     get_channel_setup_spec,
     list_channel_setup_specs,
@@ -58,10 +60,7 @@ _SOURCE_LABEL = {
 
 def _resolve_and_announce(config_path: Path | None) -> Path:
     target, source = resolve_config_path(config_path)
-    typer.secho(
-        f"Config: {target} ({_SOURCE_LABEL[source]})",
-        fg=typer.colors.CYAN,
-    )
+    ui_console.print(f"[{ACCENT_MARKUP}]Config:[/] {target} ({_SOURCE_LABEL[source]})")
     return target
 
 
@@ -94,7 +93,7 @@ def _render_channels_table(entries: list[dict[str, Any]], *, title: str) -> None
 
 def _render_status_table(payload: dict[str, Any], *, name: str | None = None) -> None:
     rows = _filter_status_rows(payload, name)
-    table = Table(title="Channel status", show_header=True, header_style="bold cyan")
+    table = Table(title="Channel status", show_header=True, header_style=ACCENT_HEADER)
     table.add_column("Name")
     table.add_column("Type")
     table.add_column("Status")

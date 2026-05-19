@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import shlex
+import sys
+import time
 from dataclasses import dataclass
 
 import pytest
@@ -71,16 +76,90 @@ def _session(
     *,
     agent_id: str | None = "agent",
     done: bool = False,
+    command: str | None = None,
+    local_urls: list[str] | None = None,
 ) -> shell._BgSession:
     return shell._BgSession(
         session_id=session_id,
-        command=f"cmd {session_id}",
+        command=command or f"cmd {session_id}",
         process=_FakeProcess(returncode=0 if done else None),  # type: ignore[arg-type]
         session_key=session_key,
         agent_id=agent_id,
         done=done,
         returncode=0 if done else None,
+        local_urls=local_urls or [],
     )
+
+
+def test_background_process_result_surfaces_local_http_server_url() -> None:
+    session = _session(
+        "server",
+        "agent:main:one",
+        command="cd /workspace && python3 -m http.server 8080",
+        local_urls=shell._local_server_urls_from_command(
+            "cd /workspace && python3 -m http.server 8080"
+        ),
+    )
+
+    result = shell._background_process_result(session)
+
+    assert "local_urls:" in result
+    assert "- http://127.0.0.1:8080/" in result
+    assert "include the local URL" in result
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process group behavior is POSIX-specific")
+@pytest.mark.asyncio
+async def test_exec_command_returns_when_shell_exits_even_if_descendant_holds_pipe() -> None:
+    child_script = "import time; time.sleep(5)"
+    parent_script = (
+        "import subprocess, sys; "
+        "subprocess.Popen([sys.executable, '-c', "
+        f"{child_script!r}], stdout=sys.stdout, stderr=sys.stderr)"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_script)}"
+
+    started = time.monotonic()
+    result = await shell.exec_command(command, timeout=1.0)
+    elapsed = time.monotonic() - started
+
+    assert result.startswith("exit_code=0\n")
+    assert elapsed < 1.0
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process group behavior is POSIX-specific")
+@pytest.mark.asyncio
+async def test_exec_command_cleans_descendant_after_shell_exits(tmp_path) -> None:
+    marker = tmp_path / "descendant-ran"
+    child_script = (
+        "import pathlib, time; "
+        f"time.sleep(0.5); pathlib.Path({str(marker)!r}).write_text('ran')"
+    )
+    parent_script = (
+        "import subprocess, sys; "
+        "subprocess.Popen([sys.executable, '-c', "
+        f"{child_script!r}])"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_script)}"
+
+    result = await shell.exec_command(command, timeout=1.0)
+    await asyncio.sleep(0.8)
+
+    assert result.startswith("exit_code=0\n")
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="POSIX shell quoting is required")
+async def test_exec_command_timeout_still_stops_foreground_process() -> None:
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote('import time; time.sleep(5)')}"
+
+    started = time.monotonic()
+    result = await shell.exec_command(command, timeout=0.1)
+    elapsed = time.monotonic() - started
+
+    assert "[timeout after 0.1s]" in result
+    assert elapsed < 1.0
 
 
 @pytest.mark.asyncio
@@ -148,6 +227,24 @@ async def test_process_owner_context_can_poll_other_sessions() -> None:
 
     assert payload["status"] == "ok"
     assert payload["session"]["session_id"] == "other"
+
+
+@pytest.mark.asyncio
+async def test_process_poll_includes_local_urls_for_server_sessions() -> None:
+    shell._bg_sessions["server"] = _session(
+        "server",
+        "agent:main:one",
+        command="python -m http.server 9090",
+        local_urls=["http://127.0.0.1:9090/"],
+    )
+
+    token = current_tool_context.set(_ctx("agent:main:one"))
+    try:
+        payload = json.loads(await shell.process("poll", session_id="server"))
+    finally:
+        current_tool_context.reset(token)
+
+    assert payload["session"]["local_urls"] == ["http://127.0.0.1:9090/"]
 
 
 @pytest.mark.asyncio

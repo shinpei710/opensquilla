@@ -25,7 +25,7 @@ def _write_pidfile(record: dict) -> None:
     path.write_text(json.dumps(record), encoding="utf-8")
 
 
-def _record(pid: int = 1234, *, port: int = 18790) -> dict:
+def _record(pid: int = 1234, *, port: int = 18791) -> dict:
     return {
         "pid": pid,
         "host": "127.0.0.1",
@@ -71,10 +71,10 @@ class _FakeHealthResponse:
 
 
 def test_gateway_startup_guidance_shows_operator_next_steps() -> None:
-    guidance = gateway_startup_guidance("127.0.0.1", 18790)
+    guidance = gateway_startup_guidance("127.0.0.1", 18791)
 
-    assert "[bold]Web UI:[/bold] http://127.0.0.1:18790/control/" in guidance
-    assert "[bold]API base:[/bold] http://127.0.0.1:18790" in guidance
+    assert "[bold]Web UI:[/bold] http://127.0.0.1:18791/control/" in guidance
+    assert "[bold]API base:[/bold] http://127.0.0.1:18791" in guidance
     debug_log = default_opensquilla_home() / "logs" / "debug.log"
     assert f"[bold]Debug log:[/bold] {debug_log}" in guidance
     assert "[dim]Keep this terminal open. Press Ctrl+C to stop.[/dim]" in guidance
@@ -276,7 +276,7 @@ def test_gateway_start_does_not_spawn_duplicate_recorded_gateway(tmp_path, monke
 
 def test_gateway_start_refuses_live_pidfile_for_different_target(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "home"))
-    _write_pidfile(_record(pid=321, port=18790))
+    _write_pidfile(_record(pid=321, port=18791))
     _patch_pid_running(monkeypatch, True)
     _patch_health(monkeypatch, False)
 
@@ -285,7 +285,7 @@ def test_gateway_start_refuses_live_pidfile_for_different_target(tmp_path, monke
 
     monkeypatch.setattr(gateway_lifecycle.subprocess, "Popen", fail_popen)
 
-    result = runner.invoke(app, ["gateway", "start", "--port", "18791", "--json"])
+    result = runner.invoke(app, ["gateway", "start", "--port", "18792", "--json"])
 
     assert result.exit_code == 3
     payload = _payload(result)
@@ -321,7 +321,7 @@ def test_gateway_stop_refuses_unmanaged_healthy_gateway(tmp_path, monkeypatch) -
 
 def test_gateway_stop_refuses_live_pidfile_for_different_target(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "home"))
-    _write_pidfile(_record(pid=321, port=18790))
+    _write_pidfile(_record(pid=321, port=18791))
     _patch_pid_running(monkeypatch, True)
     _patch_health(monkeypatch, False)
 
@@ -330,7 +330,7 @@ def test_gateway_stop_refuses_live_pidfile_for_different_target(tmp_path, monkey
 
     monkeypatch.setattr(Manager, "_terminate_pid", fail_terminate)
 
-    result = runner.invoke(app, ["gateway", "stop", "--port", "18791", "--json"])
+    result = runner.invoke(app, ["gateway", "stop", "--port", "18792", "--json"])
 
     assert result.exit_code == 3
     payload = _payload(result)
@@ -341,7 +341,7 @@ def test_gateway_stop_refuses_live_pidfile_for_different_target(tmp_path, monkey
 
 def test_gateway_restart_refuses_live_pidfile_for_different_target(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "home"))
-    _write_pidfile(_record(pid=321, port=18790))
+    _write_pidfile(_record(pid=321, port=18791))
     _patch_pid_running(monkeypatch, True)
     _patch_health(monkeypatch, False)
 
@@ -350,7 +350,7 @@ def test_gateway_restart_refuses_live_pidfile_for_different_target(tmp_path, mon
 
     monkeypatch.setattr(gateway_lifecycle.subprocess, "Popen", fail_popen)
 
-    result = runner.invoke(app, ["gateway", "restart", "--port", "18791", "--json"])
+    result = runner.invoke(app, ["gateway", "restart", "--port", "18792", "--json"])
 
     assert result.exit_code == 3
     payload = _payload(result)

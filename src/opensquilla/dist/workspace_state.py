@@ -8,7 +8,7 @@ Emits a reproducible, versioned inventory of the current opensquilla install:
       "python_requires": "<pyproject requires-python>",
       "bundled_channels": [...],
       "bundled_tools": [...],
-      "gateway_defaults": {"listen": "127.0.0.1", "port": 18790}
+      "gateway_defaults": {"listen": "127.0.0.1", "port": 18791}
     }
 
 Reproducibility contract
@@ -32,7 +32,6 @@ Secret-hygiene contract
 No value in the payload is derived from ``os.environ`` or any file outside
 this module and the installed package's metadata. No key whose name
 matches ``*_key`` / ``*_token`` / ``*_secret`` appears in the schema.
-See ``docs/dist/workspace-state.md`` for the full contract.
 """
 
 from __future__ import annotations
@@ -47,13 +46,16 @@ SCHEMA_VERSION = 1
 # under ``opensquilla.channels``. Helpers (``_util``, ``manager``, ``types``)
 # are intentionally excluded — they are infra, not channels.
 BUNDLED_CHANNELS: tuple[str, ...] = (
+    "dingtalk",
     "discord",
     "feishu",
+    "matrix",
+    "qq",
     "slack",
     "telegram",
     "terminal",
+    "wecom",
     "websocket",
-    "whatsapp",
 )
 
 # Bundled built-in tools. Tools are listed by module name under
@@ -84,7 +86,7 @@ BUNDLED_TOOLS: tuple[str, ...] = (
 # Packaging-side enforcement keeps these values consistent across release surfaces.
 GATEWAY_DEFAULTS: dict[str, object] = {
     "listen": "127.0.0.1",
-    "port": 18790,
+    "port": 18791,
 }
 
 # Fallback version used only when the package is not installed (editable

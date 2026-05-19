@@ -8,8 +8,9 @@ from typing import Any
 
 from opensquilla.session.keys import normalize_agent_id
 
+from .delivery import validate_webhook_url
 from .jobs import _next_run
-from .parser import parse_schedule
+from .parser import parse_cron, parse_iso_at, validate_tz
 from .payloads import normalize_contract, normalize_origin_session_key, payload_agent_id
 from .persistence import JobStore
 from .stagger import compute_jitter
@@ -23,6 +24,39 @@ from .types import (
     ScheduleKind,
     SessionTarget,
 )
+
+
+def _validate_structured_schedule(
+    kind: ScheduleKind | str,
+    value: str,
+) -> tuple[ScheduleKind, str]:
+    """Validate (kind, value) per-kind and return canonical (kind, value).
+
+    Raises ``ValueError`` (or subclasses) on invalid input. ``value`` is always
+    returned as a string to match how the EVERY interval is stored elsewhere.
+    """
+    if isinstance(kind, str):
+        kind = ScheduleKind(kind)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("schedule_value must be a non-empty string")
+    value = value.strip()
+    if kind == ScheduleKind.CRON:
+        parse_cron(value)
+        return kind, value
+    if kind == ScheduleKind.AT:
+        parse_iso_at(value)
+        return kind, value
+    if kind == ScheduleKind.EVERY:
+        try:
+            seconds = int(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"schedule_value for kind=every must be integer seconds; got {value!r}"
+            ) from exc
+        if seconds < 1:
+            raise ValueError("schedule_value for kind=every must be >= 1 second")
+        return kind, str(seconds)
+    raise ValueError(f"Unsupported schedule_kind: {kind!r}")
 
 
 def _coerce_wake_mode(value: CronWakeMode | str) -> CronWakeMode:
@@ -53,7 +87,13 @@ def _normalize_delivery_for_target(
     delivery: DeliveryConfig,
     explicit_delivery: bool,
 ) -> DeliveryConfig:
+    if delivery is not None and delivery.mode == DeliveryMode.WEBHOOK:
+        validate_webhook_url(delivery.webhook_url)
     if session_target != SessionTarget.MAIN:
+        return delivery
+    # Webhook delivery is allowed for any sessionTarget — the heartbeat
+    # pipeline ignores it and the webhook POST is independent of session.
+    if delivery is not None and delivery.mode == DeliveryMode.WEBHOOK:
         return delivery
     if _delivery_requested(delivery):
         if explicit_delivery:
@@ -86,8 +126,11 @@ class SchedulerOps:
     async def add(
         self,
         name: str,
-        schedule_raw: str,
-        handler_key: str,
+        *,
+        schedule_kind: ScheduleKind | str,
+        schedule_value: str,
+        schedule_tz: str = "",
+        handler_key: str = "",
         payload: dict | None = None,
         session_target: SessionTarget = SessionTarget.ISOLATED,
         session_key: str = "",
@@ -97,17 +140,49 @@ class SchedulerOps:
         delivery: DeliveryConfig | None = None,
         origin_session_key: str = "",
         tool_policy: dict[str, Any] | None = None,
+        tz: str = "",
+        jitter_seconds: float | None = None,
+        creator_session_key: str = "",
+        creator_sender_id: str = "",
+        creator_is_owner: bool = False,
     ) -> CronJob:
-        """Parse schedule, compute jitter, create and save a new CronJob."""
+        """Validate the structured schedule, compute jitter, persist a new CronJob.
+
+        ``schedule_kind`` + ``schedule_value`` are required; the value is
+        validated per kind via ``parse_cron`` / ``parse_iso_at`` / integer
+        check. No natural-language detection.
+
+        ``jitter_seconds`` controls stagger:
+          * ``None`` (default) → auto-computed via compute_jitter (legacy behaviour).
+          * ``0`` → exact timing, no stagger.
+          * ``>0`` → explicit fixed offset.
+        """
         now_local = self._now()
-        kind, cron_expr = parse_schedule(schedule_raw, reference_now=now_local)
-        jitter = compute_jitter(handler_key + name, self._max_jitter)
+        kind, cron_expr = _validate_structured_schedule(schedule_kind, schedule_value)
+        schedule_raw = cron_expr
+        tz = (schedule_tz or tz or "").strip()
+        validate_tz(tz)
+        if jitter_seconds is None:
+            jitter = compute_jitter(handler_key + name, self._max_jitter)
+        else:
+            jitter = max(0.0, float(jitter_seconds))
         now = now_local.astimezone(UTC)
 
         # Coerce string to enum if needed
         if isinstance(session_target, str):
             session_target = SessionTarget(session_target)
         wake_mode = _coerce_wake_mode(wake_mode)
+
+        # If sessionTarget=current is requested but no binding is available,
+        # fall back to ISOLATED instead of failing creation. Headless cron
+        # callers (no session context) get an isolated run rather than a hard
+        # error.
+        if (
+            session_target == SessionTarget.CURRENT
+            and not session_key
+            and not origin_session_key
+        ):
+            session_target = SessionTarget.ISOLATED
 
         origin_session_key = normalize_origin_session_key(session_target, origin_session_key)
         handler_key, normalized_payload, session_target, session_key = normalize_contract(
@@ -130,6 +205,7 @@ class SchedulerOps:
             schedule_raw=schedule_raw,
             schedule_kind=kind,
             cron_expr=cron_expr,
+            tz=tz,
             handler_key=handler_key,
             payload=normalized_payload,
             session_target=session_target,
@@ -141,13 +217,18 @@ class SchedulerOps:
             delivery=delivery,
             origin_session_key=origin_session_key,
             tool_policy=dict(tool_policy or {}),
+            creator_session_key=creator_session_key or "",
+            creator_sender_id=creator_sender_id or "",
+            creator_is_owner=bool(creator_is_owner),
         )
 
         if kind == ScheduleKind.AT:
             job.delete_after_run = True
             job.next_run_at = datetime.fromisoformat(cron_expr)
         elif kind == ScheduleKind.EVERY and cron_expr.isdigit():
-            # Anchor-based interval: fire after interval_seconds from now
+            # Anchor-based interval: record the anchor so subsequent fires
+            # align to it rather than drifting with each run.
+            job.anchor_at = now
             job.next_run_at = now + timedelta(seconds=int(cron_expr))
         else:
             # CRON or EVERY with cron expression: scan forward
@@ -167,19 +248,37 @@ class SchedulerOps:
         payload_patch = patch.pop("payload", None)
         delivery_was_patched = "delivery" in patch
 
-        if "schedule_raw" in patch:
-            raw = patch.pop("schedule_raw")
-            kind, cron_expr = parse_schedule(raw, reference_now=now_local)
-            job.schedule_raw = raw
+        if "tz" in patch:
+            raw_tz = (patch.pop("tz") or "").strip()
+            validate_tz(raw_tz)
+            job.tz = raw_tz
+
+        structured_kind = patch.pop("schedule_kind", None)
+        structured_value = patch.pop("schedule_value", None)
+        structured_tz = patch.pop("schedule_tz", None)
+        if structured_kind is not None and structured_value is not None:
+            kind, cron_expr = _validate_structured_schedule(structured_kind, structured_value)
+            if structured_tz is not None:
+                raw_tz = (structured_tz or "").strip()
+                validate_tz(raw_tz)
+                job.tz = raw_tz
+            job.schedule_raw = cron_expr
             job.schedule_kind = kind
             job.cron_expr = cron_expr
-            # Recompute next_run
             if kind == ScheduleKind.AT:
+                job.anchor_at = None
                 job.next_run_at = datetime.fromisoformat(cron_expr)
-            elif kind == ScheduleKind.EVERY and cron_expr.isdigit():
+            elif kind == ScheduleKind.EVERY:
+                job.anchor_at = now
                 job.next_run_at = now + timedelta(seconds=int(cron_expr))
             else:
+                job.anchor_at = None
                 job.next_run_at = _next_run(job, now)
+        elif "schedule_raw" in patch:
+            raise ValueError(
+                "ops.update no longer accepts schedule_raw; "
+                "pass schedule_kind + schedule_value instead"
+            )
 
         for field in ("name", "timeout_seconds", "enabled", "origin_session_key"):
             if field in patch:
@@ -263,7 +362,12 @@ class SchedulerOps:
             # Keep existing next_run_at for one-shot jobs
             pass
         elif job.schedule_kind == ScheduleKind.EVERY and job.cron_expr.isdigit():
-            job.next_run_at = now + timedelta(seconds=int(job.cron_expr))
+            # Use anchor-aligned next_run when an anchor exists; otherwise
+            # match the historical "now + interval" behaviour.
+            if job.anchor_at is not None:
+                job.next_run_at = _next_run(job, now)
+            else:
+                job.next_run_at = now + timedelta(seconds=int(job.cron_expr))
         else:
             job.next_run_at = _next_run(job, now)
 

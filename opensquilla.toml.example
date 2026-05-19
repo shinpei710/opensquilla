@@ -259,17 +259,17 @@ enabled = true
 # timeout_seconds = 30.0
 
 [sandbox]
-# Per-command ephemeral sandbox + security grading (see docs/adr/006-sandbox-governance.md).
+# Per-command ephemeral sandbox + security grading.
 #
 #  sandbox           on  -> processes run under namespace/profile isolation
 #                    off -> host execution is allowed (logs a WARNING per run)
 #  security_grading  on  -> action_kind drives the selected SecurityLevel
 #                    off -> a fixed STANDARD policy is used, no approval flow
 #
-# Both default to true. Turning sandbox off while grading stays on is
-# silently coerced to grading=false with a warning.
-sandbox = true
-security_grading = true
+# Both default to false for the out-of-box bypass posture. Turning sandbox off
+# while grading stays on is silently coerced to grading=false with a warning.
+sandbox = false
+security_grading = false
 # default_level = "STANDARD"            # DISABLED | STANDARD | STRICT | LOCKED
 # backend = "auto"                       # auto | bubblewrap | seatbelt | noop
 # allow_legacy_mode = false              # required for default_level = DISABLED
@@ -280,6 +280,13 @@ security_grading = true
 # cpu_seconds = 30
 # memory_mb = 1024
 # wall_seconds = 60
+
+[permissions]
+# Owner/operator default permission mode. The shipped default is "bypass", which
+# runs local/operator tool execution on the host while still blocking sensitive
+# paths. Use `opensquilla sandbox on|bypass|full|reset` to update this together
+# with the sandbox section.
+default_mode = "bypass"                 # off | on | bypass | full
 
 # [auth]
 # mode = "none"         # none | token | password

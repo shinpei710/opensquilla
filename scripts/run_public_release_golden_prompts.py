@@ -89,7 +89,7 @@ async def _main() -> int:
         type=Path,
         default=Path("tests/golden/public_release_open.yaml"),
     )
-    parser.add_argument("--gateway", default="ws://127.0.0.1:18790/ws")
+    parser.add_argument("--gateway", default="ws://127.0.0.1:18791/ws")
     parser.add_argument(
         "--out",
         type=Path,

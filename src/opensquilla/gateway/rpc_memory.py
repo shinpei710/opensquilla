@@ -7,12 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
-from opensquilla.memory.types import MemorySearchOpts, SearchIntent
-from opensquilla.session.keys import normalize_agent_id
-from opensquilla.tools.builtin.memory_tools import (
-    _is_memory_archive_path,
-    _is_memory_source_path,
+from opensquilla.memory.types import (
+    DEFAULT_MEMORY_SEARCH_MIN_SCORE,
+    DEFAULT_MEMORY_SEARCH_RESULTS,
+    MemorySearchOpts,
+    SearchIntent,
+    normalize_memory_search_min_score,
+    normalize_memory_source_filter,
 )
+from opensquilla.session.keys import normalize_agent_id
+from opensquilla.tools.builtin.memory_tools import _is_memory_source_path
 
 _d = get_dispatcher()
 
@@ -52,6 +56,13 @@ def _int_param(
     return number
 
 
+def _bool_param(params: dict[str, Any], name: str, default: bool = False) -> bool:
+    value = params.get(name, default)
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"params.{name} must be a boolean")
+
+
 def _result_to_wire(result: Any) -> dict[str, Any]:
     source = getattr(result, "source", "")
     source_value = getattr(source, "value", source)
@@ -88,7 +99,7 @@ def _memory_source_rows(root: Path) -> list[dict[str, Any]]:
             rel = resolved_file.relative_to(resolved_root).as_posix()
         except ValueError:
             continue
-        if rel in seen or not _is_memory_source_path(rel, allow_archive=False):
+        if rel in seen or not _is_memory_source_path(rel):
             continue
         stat = resolved_file.stat()
         with resolved_file.open("r", encoding="utf-8", errors="replace") as handle:
@@ -103,6 +114,20 @@ def _memory_source_rows(root: Path) -> list[dict[str, Any]]:
             }
         )
     return sorted(rows, key=lambda row: str(row["path"]))
+
+
+async def _manager_status_wire(manager: Any) -> dict[str, Any]:
+    status_fn = getattr(manager, "status", None)
+    if not callable(status_fn):
+        return {}
+    status = await status_fn()
+    return {
+        "fileCount": status.get("file_count"),
+        "chunkCount": status.get("chunk_count"),
+        "sourceCounts": status.get("source_counts", {}),
+        "vecAvailable": bool(status.get("vec_available", False)),
+        "ftsAvailable": bool(status.get("fts_available", False)),
+    }
 
 
 @_d.method("memory.list", scope="operator.read")
@@ -122,14 +147,21 @@ async def _handle_memory_search(params: dict | None, ctx: RpcContext) -> dict[st
     query = str(params.get("query") or "").strip()
     if not query:
         raise ValueError("params.query is required")
-    limit = _int_param(params, "limit", 10, minimum=1, maximum=20)
+    limit = _int_param(params, "limit", DEFAULT_MEMORY_SEARCH_RESULTS, minimum=1, maximum=20)
     try:
-        min_score = float(params.get("minScore", 0.0) or 0.0)
+        min_score = normalize_memory_search_min_score(
+            params.get("minScore", DEFAULT_MEMORY_SEARCH_MIN_SCORE),
+            strict=True,
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError("params.minScore must be a number") from exc
+    try:
+        source = normalize_memory_source_filter(params.get("source", "all"))
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
 
     agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
-    opts = MemorySearchOpts(max_results=limit, min_score=min_score)
+    opts = MemorySearchOpts(max_results=limit, min_score=min_score, source=source)
     results = await manager.search(query, opts, intent=SearchIntent.ADMIN)
     rows = [_result_to_wire(result) for result in results]
     return {"agentId": agent_id, "query": query, "count": len(rows), "results": rows}
@@ -142,13 +174,82 @@ def _memory_root(manager: Any) -> Path:
     return Path(root)
 
 
-def _validate_memory_path(path: str, *, allow_archive: bool) -> None:
+@_d.method("memory.index", scope="operator.admin")
+async def _handle_memory_index(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    params = params or {}
+    agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
+    force = _bool_param(params, "force", False)
+    if force:
+        store = getattr(manager, "store", None)
+        rebuild = getattr(store, "rebuild", None)
+        if not callable(rebuild):
+            raise RpcUnavailableError("Memory store rebuild is not available")
+        await rebuild()
+    sync = getattr(manager, "sync", None)
+    if not callable(sync):
+        raise RpcUnavailableError("Memory manager sync is not available")
+    await sync(reason="manual", force=force)
+    payload: dict[str, Any] = {
+        "agentId": agent_id,
+        "force": force,
+    }
+    payload.update(await _manager_status_wire(manager))
+    return payload
+
+
+def _validate_memory_path(path: str) -> None:
     if not path.strip():
         raise ValueError("params.path is required")
-    if _is_memory_archive_path(path) and not allow_archive:
-        raise ValueError("memory archive is private turn-capture storage")
-    if not _is_memory_source_path(path, allow_archive=allow_archive):
-        raise ValueError("params.path must be MEMORY.md or memory/*.md")
+    if not _is_memory_source_path(path):
+        raise ValueError("params.path must be MEMORY.md or memory/**/*.md")
+
+
+def _raw_fallback_rel_path(path: str) -> str:
+    raw = path.strip()
+    if not raw:
+        raise ValueError("params.path is required")
+    rel = Path(raw)
+    if rel.is_absolute() or any(part in {"", ".", ".."} for part in rel.parts):
+        raise ValueError("path traversal is not allowed")
+    if len(rel.parts) == 1:
+        rel = Path("memory") / ".raw_fallbacks" / rel
+    if len(rel.parts) != 3 or rel.parts[:2] != ("memory", ".raw_fallbacks"):
+        raise ValueError("params.path must be memory/.raw_fallbacks/*.md")
+    if rel.suffix.lower() != ".md" or rel.name.startswith("."):
+        raise ValueError("params.path must be memory/.raw_fallbacks/*.md")
+    return rel.as_posix()
+
+
+def _raw_fallback_reason(path: Path) -> str | None:
+    try:
+        first_line = path.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+    except (IndexError, OSError):
+        return None
+    prefix = "# Raw flush ("
+    suffix = ")"
+    if first_line.startswith(prefix) and first_line.endswith(suffix):
+        return first_line[len(prefix) : -len(suffix)]
+    return None
+
+
+def _raw_fallback_rows(root: Path) -> list[dict[str, Any]]:
+    raw_root = root / "memory" / ".raw_fallbacks"
+    if not raw_root.is_dir():
+        return []
+    rows: list[dict[str, Any]] = []
+    for file_path in sorted(path for path in raw_root.glob("*.md") if path.is_file()):
+        stat = file_path.stat()
+        rows.append(
+            {
+                "path": (Path("memory") / ".raw_fallbacks" / file_path.name).as_posix(),
+                "sizeBytes": stat.st_size,
+                "modifiedAt": datetime.fromtimestamp(stat.st_mtime, tz=UTC).isoformat(),
+                "reason": _raw_fallback_reason(file_path),
+            }
+        )
+    return rows
 
 
 def _read_memory_content(
@@ -206,9 +307,7 @@ async def _handle_memory_show(params: dict | None, ctx: RpcContext) -> dict[str,
     raw_path = str(params.get("path") or "")
     agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
 
-    memory_config = getattr(manager, "memory_config", None)
-    allow_archive = bool(memory_config and getattr(memory_config, "index_captured_turns", False))
-    _validate_memory_path(raw_path, allow_archive=allow_archive)
+    _validate_memory_path(raw_path)
 
     from_line = params.get("fromLine")
     if from_line is not None:
@@ -246,4 +345,62 @@ async def _handle_memory_show(params: dict | None, ctx: RpcContext) -> dict[str,
         "lineCount": selected_line_count,
         "truncated": truncated,
         "content": content,
+    }
+
+
+@_d.method("memory.raw_fallbacks.list", scope="operator.admin")
+async def _handle_raw_fallbacks_list(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    agent_id, manager = _require_memory_manager(ctx, (params or {}).get("agentId"))
+    rows = _raw_fallback_rows(_memory_root(manager).resolve())
+    return {"agentId": agent_id, "count": len(rows), "files": rows}
+
+
+@_d.method("memory.raw_fallbacks.show", scope="operator.admin")
+async def _handle_raw_fallbacks_show(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    raw_path = _raw_fallback_rel_path(str(params.get("path") or ""))
+    agent_id, manager = _require_memory_manager(ctx, params.get("agentId"))
+
+    from_line = params.get("fromLine")
+    if from_line is not None:
+        from_line = _int_param(params, "fromLine", 1, minimum=1, maximum=1_000_000)
+    lines = params.get("lines")
+    if lines is not None:
+        lines = _int_param(params, "lines", 1, minimum=1, maximum=_MAX_MEMORY_SHOW_LINES)
+
+    root = _memory_root(manager).resolve()
+    file_path = (root / raw_path).resolve()
+    raw_root = (root / "memory" / ".raw_fallbacks").resolve()
+    try:
+        file_path.relative_to(raw_root)
+    except ValueError as exc:
+        raise ValueError("path traversal is not allowed") from exc
+    if not file_path.is_file():
+        raise KeyError(f"Raw fallback not found: {raw_path}")
+    if (
+        from_line is None
+        and lines is None
+        and file_path.stat().st_size > _MAX_MEMORY_SHOW_FILE_BYTES
+    ):
+        raise ValueError("raw fallback is too large; request a line slice")
+
+    content, selected_line_count, truncated = _read_memory_content(
+        file_path,
+        from_line=from_line,
+        lines=lines,
+    )
+    return {
+        "agentId": agent_id,
+        "path": raw_path,
+        "fromLine": int(from_line or 1),
+        "lineCount": selected_line_count,
+        "truncated": truncated,
+        "content": content,
+        "reason": _raw_fallback_reason(file_path),
     }

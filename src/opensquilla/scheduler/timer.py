@@ -6,8 +6,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 
-from .jobs import HandlerFn, apply_reserved_result, execute_with_timeout
-from .parser import parse_cron
+from .jobs import HandlerFn, _next_run, apply_reserved_result, execute_with_timeout
 from .persistence import JobStore
 from .stagger import spread_jobs
 from .types import CronJob, JobReservation, JobStatus, ScheduleKind, clear_reservation
@@ -120,20 +119,15 @@ class SchedulerTimer:
                 delay = delays.get(reservation.job.id, 0.0)
                 asyncio.create_task(self._staggered_run(reservation, delay))
 
-        # Step 4: fast-forward remaining (except AT one-shots)
+        # Step 4: fast-forward remaining (except AT one-shots). Delegates to
+        # the shared next-run helper so EVERY+anchor jobs use the interval-grid
+        # ceil math and CRON jobs use the field-matching scan with tz support.
         for job in remaining_jobs:
             if job.schedule_kind == ScheduleKind.AT:
                 # Leave AT jobs as-is — they'll be picked up on next tick
                 continue
-            # Fast-forward to next future time
             try:
-                expr = parse_cron(job.cron_expr)
-                candidate = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-                for _ in range(2_102_400):
-                    if expr.matches(candidate):
-                        job.next_run_at = candidate + timedelta(seconds=job.jitter_seconds)
-                        break
-                    candidate += timedelta(minutes=1)
+                job.next_run_at = _next_run(job, now)
                 job.updated_at = now
                 await self._store.save(job)
                 logger.info("startup_fast_forward id=%s next_run=%s", job.id, job.next_run_at)

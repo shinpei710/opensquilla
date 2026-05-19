@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 
+from opensquilla.session.compaction import CompactionConfig
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionIntent, SessionStatus, SessionSummary, TranscriptEntry
 from opensquilla.session.storage import SessionStorage
@@ -396,6 +397,75 @@ async def test_compact_with_result_returns_source_and_persists(manager):
     assert [summary.summary_text for summary in summaries] == [result.summary]
 
 
+@pytest.mark.asyncio
+async def test_compact_with_result_preserves_tool_metadata_for_boundary_cut(manager):
+    await manager.create("agent:main:main")
+    await manager.append_message("agent:main:main", "user", "old context", token_count=30)
+    await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "calling tool",
+        tool_calls=[{"id": "call_1", "type": "function"}],
+        token_count=4,
+    )
+    await manager.append_message(
+        "agent:main:main",
+        "tool",
+        "tool result",
+        tool_call_id="call_1",
+        token_count=4,
+    )
+    await manager.append_message("agent:main:main", "user", "next question", token_count=3)
+    await manager.append_message("agent:main:main", "assistant", "answer", token_count=3)
+
+    result = await manager.compact_with_result(
+        "agent:main:main",
+        context_window_tokens=50,
+        config=CompactionConfig(safety_margin=1.0),
+    )
+
+    assert result.removed_count == 1
+    assert result.kept_entries[0]["role"] == "assistant"
+    assert result.kept_entries[0]["tool_calls"] == [{"id": "call_1", "type": "function"}]
+    transcript = await manager.get_transcript("agent:main:main")
+    assert transcript[0].role == "assistant"
+    assert transcript[0].tool_calls == [{"id": "call_1", "type": "function"}]
+    assert transcript[1].role == "tool"
+    assert transcript[1].tool_call_id == "call_1"
+
+
+@pytest.mark.asyncio
+async def test_compact_counts_tool_calls_when_token_count_is_underreported(manager):
+    await manager.create("agent:main:main")
+    large_content = "x" * 5000
+    await manager.append_message(
+        "agent:main:main",
+        "assistant",
+        "small visible answer",
+        tool_calls=[
+            {
+                "type": "tool_use",
+                "tool_use_id": "write-stale",
+                "name": "write_file",
+                "input": {"path": "index.html", "content": large_content},
+            }
+        ],
+        token_count=1,
+    )
+
+    result = await manager.compact_with_result(
+        "agent:main:main",
+        context_window_tokens=400,
+        config=CompactionConfig(safety_margin=1.0),
+    )
+
+    assert result.removed_count == 1
+    assert result.summary
+    assert large_content not in result.summary
+    node = await manager._storage.get_session("agent:main:main")
+    assert node.compaction_count == 1
+
+
 def _fail_next_transcript_insert(monkeypatch: pytest.MonkeyPatch, storage: SessionStorage) -> None:
     original_execute = storage.conn.execute
     failed = False
@@ -490,6 +560,31 @@ async def test_persist_compaction_result_stores_summary_out_of_band(manager):
     summaries = await manager._storage.get_all_summaries(node.session_id)
     assert len(summaries) == 1
     assert summaries[0].summary_text == "short summary"
+
+
+@pytest.mark.asyncio
+async def test_persist_compaction_result_without_summary_does_not_rewrite_transcript(manager):
+    node = await manager.create("agent:main:main")
+    for index in range(5):
+        await manager.append_message("agent:main:main", "user", f"msg {index}", token_count=5)
+
+    original_transcript = await manager.get_transcript("agent:main:main")
+    original_node = await manager._storage.get_session("agent:main:main")
+
+    await manager.persist_compaction_result(
+        "agent:main:main",
+        "",
+        [{"role": "assistant", "content": "latest reply"}],
+    )
+
+    assert await manager.get_transcript("agent:main:main") == original_transcript
+    assert await manager.get_summaries("agent:main:main") == []
+    current_node = await manager._storage.get_session("agent:main:main")
+    assert current_node is not None
+    assert original_node is not None
+    assert current_node.session_id == node.session_id
+    assert current_node.compaction_count == original_node.compaction_count
+    assert current_node.updated_at == original_node.updated_at
 
 
 @pytest.mark.asyncio

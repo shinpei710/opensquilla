@@ -37,7 +37,7 @@ class GatewayLifecycleResult:
     pid: int | None = None
     host: str = "127.0.0.1"
     probe_host: str | None = None
-    port: int = 18790
+    port: int = 18791
     managed: bool = False
     code: str | None = None
     message: str = ""
@@ -98,7 +98,7 @@ class GatewayLifecycleManager:
         self,
         *,
         host: str = "127.0.0.1",
-        port: int = 18790,
+        port: int = 18791,
         config_path: str | None = None,
         health_timeout: float = 60.0,
         shutdown_timeout: float = 10.0,

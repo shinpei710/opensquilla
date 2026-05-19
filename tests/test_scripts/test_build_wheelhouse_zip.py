@@ -9,6 +9,8 @@ import tomllib
 from pathlib import Path
 from zipfile import ZipFile
 
+import pytest
+
 SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "build_wheelhouse_zip.py"
 REPO_ROOT = SCRIPT_PATH.parents[1]
 WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "wheelhouse-release.yml"
@@ -103,45 +105,26 @@ def test_python_runtime_asset_name_uses_platform_triple() -> None:
     )
 
 
-def test_pip_platform_tag_maps_target_platforms() -> None:
-    module = load_script()
-
-    assert module.pip_platform_tag("macos-arm64") == "macosx_12_0_arm64"
-    assert module.pip_platform_tag("macos-x64") == "macosx_10_13_x86_64"
-    assert module.pip_platform_tag("windows-x64") == "win_amd64"
-    assert module.pip_platform_tag("linux-x64") == "manylinux2014_x86_64"
-
-
-def test_cross_platform_wheelhouse_uses_pip_download_target(tmp_path: Path) -> None:
+def test_cross_platform_wheelhouse_requires_target_host(tmp_path: Path) -> None:
     module = load_script()
     module.platform_tag = lambda: "linux-x64"
     wheel_path = tmp_path / "opensquilla-0.1.0-py3-none-any.whl"
     package_dir = tmp_path / "packages"
 
-    command = module.build_wheelhouse_command(
-        package_dir,
-        wheel_path,
-        "recommended",
-        target_platform_tag="macos-arm64",
-        python_major=3,
-        python_minor=12,
-    )
-
-    assert command[:4] == [sys.executable, "-m", "pip", "download"]
-    assert "--dest" in command
-    assert str(package_dir) in command
-    assert "--find-links" in command
-    assert "--platform" in command
-    assert "macosx_12_0_arm64" in command
-    assert "--only-binary=:all:" in command
-    assert "--abi" in command
-    assert "cp312" in command
-    assert "abi3" in command
-    assert str(wheel_path) + "[recommended]" in command
+    with pytest.raises(SystemExit, match="must run on the target platform"):
+        module.build_wheelhouse_command(
+            package_dir,
+            wheel_path,
+            "recommended",
+            target_platform_tag="windows-x64",
+            python_major=3,
+            python_minor=12,
+        )
 
 
 def test_portable_recommended_wheelhouse_includes_feishu_extra(tmp_path: Path) -> None:
     module = load_script()
+    module.platform_tag = lambda: "windows-x64"
     wheel_path = tmp_path / "opensquilla-0.1.0-py3-none-any.whl"
     package_dir = tmp_path / "packages"
 
@@ -156,19 +139,6 @@ def test_portable_recommended_wheelhouse_includes_feishu_extra(tmp_path: Path) -
     )
 
     assert str(wheel_path) + "[recommended,feishu]" in command
-
-
-def test_cross_platform_seed_wheel_commands_include_pure_python_sources(tmp_path: Path) -> None:
-    module = load_script()
-    package_dir = tmp_path / "packages"
-
-    commands = module.cross_platform_seed_wheel_commands(package_dir, "recommended")
-
-    assert commands == [
-        [sys.executable, "-m", "pip", "wheel", "--wheel-dir", str(package_dir), "jieba>=0.42"]
-    ]
-    assert module.cross_platform_seed_wheel_commands(package_dir, "core") == []
-
 
 def test_release_wheel_allows_router_provenance_markdown() -> None:
     module = load_script()
@@ -464,17 +434,20 @@ def test_render_readme_is_platform_specific_for_windows_portable() -> None:
     assert "## Windows" in readme
     assert "# OpenSquilla 0.1.0 Portable Release" in readme
     assert "Wheelhouse Release" not in readme
-    assert "Double-click `Start OpenSquilla.cmd`" in readme
+    assert "Right-click `Start OpenSquilla.cmd`" in readme
+    assert "Run as administrator" in readme
+    assert "Smart App Control" in readme
     assert ".\\start.ps1" in readme
     assert "## macOS / Linux" not in readme
     assert "bash start.sh" not in readme
     assert "Python is bundled in this zip." in readme
     assert "Complete onboarding." in readme
-    assert "The recommended portable package includes Feishu websocket support." in readme
+    assert "Feishu" not in readme
     assert "Advanced portable usage" in readme
     assert "OPENROUTER_API_KEY" in readme
     assert "writes an OpenRouter env-reference config" in readme
-    assert "later starts let you review or change the config" in readme
+    assert "supported portable launch\n  path is administrator launch" in readme
+    assert "Microsoft documents that SmartScreen checks downloaded apps" in readme
     assert "skip setup when it is complete" not in readme
     assert "does not install a global `opensquilla` command" in readme
     assert (
@@ -503,7 +476,7 @@ def test_render_readme_is_platform_specific_for_macos_portable() -> None:
     assert ".\\start.ps1" not in readme
     assert "Python is bundled in this zip." in readme
     assert "Complete onboarding." in readme
-    assert "The recommended portable package includes Feishu websocket support." in readme
+    assert "Feishu" not in readme
     assert "later starts let you review or change the config" in readme
     assert "skip setup when it is complete" not in readme
     assert "does not install a global `opensquilla` command" not in readme
@@ -607,6 +580,54 @@ def test_prepare_portable_release_tree_includes_runtime_and_start_scripts(tmp_pa
     assert "install_only_stripped.tar.gz" in manifest
 
 
+def test_prune_portable_runtime_removes_packaging_tools_and_bytecode(
+    tmp_path: Path,
+) -> None:
+    module = load_script()
+    runtime_root = tmp_path / "runtime"
+    site_packages = runtime_root / "Lib" / "site-packages"
+    long_license_path = (
+        site_packages
+        / "pip-26.0.1.dist-info"
+        / "licenses"
+        / "src"
+        / "pip"
+        / "_vendor"
+        / "dependency_groups"
+    )
+    long_license_path.mkdir(parents=True)
+    (long_license_path / "LICENSE.txt").write_text("license\n", encoding="utf-8")
+    for name in ("pip", "setuptools", "wheel", "_distutils_hack", "pkg_resources"):
+        package = site_packages / name
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("", encoding="utf-8")
+    for name in ("setuptools-80.0.0.dist-info", "wheel-0.45.0.dist-info"):
+        dist_info = site_packages / name
+        dist_info.mkdir(parents=True)
+        (dist_info / "METADATA").write_text("Name: test\n", encoding="utf-8")
+    (site_packages / "opensquilla_runtime_dep").mkdir(parents=True)
+    (site_packages / "opensquilla_runtime_dep" / "__init__.py").write_text(
+        "VALUE = 1\n",
+        encoding="utf-8",
+    )
+    pycache = runtime_root / "Lib" / "__pycache__"
+    pycache.mkdir(parents=True)
+    (pycache / "module.cpython-312.pyc").write_bytes(b"cache")
+
+    module.prune_portable_runtime(runtime_root)
+
+    assert not (site_packages / "pip").exists()
+    assert not (site_packages / "pip-26.0.1.dist-info").exists()
+    assert not (site_packages / "setuptools").exists()
+    assert not (site_packages / "setuptools-80.0.0.dist-info").exists()
+    assert not (site_packages / "wheel").exists()
+    assert not (site_packages / "wheel-0.45.0.dist-info").exists()
+    assert not (site_packages / "_distutils_hack").exists()
+    assert not (site_packages / "pkg_resources").exists()
+    assert not pycache.exists()
+    assert (site_packages / "opensquilla_runtime_dep" / "__init__.py").is_file()
+
+
 def test_prepare_windows_portable_release_tree_includes_double_click_launcher(
     tmp_path: Path,
 ) -> None:
@@ -646,11 +667,24 @@ def test_prepare_windows_portable_release_tree_includes_double_click_launcher(
     assert "function global:opensquilla" in shell_text
     assert "opensquilla.cmd" in shell_text
     readme = (release_root / "README.md").read_text(encoding="utf-8")
-    assert "Double-click `Start OpenSquilla.cmd`" in readme
-    assert "double-click\n`OpenSquilla Shell.cmd`" in readme
+    assert "Right-click `Start OpenSquilla.cmd`" in readme
+    assert "Run as administrator" in readme
+    assert "Smart App Control" in readme
+    assert "run\n`OpenSquilla Shell.cmd`" in readme
     assert ".\\opensquilla.cmd onboard" in readme
-    assert "Closing the terminal stops the gateway." in readme
+    assert "Closing it stops the gateway." in readme
     assert "Advanced portable usage" in readme
+    start_ps1 = (release_root / "start.ps1").read_text(encoding="utf-8")
+    assert "Test-WindowsVCRedistInstalled" in start_ps1
+    assert "RuntimeInformation]::IsOSPlatform" in start_ps1
+    assert "$RequiresRouterRuntime = $true" in start_ps1
+    assert '"opensquilla[recommended,feishu]" -notmatch' not in start_ps1
+    assert "OPENSQUILLA_SKIP_VC_REDIST" in start_ps1
+    assert "Microsoft.VCRedist.2015+.x64" in start_ps1
+    assert "https://aka.ms/vs/17/release/vc_redist.x64.exe" in start_ps1
+    assert "safe router fallback" in start_ps1
+    assert "If automatic installation fails, install it manually" in start_ps1
+    assert "After installing, reopen PowerShell and restart OpenSquilla" in start_ps1
 
 
 def test_install_portable_wheelhouse_preinstalls_into_bundled_python(
@@ -762,22 +796,41 @@ def test_write_sha256s_records_all_release_zips(tmp_path: Path) -> None:
     assert checksum_path.read_text(encoding="utf-8").splitlines() == expected
 
 
-def test_release_workflow_publishes_only_windows_portable_zip() -> None:
+def test_release_workflow_publishes_windows_portable_zip_and_wheel() -> None:
     workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
 
+    assert "concurrency:" in workflow
+    assert "windows-release-assets-${{" in workflow
+    assert "cancel-in-progress: false" in workflow
+    assert "timeout-minutes: 90" in workflow
+    assert "timeout-minutes: 20" in workflow
+    assert "Validate workflow inputs" in workflow
+    assert "python_runtime_release must be a YYYYMMDD" in workflow
+    assert "python_runtime_version must be a CPython 3.12 patch version" in workflow
+    assert "persist-credentials: false" in workflow
     assert "bundle_python_runtime:" not in workflow
-    assert "platform_tag: windows-x64" in workflow
+    assert "--platform-tag windows-x64" in workflow
     assert "platform_tag: macos-arm64" not in workflow
     assert "platform_tag: linux-x64" not in workflow
     assert "for mode in portable wheelhouse" not in workflow
     assert "--bundle-python-runtime" in workflow
-    assert "expected one portable zip" in workflow
-    assert "expected one Windows portable zip" in workflow
+    assert "expected one versioned portable zip" in workflow
+    assert "expected one versioned wheel" in workflow
     assert "manifest[\"portable\"] is True" in workflow
     assert "SHA256SUMS" in workflow
     assert "manifest.version" in workflow
     assert "GH_REPO: ${{ github.repository }}" in workflow
-    assert "dist/*.zip dist/*.zip.sha256 dist/SHA256SUMS" in workflow
+    assert "OpenSquilla-windows-x64-portable.zip" in workflow
+    assert "opensquilla-latest-py3-none-any.whl" in workflow
+    assert "dist/*.zip dist/*.whl dist/SHA256SUMS" in workflow
+    assert "dist/*.zip dist/*.zip.sha256 dist/SHA256SUMS" not in workflow
+    assert "Git LFS pointer leaked into wheel" in workflow
+    assert "Verify GitHub Release assets" in workflow
+    assert "release\", \"delete-asset\", tag, name, \"--yes\"" in workflow
+    assert "name.endswith(\".sha256\")" in workflow
+    assert '["gh", "release", "view", tag, "--json", "assets"]' in workflow
+    assert "Unexpected GitHub Release assets" in workflow
+    assert "\"unexpected\": unexpected" in workflow
     assert "zip_path.stem" not in workflow
     assert "archive_roots =" in workflow
     assert "root = archive_roots[0] + \"/\"" in workflow

@@ -15,12 +15,46 @@ from opensquilla.channels.transports import InboundEventEnvelope
 
 
 class _Builder:
+    instances: list[_Builder] = []
+
+    def __init__(self) -> None:
+        self.registered: dict[str, Callable[[Any], None]] = {}
+        _Builder.instances.append(self)
+
     def register_p2_im_message_receive_v1(self, callback: Callable[[Any], None]) -> _Builder:
         self.message_callback = callback
+        self.registered["im.message.receive_v1"] = callback
         return self
 
     def register_p2_im_message_message_read_v1(self, callback: Callable[[Any], None]) -> _Builder:
         self.read_callback = callback
+        self.registered["im.message.message_read_v1"] = callback
+        return self
+
+    def register_p2_im_chat_member_bot_added_v1(self, callback: Callable[[Any], None]) -> _Builder:
+        self.registered["im.chat.member.bot.added_v1"] = callback
+        return self
+
+    def register_p2_im_chat_member_bot_deleted_v1(
+        self, callback: Callable[[Any], None]
+    ) -> _Builder:
+        self.registered["im.chat.member.bot.deleted_v1"] = callback
+        return self
+
+    def register_p2_im_message_reaction_created_v1(
+        self, callback: Callable[[Any], None]
+    ) -> _Builder:
+        self.registered["im.message.reaction.created_v1"] = callback
+        return self
+
+    def register_p2_im_message_reaction_deleted_v1(
+        self, callback: Callable[[Any], None]
+    ) -> _Builder:
+        self.registered["im.message.reaction.deleted_v1"] = callback
+        return self
+
+    def register_p2_card_action_trigger(self, callback: Callable[[Any], None]) -> _Builder:
+        self.registered["card.action.trigger"] = callback
         return self
 
     def build(self) -> object:
@@ -31,6 +65,7 @@ def _install_fake_lark_module(monkeypatch: pytest.MonkeyPatch) -> tuple[types.Mo
     sdk_module = types.ModuleType("_fake_lark_ws_client")
     sdk_module.loop = None
     sys.modules[sdk_module.__name__] = sdk_module
+    _Builder.instances.clear()
 
     async def _select_forever() -> None:
         while True:
@@ -101,6 +136,53 @@ async def test_feishu_websocket_stop_stops_sdk_loop_thread(
 
     assert client.disconnect_called is True
     assert transport._thread is None
+
+
+@pytest.mark.asyncio
+async def test_feishu_websocket_registers_supported_non_message_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_lark_module(monkeypatch)
+    transport = FeishuWebSocketTransport(
+        FeishuChannelConfig(app_id="app", app_secret="secret", connection_mode="websocket")
+    )
+
+    await transport.start(_noop_handler)
+    await transport.stop()
+
+    assert _Builder.instances
+    assert set(_Builder.instances[-1].registered) == {
+        "im.message.receive_v1",
+        "im.message.message_read_v1",
+        "im.chat.member.bot.added_v1",
+        "im.chat.member.bot.deleted_v1",
+        "im.message.reaction.created_v1",
+        "im.message.reaction.deleted_v1",
+        "card.action.trigger",
+    }
+
+
+@pytest.mark.asyncio
+async def test_feishu_websocket_rejects_second_concurrent_sdk_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_lark_module(monkeypatch)
+    first = FeishuWebSocketTransport(
+        FeishuChannelConfig(app_id="app-1", app_secret="secret", connection_mode="websocket")
+    )
+    second = FeishuWebSocketTransport(
+        FeishuChannelConfig(app_id="app-2", app_secret="secret", connection_mode="websocket")
+    )
+
+    await first.start(_noop_handler)
+    try:
+        with pytest.raises(RuntimeError, match="only one Feishu websocket"):
+            await second.start(_noop_handler)
+    finally:
+        await first.stop()
+
+    await second.start(_noop_handler)
+    await second.stop()
 
 
 class _FakeTransport:
@@ -175,3 +257,63 @@ async def test_feishu_websocket_dedupes_replayed_message_event() -> None:
 
     assert channel._queue.qsize() == 1
     assert (await channel.receive()).content == "draw an image"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event_type,raw_event",
+    [
+        (
+            "im.chat.member.bot.added_v1",
+            {"event": {"chat_id": "oc_chat", "operator_id": {"open_id": "ou_user"}}},
+        ),
+        (
+            "im.chat.member.bot.deleted_v1",
+            {"event": {"chat_id": "oc_chat", "operator_id": {"open_id": "ou_user"}}},
+        ),
+        (
+            "im.message.reaction.created_v1",
+            {
+                "event": {
+                    "message_id": "om_1",
+                    "operator_type": "user",
+                    "user_id": {"open_id": "ou_user"},
+                    "reaction_type": {"emoji_type": "OK"},
+                }
+            },
+        ),
+        (
+            "im.message.reaction.deleted_v1",
+            {
+                "event": {
+                    "message_id": "om_1",
+                    "operator_type": "user",
+                    "user_id": {"open_id": "ou_user"},
+                    "reaction_type": {"emoji_type": "OK"},
+                }
+            },
+        ),
+        (
+            "card.action.trigger",
+            {"event": {"open_id": "ou_user", "action": {"value": {"action": "noop"}}}},
+        ),
+    ],
+)
+async def test_feishu_non_message_events_do_not_start_agent_turns(
+    event_type: str,
+    raw_event: dict[str, Any],
+) -> None:
+    channel = FeishuChannel(
+        FeishuChannelConfig(app_id="app", app_secret="secret", connection_mode="websocket")
+    )
+    envelope = InboundEventEnvelope(
+        source="feishu:websocket",
+        event_id=f"evt-{event_type}",
+        event_type=event_type,
+        raw={"header": {"event_id": f"evt-{event_type}", "event_type": event_type}, **raw_event},
+        received_at=datetime.now(UTC),
+    )
+
+    await channel._handle_inbound_event(envelope)
+
+    assert channel._queue.qsize() == 0

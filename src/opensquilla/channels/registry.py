@@ -21,6 +21,11 @@ log = structlog.get_logger(__name__)
 
 _COMMON_ENTRY_FIELDS = frozenset({"name", "type", "enabled", "agent_id"})
 _INTERNAL = frozenset({"manager", "registry", "transports", "types"})
+# Adapters that exist on disk but are intentionally hidden from
+# auto-discovery. The implementation is kept for future first-class
+# promotion; until then the runtime does not advertise them and there is
+# no packaging extra installable for their third-party SDK.
+_HIDDEN = frozenset({"msteams"})
 _PLAIN_TEXT_MARKDOWN_HINT = (
     "This channel renders Markdown markers as literal text. Reply in plain text: "
     "avoid Markdown headings, bold/italic markers, tables, and fenced code unless "
@@ -55,7 +60,10 @@ def discover_channel_names() -> list[str]:
     return [
         name
         for _, name, ispkg in pkgutil.iter_modules(pkg.__path__)
-        if not ispkg and not name.startswith("_") and name not in _INTERNAL
+        if not ispkg
+        and not name.startswith("_")
+        and name not in _INTERNAL
+        and name not in _HIDDEN
     ]
 
 

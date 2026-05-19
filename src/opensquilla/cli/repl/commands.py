@@ -16,7 +16,10 @@ from dataclasses import dataclass
 from rich.markup import escape
 from rich.table import Table
 
+from opensquilla.cli.ui import ACCENT_HEADER
 from opensquilla.engine.commands import DEFAULT_REGISTRY, CommandDef, Surface
+
+DEFAULT_SURFACE = Surface.CLI_GATEWAY
 
 
 @dataclass(frozen=True)
@@ -47,9 +50,11 @@ def _to_shim(cmd: CommandDef) -> SlashCommand:
     )
 
 
-REGISTRY: tuple[SlashCommand, ...] = tuple(
-    _to_shim(cmd) for cmd in DEFAULT_REGISTRY.for_surface(Surface.TUI)
-)
+def registry_for_surface(surface: Surface | str = DEFAULT_SURFACE) -> tuple[SlashCommand, ...]:
+    return tuple(_to_shim(cmd) for cmd in DEFAULT_REGISTRY.for_surface(surface))
+
+
+REGISTRY: tuple[SlashCommand, ...] = registry_for_surface(DEFAULT_SURFACE)
 
 
 # Bare-string exit aliases that the user can type without a leading slash.
@@ -59,44 +64,44 @@ REGISTRY: tuple[SlashCommand, ...] = tuple(
 _BARE_EXIT_WORDS: frozenset[str] = frozenset({":q", "quit", "exit"})
 
 
-def slash_words() -> list[str]:
+def slash_words(surface: Surface | str = DEFAULT_SURFACE) -> list[str]:
     """Return all words offered by prompt-toolkit completion.
 
     Includes canonical names, slash-prefixed aliases, and the bare exit
     words (``:q`` / ``quit`` / ``exit``) so the user can complete them
     even though they bypass the slash-command registry.
     """
-    words: list[str] = [word for command in REGISTRY for word in command.words]
+    words: list[str] = [word for command in registry_for_surface(surface) for word in command.words]
     words.extend(_BARE_EXIT_WORDS)
     return words
 
 
-def is_exit_command(value: str) -> bool:
+def is_exit_command(value: str, surface: Surface | str = DEFAULT_SURFACE) -> bool:
     head = value.strip().lower()
     if not head:
         return False
     if head in _BARE_EXIT_WORDS:
         return True
-    cmd = DEFAULT_REGISTRY.find(head, surface=Surface.TUI)
+    cmd = DEFAULT_REGISTRY.find(head, surface=surface)
     return cmd is not None and cmd.name == "/exit"
 
 
-def find_command(value: str) -> SlashCommand | None:
+def find_command(value: str, surface: Surface | str = DEFAULT_SURFACE) -> SlashCommand | None:
     head = value.strip().split(maxsplit=1)[0].lower() if value.strip() else ""
     if not head:
         return None
     if head in _BARE_EXIT_WORDS:
-        cmd = DEFAULT_REGISTRY.find("/exit", surface=Surface.TUI)
+        cmd = DEFAULT_REGISTRY.find("/exit", surface=surface)
         return _to_shim(cmd) if cmd is not None else None
-    cmd = DEFAULT_REGISTRY.find(head, surface=Surface.TUI)
+    cmd = DEFAULT_REGISTRY.find(head, surface=surface)
     return _to_shim(cmd) if cmd is not None else None
 
 
-def render_help_table() -> Table:
-    table = Table(title="OpenSquilla Chat Commands", show_header=True, header_style="bold cyan")
+def render_help_table(surface: Surface | str = DEFAULT_SURFACE) -> Table:
+    table = Table(title="OpenSquilla Chat Commands", show_header=True, header_style=ACCENT_HEADER)
     table.add_column("Command", style="bold")
     table.add_column("Description")
-    for command in REGISTRY:
+    for command in registry_for_surface(surface):
         cell = command.usage
         if command.aliases:
             cell += f"  (alias: {', '.join(command.aliases)})"

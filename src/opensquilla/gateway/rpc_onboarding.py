@@ -91,6 +91,7 @@ def _sync_image_generation(config: Any) -> None:
     configure_image_generation(
         getattr(config, "image_generation", None),
         llm_config=getattr(config, "llm", None),
+        squilla_router_config=getattr(config, "squilla_router", None),
     )
 
 

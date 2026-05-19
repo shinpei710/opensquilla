@@ -8,9 +8,8 @@ Starlette request body into a ``botbuilder.schema.Activity`` first
 ``parse_request`` helper rejects raw Starlette ``Request`` objects.
 
 Outbound proactive sends use ``BotFrameworkAdapter.continue_conversation``
-keyed off persisted ``ConversationReference`` records (cached on disk
-under ``<workspace>/state/msteams/conversations.json`` with a
-``schema_version`` and auto-rebuild on mismatch).
+keyed off persisted ``ConversationReference`` records cached in gateway state
+with a ``schema_version`` and auto-rebuild on mismatch.
 
 Streaming edits use ``TurnContext.update_activity``; if the channel
 reports the operation as unsupported, the adapter falls back to
@@ -36,6 +35,13 @@ from starlette.responses import Response
 from starlette.routing import Route
 
 from opensquilla.channels._util import ChannelAccessPolicy, EventDedupeCache
+from opensquilla.channels.contract import (
+    ChannelCapabilityProfile,
+    ChannelPlatformCapability,
+    ChannelPlatformCapabilityStatus,
+    ChannelPlatformCategories,
+    ChannelPlatformManifest,
+)
 from opensquilla.channels.types import (
     ChannelHealth,
     IncomingMessage,
@@ -119,6 +125,48 @@ class MSTeamsChannel:
         init=False,
         repr=False,
     )
+
+    @property
+    def capability_profile(self) -> ChannelCapabilityProfile:
+        return ChannelCapabilityProfile(
+            channel_type="msteams",
+            group_chat=True,
+            mentions=True,
+            reply=True,
+            edit=True,
+            delete=True,
+            transports=("webhook",),
+            notes=(
+                "Bot Framework attachments/cards exist, but this adapter currently "
+                "exposes text activity sends only.",
+            ),
+        )
+
+    @property
+    def platform_capability_manifest(self) -> ChannelPlatformManifest:
+        return ChannelPlatformManifest.from_channel_profile(
+            self.capability_profile,
+        ).with_capabilities(
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.FILES,
+                status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
+                tools=("FileConsentCard", "Microsoft Graph file attachments"),
+                notes=(
+                    "Teams supports file flows, but this adapter does not yet implement "
+                    "FileConsentCard or Graph-backed file delivery.",
+                ),
+            ),
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.ATTACHMENTS,
+                status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
+                tools=("Bot Framework attachments",),
+                notes=("Inbound Teams attachment resolution is not implemented in this adapter.",),
+            ),
+        )
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self.capability_profile.capability_tags()
 
     # ------------------------------------------------------------------
     # Lifecycle

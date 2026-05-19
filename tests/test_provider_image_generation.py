@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import base64
+import json
+from types import SimpleNamespace
+
 import pytest
 
 from opensquilla.provider.image_generation import (
@@ -8,6 +12,23 @@ from opensquilla.provider.image_generation import (
     OpenRouterImageGenerationProvider,
     get_image_generation_provider,
 )
+
+
+def _clear_vision_provider_env(monkeypatch) -> None:
+    for name in (
+        "OPENSQUILLA_VISION_PROVIDER",
+        "OPENSQUILLA_VISION_MODEL",
+        "OPENSQUILLA_LLM_PROVIDER",
+        "OPENSQUILLA_LLM_MODEL",
+        "OPENSQUILLA_LLM_PROXY",
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_BASE_URL",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+    ):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.mark.asyncio
@@ -121,9 +142,10 @@ async def test_image_generate_auto_publishes_generated_image_artifact_for_surfac
     assert result["path"].endswith("Elephant.png")
     assert result["artifact"]["name"] == "Elephant.png"
     assert result["artifact"]["mime"] == "image/png"
-    assert result["artifact"]["delivered_to_user"] is True
+    assert result["artifact"]["registered_for_delivery"] is True
+    assert result["artifact"]["delivery_managed_by_surface"] is True
     assert "download_url" not in result["artifact"]
-    assert "already published" in result["note"]
+    assert "registered for the current chat surface" in result["note"]
     assert "Do not call publish_artifact" in result["note"]
     assert len(ctx.published_artifacts) == 1
     published = ctx.published_artifacts[0]
@@ -179,6 +201,42 @@ async def test_image_generate_does_not_auto_publish_artifact_for_subagent(
     assert ctx.published_artifacts == []
 
 
+@pytest.mark.asyncio
+async def test_image_generate_rejects_foreign_posix_filename_on_windows(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.gateway.config import ImageGenerationConfig
+    from opensquilla.tools.builtin import media
+    from opensquilla.tools.types import CallerKind, ToolContext, ToolError, current_tool_context
+
+    monkeypatch.setattr(media.os, "name", "nt")
+    config = ImageGenerationConfig(
+        enabled=True,
+        primary="openrouter/google/gemini-3.1-flash-image-preview",
+    )
+    config.providers.openrouter.api_key = "sk-or-test"
+    media.configure_image_generation(config)
+
+    ctx = ToolContext(
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path / "workspace"),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:web:test",
+    )
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(ToolError, match="foreign_host_path"):
+            await media.image_generate(
+                prompt="draw an elephant",
+                filename="/Users/a1/Desktop/Elephant.png",
+            )
+    finally:
+        current_tool_context.reset(token)
+        media.configure_image_generation(None)
+
+
 def test_image_generation_reuses_llm_key_only_after_capability_is_enabled(monkeypatch) -> None:
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -210,6 +268,286 @@ def test_image_generation_reuses_llm_key_only_after_capability_is_enabled(monkey
 
     image_config.enabled = True
     assert image_generation_available()
+
+
+def test_vision_provider_uses_configured_router_image_tier(monkeypatch) -> None:
+    _clear_vision_provider_env(monkeypatch)
+
+    from opensquilla.gateway.config import (
+        ImageGenerationConfig,
+        LlmProviderConfig,
+        SquillaRouterConfig,
+    )
+    from opensquilla.tools.builtin import media
+
+    llm_config = LlmProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-flash",
+        api_key="sk-or-configured",
+        base_url="https://router.example/v1",
+        proxy="http://proxy.example",
+        provider_routing={"moonshotai/kimi-k2.6": "preferred-upstream"},
+    )
+    router_config = SquillaRouterConfig(
+        tiers={
+            "t1": {
+                "provider": "openrouter",
+                "model": "deepseek/deepseek-v4-flash",
+                "supports_image": False,
+            },
+            "image_model": {
+                "provider": "openrouter",
+                "model": "moonshotai/kimi-k2.6",
+                "supports_image": True,
+                "image_only": True,
+            },
+        }
+    )
+
+    media.configure_image_generation(
+        ImageGenerationConfig(),
+        llm_config=llm_config,
+        squilla_router_config=router_config,
+    )
+    try:
+        cfg = media._resolve_vision_provider_config(default_model="openai/gpt-4o-mini")
+    finally:
+        media.configure_image_generation(None)
+
+    assert cfg.provider == "openrouter"
+    assert cfg.model == "moonshotai/kimi-k2.6"
+    assert cfg.api_key == "sk-or-configured"
+    assert cfg.base_url == "https://router.example/v1"
+    assert cfg.proxy == "http://proxy.example"
+    assert cfg.provider_routing == {"moonshotai/kimi-k2.6": "preferred-upstream"}
+
+
+def test_vision_provider_env_override_wins_over_router_image_tier(monkeypatch) -> None:
+    _clear_vision_provider_env(monkeypatch)
+    monkeypatch.setenv("OPENSQUILLA_VISION_PROVIDER", "anthropic")
+    monkeypatch.setenv("OPENSQUILLA_VISION_MODEL", "claude-3-5-sonnet-latest")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-configured")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://anthropic.example")
+
+    from opensquilla.gateway.config import (
+        ImageGenerationConfig,
+        LlmProviderConfig,
+        SquillaRouterConfig,
+    )
+    from opensquilla.tools.builtin import media
+
+    media.configure_image_generation(
+        ImageGenerationConfig(),
+        llm_config=LlmProviderConfig(provider="openrouter", api_key="sk-or-configured"),
+        squilla_router_config=SquillaRouterConfig(),
+    )
+    try:
+        cfg = media._resolve_vision_provider_config(default_model="openai/gpt-4o-mini")
+    finally:
+        media.configure_image_generation(None)
+
+    assert cfg.provider == "anthropic"
+    assert cfg.model == "claude-3-5-sonnet-latest"
+    assert cfg.api_key == "sk-ant-configured"
+    assert cfg.base_url == "https://anthropic.example"
+
+
+def test_image_analysis_tool_timeout_exceeds_provider_request_timeout() -> None:
+    from opensquilla.provider.types import ChatConfig
+    from opensquilla.tools.registry import get_default_registry
+
+    registered = get_default_registry().get("image")
+
+    assert registered is not None
+    assert registered.spec.execution_timeout_seconds is not None
+    assert registered.spec.execution_timeout_seconds > ChatConfig().timeout
+
+
+@pytest.mark.asyncio
+async def test_image_tool_uses_configured_router_vision_provider_for_local_file(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    _clear_vision_provider_env(monkeypatch)
+
+    from opensquilla.gateway.config import (
+        ImageGenerationConfig,
+        LlmProviderConfig,
+        SquillaRouterConfig,
+    )
+    from opensquilla.provider.types import ContentBlockImage, ContentBlockText, Message
+    from opensquilla.tools.builtin import media
+
+    llm_config = LlmProviderConfig(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-flash",
+        api_key="sk-or-configured",
+    )
+    router_config = SquillaRouterConfig(
+        tiers={
+            "image_model": {
+                "provider": "openrouter",
+                "model": "moonshotai/kimi-k2.6",
+                "supports_image": True,
+                "image_only": True,
+            }
+        }
+    )
+    media.configure_image_generation(
+        ImageGenerationConfig(),
+        llm_config=llm_config,
+        squilla_router_config=router_config,
+    )
+    png_path = tmp_path / "generated-image.png"
+    png_path.write_bytes(
+        base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg=="
+        )
+    )
+    captured: dict[str, object] = {}
+
+    class FakeProvider:
+        async def chat(self, *, messages, config=None):
+            captured["messages"] = messages
+            yield SimpleNamespace(text="a generated image")
+
+    class FakeSelector:
+        def __init__(self, selector_config):
+            captured["primary"] = selector_config.primary
+
+        def resolve(self):
+            return FakeProvider()
+
+    monkeypatch.setattr("opensquilla.provider.selector.ModelSelector", FakeSelector)
+
+    try:
+        result = await media.image(str(png_path), prompt="Describe this image")
+    finally:
+        media.configure_image_generation(None)
+
+    payload = json.loads(result)
+    assert payload["description"] == "a generated image"
+    assert payload["model"] == "provider"
+    assert captured["primary"].model == "moonshotai/kimi-k2.6"
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    message = messages[0]
+    assert isinstance(message, Message)
+    assert isinstance(message.content[0], ContentBlockImage)
+    assert message.content[0].media_type == "image/png"
+    assert isinstance(message.content[1], ContentBlockText)
+    assert message.content[1].text == "Describe this image"
+
+
+@pytest.mark.asyncio
+async def test_vision_provider_sends_provider_native_multimodal_message(monkeypatch) -> None:
+    _clear_vision_provider_env(monkeypatch)
+
+    from opensquilla.provider.types import ContentBlockImage, ContentBlockText, Message
+    from opensquilla.tools.builtin import media
+
+    media.configure_image_generation(None)
+    captured: dict[str, object] = {}
+
+    class FakeProvider:
+        async def chat(self, *, messages, config=None):
+            captured["messages"] = messages
+            captured["config"] = config
+            yield SimpleNamespace(text="described")
+
+    class FakeSelector:
+        def __init__(self, selector_config):
+            captured["primary"] = selector_config.primary
+
+        def resolve(self):
+            return FakeProvider()
+
+    monkeypatch.setattr("opensquilla.provider.selector.ModelSelector", FakeSelector)
+
+    result = await media._call_vision_provider(
+        b64_data="aW1hZ2UtYnl0ZXM=",
+        media_type="image/png",
+        prompt="What is in this image?",
+    )
+
+    assert result == "described"
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    assert len(messages) == 1
+    message = messages[0]
+    assert isinstance(message, Message)
+    assert message.role == "user"
+    assert isinstance(message.content[0], ContentBlockImage)
+    assert message.content[0].media_type == "image/png"
+    assert message.content[0].data == "aW1hZ2UtYnl0ZXM="
+    assert isinstance(message.content[1], ContentBlockText)
+    assert message.content[1].text == "What is in this image?"
+
+
+@pytest.mark.asyncio
+async def test_vision_provider_error_event_is_not_empty_success(monkeypatch) -> None:
+    _clear_vision_provider_env(monkeypatch)
+
+    from opensquilla.provider.types import ErrorEvent
+    from opensquilla.tools.builtin import media
+
+    media.configure_image_generation(None)
+
+    class FakeProvider:
+        async def chat(self, *, messages, config=None):
+            yield ErrorEvent(message="Request timed out", code="timeout")
+
+    class FakeSelector:
+        def __init__(self, selector_config):
+            return None
+
+        def resolve(self):
+            return FakeProvider()
+
+    monkeypatch.setattr("opensquilla.provider.selector.ModelSelector", FakeSelector)
+
+    with pytest.raises(RuntimeError, match="Provider stream error.*timeout"):
+        await media._call_vision_provider(
+            b64_data="aW1hZ2UtYnl0ZXM=",
+            media_type="image/png",
+            prompt="What is in this image?",
+        )
+
+
+@pytest.mark.asyncio
+async def test_text_media_llm_uses_provider_native_message(monkeypatch) -> None:
+    _clear_vision_provider_env(monkeypatch)
+
+    from opensquilla.provider.types import Message
+    from opensquilla.tools.builtin import media
+
+    captured: dict[str, object] = {}
+
+    class FakeProvider:
+        async def chat(self, *, messages, config=None):
+            captured["messages"] = messages
+            captured["config"] = config
+            yield SimpleNamespace(text="analyzed")
+
+    class FakeSelector:
+        def __init__(self, selector_config):
+            captured["primary"] = selector_config.primary
+
+        def resolve(self):
+            return FakeProvider()
+
+    monkeypatch.setattr("opensquilla.provider.selector.ModelSelector", FakeSelector)
+
+    result = await media._call_llm_with_text("Extracted text", "Analyze this")
+
+    assert result == "analyzed"
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    assert len(messages) == 1
+    message = messages[0]
+    assert isinstance(message, Message)
+    assert message.role == "user"
+    assert message.content == "Analyze this\n\n---\nExtracted text"
 
 
 def test_image_generation_uses_provider_specific_api_key(monkeypatch) -> None:

@@ -8,6 +8,7 @@ import logging
 import os
 import secrets
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -38,11 +39,18 @@ from opensquilla.gateway.app import create_gateway_app
 from opensquilla.gateway.config import GatewayConfig, is_public_bind
 from opensquilla.gateway.llm_runtime import resolve_llm_runtime_config
 from opensquilla.gateway.rpc import get_dispatcher
+from opensquilla.gateway.session_events import build_sessions_changed_payload
+from opensquilla.gateway.session_lifecycle import (
+    TaskLifecycleEvent,
+    apply_task_lifecycle_to_session,
+    session_status_for_task_status,
+)
 from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.gateway.websocket import get_registry
 from opensquilla.paths import default_opensquilla_home
-from opensquilla.session.terminal_reply import build_terminal_reply
+from opensquilla.permissions import configured_default_elevated
+from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 
 log = structlog.get_logger(__name__)
 
@@ -60,6 +68,21 @@ _LOG_LEVELS = {
     "TRACE": logging.DEBUG,
     "NOTSET": logging.NOTSET,
 }
+
+
+class TaskRuntimeStreamError(RuntimeError):
+    """Terminal error raised after a turn stream emits an error event."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        terminal_reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.terminal_reason = terminal_reason
 
 
 # fmt: off
@@ -83,9 +106,17 @@ def _make_channel_rpc_context_factory(svc: ServiceContainer, config: GatewayConf
 # fmt: on
 
 
-def _interval_h_to_schedule_raw(interval_h: int) -> str:
-    """Render an interval schedule accepted by the scheduler parser."""
-    return f"every {interval_h}h"
+def _interval_h_to_schedule(interval_h: int) -> tuple[Any, str]:
+    """Map an hour interval to a structured (kind, value) schedule pair.
+
+    Aligns to a clean cron expression when 24 divides evenly; otherwise falls
+    back to a raw interval-in-seconds for the EVERY kind.
+    """
+    from opensquilla.scheduler.types import ScheduleKind
+
+    if interval_h > 0 and 24 % interval_h == 0:
+        return ScheduleKind.CRON, f"0 */{interval_h} * * *"
+    return ScheduleKind.EVERY, str(interval_h * 3600)
 
 
 async def _list_scheduler_jobs(scheduler: Any) -> list[Any]:
@@ -111,12 +142,12 @@ async def _register_dream_crons(
     """Register a `memory_dream` cron per agent when enabled.
 
     Respects the ``OPENSQUILLA_MEMORY_DREAM_DISABLED=1`` kill switch.
-    Prefers ``memory_config.dream.cron`` if set, else derives
-    ``every Nh`` from ``interval_h``.
+    Prefers ``memory_config.dream.cron`` if set, else derives a structured
+    ``(kind, value)`` pair from ``interval_h``.
     """
     import os
 
-    from opensquilla.scheduler.types import SessionTarget
+    from opensquilla.scheduler.types import ScheduleKind, SessionTarget
 
     dream_cfg = getattr(memory_config, "dream", None)
     existing_jobs = await _list_scheduler_jobs(scheduler)
@@ -142,18 +173,20 @@ async def _register_dream_crons(
         return
 
     assert dream_cfg is not None
-    schedule_raw = (
-        dream_cfg.cron
-        if getattr(dream_cfg, "cron", None)
-        else _interval_h_to_schedule_raw(dream_cfg.interval_h)
-    )
+    if getattr(dream_cfg, "cron", None):
+        schedule_kind, schedule_value = ScheduleKind.CRON, dream_cfg.cron
+    else:
+        schedule_kind, schedule_value = _interval_h_to_schedule(dream_cfg.interval_h)
     for agent_id in agent_ids:
         name = f"memory_dream:{agent_id}"
         existing = existing_by_name.get(name)
         if existing is not None:
             patch: dict[str, Any] = {}
-            if getattr(existing, "schedule_raw", "") != schedule_raw:
-                patch["schedule_raw"] = schedule_raw
+            existing_kind = getattr(existing, "schedule_kind", None)
+            existing_value = getattr(existing, "cron_expr", "") or ""
+            if (existing_kind, existing_value) != (schedule_kind, schedule_value):
+                patch["schedule_kind"] = schedule_kind
+                patch["schedule_value"] = schedule_value
             if getattr(existing, "payload", {}).get("agent_id") != agent_id:
                 patch["payload"] = {"agent_id": agent_id}
             if getattr(existing, "session_target", None) != SessionTarget.ISOLATED:
@@ -166,21 +199,24 @@ async def _register_dream_crons(
             log.info(
                 "boot.dream.already_registered",
                 agent_id=agent_id,
-                schedule=schedule_raw,
+                schedule_kind=schedule_kind.value,
+                schedule_value=schedule_value,
             )
             continue
 
         await scheduler.add_job(
             name=name,
-            schedule_raw=schedule_raw,
             handler_key="memory_dream",
             payload={"agent_id": agent_id},
             session_target=SessionTarget.ISOLATED,
+            schedule_kind=schedule_kind,
+            schedule_value=schedule_value,
         )
         log.info(
             "boot.dream.registered",
             agent_id=agent_id,
-            schedule=schedule_raw,
+            schedule_kind=schedule_kind.value,
+            schedule_value=schedule_value,
         )
 
 
@@ -242,11 +278,10 @@ class ServiceContainer:
     model_catalog: ModelCatalog | None = None
     agent_registry: Any = None
     memory_managers: dict[str, MemoryManager] = field(default_factory=dict)
-    # Legacy per-tier dicts. As of Step 1A these are derived views over
+    # Legacy per-tier dicts. These are derived views over
     # `memory_managers` populated in build_services(); direct ServiceContainer
-    # constructors (e.g. tests) may still set them independently. Step 1B
-    # will collapse the consumers in TurnRunner / CLI onto `memory_managers`,
-    # at which point these legacy fields can be removed.
+    # constructors (e.g. tests) may still set them independently. Once all
+    # consumers use `memory_managers`, these legacy fields can be removed.
     memory_stores: dict[str, LongTermMemoryStore] = field(default_factory=dict)
     memory_sync_managers: dict[str, MemoryFileWatcher] = field(default_factory=dict)
     memory_watchers: list[MemoryFileWatcher] = field(default_factory=list)
@@ -256,6 +291,7 @@ class ServiceContainer:
     task_runtime: Any = None
     heartbeat_loop: Any = None
     heartbeat_watcher: Any = None
+    _compaction_listener_remove: Callable[[], None] | None = None
 
     # Backward-compat alias — returns the "main" store (or None).
     @property
@@ -270,6 +306,14 @@ class ServiceContainer:
         an in-flight cron job or heartbeat tick can drive TurnRunner ->
         TurnCaptureService.capture_turn against an already-closed store.
         """
+        remove_compaction_listener = getattr(self, "_compaction_listener_remove", None)
+        if callable(remove_compaction_listener):
+            try:
+                remove_compaction_listener()
+            except Exception:
+                pass
+            self._compaction_listener_remove = None
+
         # ── 1. Stop scheduled producers (no further writes after this) ──
         if self.heartbeat_watcher is not None:
             try:
@@ -462,6 +506,22 @@ def _task_runtime_max_pending_per_session(config: GatewayConfig) -> int:
     return int(config.task_runtime.max_pending_per_session)
 
 
+def _task_runtime_turn_hard_deadline_s(config: GatewayConfig) -> float | None:
+    configured = getattr(config.task_runtime, "turn_hard_deadline_s", None)
+    if configured is not None:
+        return float(configured)
+    runtime_timeout = getattr(config, "agent_runtime_timeout_seconds", None)
+    if runtime_timeout is None:
+        runtime_timeout = 900.0
+    try:
+        runtime_timeout_value = float(runtime_timeout)
+    except (TypeError, ValueError):
+        runtime_timeout_value = 900.0
+    if runtime_timeout_value <= 0:
+        return None
+    return runtime_timeout_value + 30.0
+
+
 def _task_runtime_envelope_owner(envelope: Any) -> bool:
     """Resolve owner privileges from authenticated route metadata."""
     from opensquilla.gateway.routing import SourceKind
@@ -489,7 +549,6 @@ async def dispatch_task_runtime_turn(
     (including the ``semantic_message`` regression surface).
     """
     from opensquilla.gateway.routing import tool_context_from_envelope
-
     workspace_dir = resolve_agent_workspace_dir(run.agent_id, config)
     workspace_strict = getattr(config, "workspace_strict", None)
     if not isinstance(workspace_strict, bool):
@@ -500,6 +559,7 @@ async def dispatch_task_runtime_turn(
         is_owner=is_owner,
         workspace_dir=str(workspace_dir),
         workspace_strict=workspace_strict,
+        default_elevated=configured_default_elevated(config),
     )
     tool_context.task_id = run.task_id
     session = None
@@ -516,19 +576,49 @@ async def dispatch_task_runtime_turn(
     )
     raw_stream = turn_runner.run(run.message, run.session_key, **run_kwargs)
     stream_idle_timeout = _optional_positive_timeout(
-        config, "agent_stream_idle_timeout_seconds", 180.0
+        config, "agent_stream_idle_timeout_seconds", 600.0
     )
     heartbeat_interval = _optional_positive_timeout(
         config, "agent_stream_heartbeat_interval_seconds", 15.0
     )
-    await _emit_task_runtime_stream_events(
-        raw_stream,
-        run.session_key,
-        event_emitter,
-        idle_timeout=stream_idle_timeout,
-        heartbeat_interval=heartbeat_interval,
-        stream_event_sink=getattr(run, "stream_event_sink", None),
-    )
+    try:
+        await _emit_task_runtime_stream_events(
+            raw_stream,
+            run.session_key,
+            event_emitter,
+            idle_timeout=stream_idle_timeout,
+            heartbeat_interval=heartbeat_interval,
+            stream_event_sink=getattr(run, "stream_event_sink", None),
+        )
+    except TaskRuntimeStreamError as exc:
+        if exc.code in {
+            "provider_request_budget_exhausted",
+            "provider_request_too_large",
+            "current_turn_context_exhausted",
+        }:
+            message_id = getattr(run, "persisted_user_message_id", None)
+            remove_message = getattr(session_manager, "remove_message", None)
+            if isinstance(message_id, str) and message_id and callable(remove_message):
+                try:
+                    removed = remove_message(run.session_key, message_id)
+                    if inspect.isawaitable(removed):
+                        removed = await removed
+                    if removed:
+                        log.info(
+                            "task_runtime.user_message_rolled_back",
+                            session_key=run.session_key,
+                            message_id=message_id,
+                            reason=exc.code,
+                        )
+                except Exception as rb_exc:  # noqa: BLE001 - preserve terminal error
+                    log.warning(
+                        "task_runtime.user_message_rollback_failed",
+                        session_key=run.session_key,
+                        message_id=message_id,
+                        reason=exc.code,
+                        error=str(rb_exc),
+                    )
+        raise
 
 
 def build_task_runtime_run_kwargs(
@@ -540,7 +630,7 @@ def build_task_runtime_run_kwargs(
     """Build kwargs for ``turn_runner.run`` from a ``TaskRun``.
 
     Pure helper extracted from ``_task_runtime_turn_handler`` so the
-    boot-level link of the recall-prefetch chain is directly
+    boot-level link of semantic message forwarding is directly
     testable: a regression that drops ``semantic_message`` forwarding
     here is caught by ``test_boot_task_runtime_kwargs.py`` without
     requiring a live gateway.
@@ -590,15 +680,70 @@ def build_cron_result_payload(
     }
 
 
-def build_sessions_changed_payload(session_key: str, reason: str) -> dict[str, str]:
-    """Build the WS payload for a ``sessions.changed`` broadcast.
+def _task_run_status_for_session_change(event: TaskLifecycleEvent) -> str:
+    status = getattr(event.task_status, "value", str(event.task_status))
+    if event.phase == "running":
+        return "running"
+    if status == "succeeded":
+        return "idle"
+    if status == "abandoned":
+        return "interrupted"
+    if status in {"failed", "timeout", "cancelled"}:
+        return status
+    return "idle"
 
-    Trivial helper — but having one symbol is the only way to ground a
-    gate-4 snapshot in actual production code rather than an invented
-    literal that production drift would silently ignore. Sites that
-    emit this event must call this helper.
-    """
-    return {"key": session_key, "reason": reason}
+
+def _task_state_for_session_change(event: TaskLifecycleEvent) -> dict[str, Any]:
+    status = getattr(event.task_status, "value", str(event.task_status))
+    task: dict[str, Any] = {
+        "task_id": event.task_id,
+        "status": "running" if event.phase == "running" else status,
+    }
+    if event.terminal_reason:
+        task["terminal_reason"] = event.terminal_reason
+    if event.phase == "terminal" and status != "succeeded":
+        task["terminal_message"] = build_terminal_reply(
+            {
+                "status": status,
+                "terminal_reason": event.terminal_reason,
+                "error_class": event.error_class,
+                "error_message": event.error_message,
+            }
+        )
+    return task
+
+
+def _make_task_session_lifecycle_listener(
+    *,
+    session_manager: Any,
+    event_emitter: Any,
+) -> Any:
+    async def _listener(event: TaskLifecycleEvent) -> None:
+        if event.run_kind == "subagent":
+            return
+        changed = await apply_task_lifecycle_to_session(
+            event,
+            session_manager=session_manager,
+        )
+        if not changed:
+            return
+        reason = "task_running" if event.phase == "running" else "task_terminal"
+        session_status = session_status_for_task_status(event.task_status)
+        task_state = _task_state_for_session_change(event)
+        state_field = "active_task" if event.phase == "running" else "last_task"
+        await event_emitter(
+            event.session_key,
+            "sessions.changed",
+            build_sessions_changed_payload(
+                event.session_key,
+                reason,
+                status=getattr(session_status, "value", session_status),
+                run_status=_task_run_status_for_session_change(event),
+                **{state_field: task_state},
+            ),
+        )
+
+    return _listener
 
 
 def _optional_positive_timeout(config: Any, attr: str, default: float) -> float | None:
@@ -625,6 +770,8 @@ async def _emit_task_runtime_stream_events(
     from opensquilla.engine.stream_wrappers import wrap_stream
 
     error_message: str | None = None
+    error_code: str | None = None
+    terminal_reason: str | None = None
     async for event in wrap_stream(
         raw_stream,
         idle_timeout=idle_timeout,
@@ -658,19 +805,38 @@ async def _emit_task_runtime_stream_events(
                 raw_message if isinstance(raw_message, str) and raw_message else "Agent error"
             )
             code = event_dict.get("code")
+            error_code = str(code) if code else None
             code_text = str(code or "").lower()
             is_timeout = "timeout" in code_text or "stream idle" in error_message.lower()
+            is_output_truncated = code_text == "provider_output_truncated"
+            terminal_reason = (
+                "timeout"
+                if is_timeout
+                else "output_truncated"
+                if is_output_truncated
+                else "error"
+            )
             terminal_payload = {
                 "status": "timeout" if is_timeout else "failed",
-                "terminal_reason": "timeout" if is_timeout else "error",
+                "terminal_reason": terminal_reason,
                 "error_class": code,
                 "error_message": error_message,
             }
+            safe_error_code, safe_error_message = sanitize_agent_error(
+                terminal_payload,
+                fallback_error_class=error_code,
+                fallback_error_message=error_message,
+            )
+            if safe_error_code == "provider_request_too_large":
+                error_code = safe_error_code
+                event_dict["code"] = safe_error_code
+                terminal_payload["error_class"] = safe_error_code
+                terminal_payload["error_message"] = safe_error_message
             terminal_message = build_terminal_reply(terminal_payload)
             event_dict["message"] = terminal_message
             event_dict["terminal_message"] = terminal_message
             event_dict["terminal_reason"] = terminal_payload["terminal_reason"]
-            event_dict["error_message"] = error_message
+            event_dict["error_message"] = safe_error_message
         await event_emitter(
             session_key,
             f"session.event.{event_kind}",
@@ -680,7 +846,11 @@ async def _emit_task_runtime_stream_events(
             message = event_dict.get("error_message")
             error_message = message if isinstance(message, str) and message else "Agent error"
     if error_message is not None:
-        raise RuntimeError(error_message)
+        raise TaskRuntimeStreamError(
+            error_message,
+            code=error_code,
+            terminal_reason=terminal_reason,
+        )
 
 
 def _env_bool(name: str) -> bool | None:
@@ -866,7 +1036,7 @@ def build_flush_service(
     if memory_cfg is not None:
         service_kwargs["default_timeout"] = getattr(
             memory_cfg,
-            "flush_timeout_seconds",
+            "flush_background_timeout_seconds",
             30.0,
         )
 
@@ -1003,6 +1173,7 @@ async def build_services(
     usage_tracker: Any = None,
     session_db_path: str = ":memory:",
     extra_agent_ids: list[str] | None = None,
+    seed_agent_workspaces: bool = True,
 ) -> ServiceContainer:
     """Initialize reusable services without any gateway-specific side effects.
 
@@ -1032,7 +1203,8 @@ async def build_services(
     from opensquilla.memory.embedding_resolver import resolve_memory_embedding
 
     resolve_memory_embedding(config.memory, local_available=lambda *_: False)
-    _ensure_configured_agent_workspaces(config, extra_agent_ids=extra_agent_ids)
+    if seed_agent_workspaces:
+        _ensure_configured_agent_workspaces(config, extra_agent_ids=extra_agent_ids)
 
     # Inject config into admin tool (needed by both gateway and standalone)
     from opensquilla.tools.builtin.admin import set_gateway_config
@@ -1069,7 +1241,7 @@ async def build_services(
     # yoyo would operate on a separate in-memory connection from storage.
     # Migration failures propagate: code ships behind the migration, never
     # ahead of it — silently booting on an out-of-date schema is worse than
-    # failing loud. See docs/architecture/schema-migration.md.
+    # failing loud.
     if session_db_path != ":memory:":
         from opensquilla.persistence.migrator import apply_pending
 
@@ -1107,6 +1279,7 @@ async def build_services(
 
     set_session_manager(session_manager)
     _set_sessions_gateway_config(config)
+    session_storage = get_session_storage(session_manager)
 
     # Wire agent registry into the agents_list tool surface.
     from opensquilla.tools.builtin.agents import set_agent_registry as _set_agent_registry_tool
@@ -1189,9 +1362,24 @@ async def build_services(
         tool_registry = get_default_registry()
 
     try:
+        from opensquilla.tools.builtin.session_search import create_session_search_tool
+
+        if session_storage is not None:
+            create_session_search_tool(session_storage, registry=tool_registry)
+            log.info("build_services.session_search_tool_registered")
+        else:
+            log.warning("build_services.session_search_tool_skipped", reason="storage_unavailable")
+    except Exception as e:
+        log.warning("build_services.session_search_tool_failed", error=str(e))
+
+    try:
         from opensquilla.tools.builtin.media import configure_image_generation
 
-        configure_image_generation(config.image_generation, llm_config=config.llm)
+        configure_image_generation(
+            config.image_generation,
+            llm_config=config.llm,
+            squilla_router_config=config.squilla_router,
+        )
     except Exception as e:
         log.warning("build_services.image_generation_config_failed", error=str(e))
 
@@ -1211,10 +1399,14 @@ async def build_services(
         from opensquilla.tools.builtin.memory_tools import create_memory_tools
 
         agent_ids = _configured_agent_ids(config, extra_agent_ids)
-        memory_managers = await build_memory_managers(config, agent_ids)
+        memory_managers = await build_memory_managers(
+            config,
+            agent_ids,
+            session_storage=session_storage,
+        )
 
         # Derive legacy per-tier views from the managers. These remain in
-        # `ServiceContainer` until Step 1B migrates downstream consumers
+        # `ServiceContainer` until downstream consumers
         # (TurnRunner, CLI, memory_tools) onto `memory_managers` directly.
         memory_stores = {aid: m.store for aid, m in memory_managers.items()}
         memory_retrievers = {aid: m.retriever for aid, m in memory_managers.items()}
@@ -1443,7 +1635,7 @@ def build_turn_runner_from_services(
     resolved_config = config if config is not None else svc.config
     # Standalone lock dict for CLI / test paths (no TaskRuntime involved).
     # Gateway path replaces this with task_runtime._get_session_lock_for_turn
-    # immediately after task_runtime is constructed (see boot.py §7b wiring).
+    # immediately after task_runtime is constructed.
     _standalone_locks: dict[str, _asyncio.Lock] = {}
 
     def _standalone_lock_provider(session_key: str) -> _asyncio.Lock:
@@ -1463,6 +1655,13 @@ def build_turn_runner_from_services(
         session_flush_service=getattr(svc, "flush_service", None),
         session_lock_provider=_standalone_lock_provider,
         diagnostics_state=diagnostics_state,
+        # Hook registries forwarded from services when present so any future
+        # user-registered TurnHook / CompactionHook instance flows through to
+        # TurnRunner without another boot edit.
+        # None today (no production services expose either registry); the
+        # plumbing stays here so the path is wired end-to-end.
+        turn_hooks=getattr(svc, "turn_hooks", None),
+        compaction_hooks=getattr(svc, "compaction_hooks", None),
     )
 
 
@@ -1600,6 +1799,30 @@ async def start_gateway_server(
         subscription_manager=subscription_manager,
         connection_registry=get_registry(),
     )
+
+    from opensquilla.engine.cache_break_monitor import add_compaction_listener
+
+    def _emit_runtime_compaction_event(
+        session_key: str,
+        payload: dict[str, Any],
+    ) -> None:
+        event_payload = dict(payload or {})
+        event_payload.setdefault("status", "completed")
+        event_payload.setdefault("source", "automatic")
+        emit_coro = runtime_event_bridge.emit(
+            session_key,
+            "session.event.compaction",
+            event_payload,
+        )
+        try:
+            create_background_task(emit_coro)
+        except RuntimeError:
+            emit_coro.close()
+
+    svc._compaction_listener_remove = add_compaction_listener(
+        _emit_runtime_compaction_event
+    )
+
     background_completion_manager = BackgroundCompletionManager(
         session_manager=svc.session_manager,
         event_emitter=runtime_event_bridge.emit,
@@ -1632,10 +1855,18 @@ async def start_gateway_server(
         turn_handler=_task_runtime_turn_handler,
         event_emitter=runtime_event_bridge.emit,
         terminal_listener=_subagent_completion_listener,
+        lifecycle_listener=_make_task_session_lifecycle_listener(
+            session_manager=svc.session_manager,
+            event_emitter=runtime_event_bridge.emit,
+        ),
         max_concurrency=_task_runtime_max_concurrency(config),
         max_pending_per_session=_task_runtime_max_pending_per_session(config),
         subagent_reserved_slots=int(
             getattr(getattr(config, "subagents", None), "subagent_reserved_slots", 0)
+        ),
+        turn_hard_deadline_s=_task_runtime_turn_hard_deadline_s(config),
+        pending_overflow_policy=getattr(
+            config.task_runtime, "pending_overflow_policy", "reject_newest"
         ),
     )
     # Wire task_runtime's lock provider into turn_runner so both share a
@@ -1678,7 +1909,11 @@ async def start_gateway_server(
         from opensquilla.memory.dream_factory import build_dream_factory
         from opensquilla.scheduler.delivery import DeliveryChain
         from opensquilla.scheduler.dream_handler import make_memory_dream_handler
-        from opensquilla.scheduler.handlers import make_agent_run_handler, make_system_event_handler
+        from opensquilla.scheduler.handlers import (
+            make_agent_run_handler,
+            make_static_message_handler,
+            make_system_event_handler,
+        )
         from opensquilla.scheduler.heartbeat_service import HeartbeatService
 
         async def _cron_ws_emitter(topic: str, event: str, payload: dict) -> int:
@@ -1782,6 +2017,16 @@ async def start_gateway_server(
             session_forwarder=_session_forwarder,
         )
 
+        # Plug DeliveryChain.dispatch_failure_alert into execute_with_timeout
+        # so every failed cron run (agent_run raise, system_event raise,
+        # TimeoutError, generic exception) reaches the job's configured
+        # FailureDestination at runtime. Without this wire the dispatch
+        # plumbing is dead in production even though unit tests cover the
+        # hook directly.
+        from opensquilla.scheduler.jobs import set_failure_dispatcher
+
+        set_failure_dispatcher(delivery_chain.dispatch_failure_alert)
+
         def _cron_workspace_resolver(agent_id: str) -> tuple[str | None, bool]:
             workspace_dir = resolve_agent_workspace_dir(agent_id, config)
             workspace_strict = getattr(config, "workspace_strict", None)
@@ -1795,6 +2040,7 @@ async def start_gateway_server(
             session_manager_ref=lambda: svc.session_manager,
             task_runtime_ref=lambda: task_runtime,
             workspace_resolver=_cron_workspace_resolver,
+            default_elevated=lambda: configured_default_elevated(config),
         )
         system_handler = make_system_event_handler(
             delivery_chain=delivery_chain,
@@ -1804,7 +2050,9 @@ async def start_gateway_server(
             heartbeat_service_ref=lambda: heartbeat_service,
             heartbeat_loop_ref=lambda: heartbeat_loop,
             workspace_resolver=_cron_workspace_resolver,
+            default_elevated=lambda: configured_default_elevated(config),
         )
+        static_handler = make_static_message_handler(delivery_chain=delivery_chain)
         dream_handler = make_memory_dream_handler(
             build_dream=build_dream_factory(
                 config=config,
@@ -1817,9 +2065,11 @@ async def start_gateway_server(
             ),
         )
         svc.cron_scheduler.register_handler("agent_run", agent_handler)
+        svc.cron_scheduler.register_handler("static_message", static_handler)
         svc.cron_scheduler.register_handler("system_event", system_handler)
         svc.cron_scheduler.register_handler("memory_dream", dream_handler)
         log.info("gateway.cron_handler_registered", handler_key="agent_run")
+        log.info("gateway.cron_handler_registered", handler_key="static_message")
         log.info("gateway.cron_handler_registered", handler_key="system_event")
         log.info("gateway.cron_handler_registered", handler_key="memory_dream")
         await _register_dream_crons(

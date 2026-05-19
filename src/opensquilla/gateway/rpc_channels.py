@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from opensquilla.channels.contract import (
+    channel_capability_profile,
+    channel_platform_manifest,
+)
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 
 _d = get_dispatcher()
@@ -39,6 +43,25 @@ def _status_for(*, connected: bool, enabled: bool, dispatch_state: str | None) -
     return _channel_status(connected)
 
 
+def _capability_payload(adapter: Any | None) -> tuple[list[str], dict[str, Any] | None]:
+    profile = channel_capability_profile(adapter)
+    if profile is None:
+        return [], None
+    return sorted(profile.capability_tags()), {
+        "channel_type": profile.channel_type,
+        "transports": list(profile.transports),
+    }
+
+
+def _platform_manifest_payload(adapter: Any | None) -> dict[str, Any] | None:
+    manifest = channel_platform_manifest(adapter)
+    return manifest.to_dict() if manifest is not None else None
+
+
+def _diagnostics_payload() -> dict[str, Any]:
+    return {"network_probe": "not_run"}
+
+
 @_d.method("channels.status", scope="operator.read")
 async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     health_map = await ctx.channel_manager.health() if ctx.channel_manager else {}
@@ -55,6 +78,9 @@ async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[
         enabled = bool(entry.get("enabled", True))
         health = health_map.get(name)
         extra = _health_extra(health)
+        adapter = ctx.channel_manager.get(name) if ctx.channel_manager else None
+        capabilities, capability_profile = _capability_payload(adapter)
+        platform_manifest = _platform_manifest_payload(adapter)
         connected = bool(getattr(health, "connected", False)) if health else False
         channels.append(
             {
@@ -71,6 +97,10 @@ async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[
                 "type": entry.get("type"),
                 "enabled": enabled,
                 "configured": True,
+                "capabilities": capabilities,
+                "capability_profile": capability_profile,
+                "platform_manifest": platform_manifest,
+                "diagnostics": _diagnostics_payload(),
             }
         )
         seen.add(name)
@@ -80,6 +110,8 @@ async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[
             continue
         extra = _health_extra(health)
         adapter = ctx.channel_manager.get(name) if ctx.channel_manager else None
+        capabilities, capability_profile = _capability_payload(adapter)
+        platform_manifest = _platform_manifest_payload(adapter)
         connected = bool(getattr(health, "connected", False))
         channels.append(
             {
@@ -96,6 +128,10 @@ async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[
                 "type": manager_types.get(name) or type(adapter).__name__,
                 "enabled": True,
                 "configured": False,
+                "capabilities": capabilities,
+                "capability_profile": capability_profile,
+                "platform_manifest": platform_manifest,
+                "diagnostics": _diagnostics_payload(),
             }
         )
 

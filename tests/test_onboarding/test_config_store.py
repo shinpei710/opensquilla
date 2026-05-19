@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import os
 import stat
 import tomllib
 
 import pytest
 
+import opensquilla.gateway.config_migration as migration_module
 from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig
 from opensquilla.onboarding.config_store import (
     PersistResult,
@@ -99,7 +101,7 @@ def test_persist_creates_file_with_mode_0600(tmp_path):
 
 def test_persist_creates_backup_when_target_exists(tmp_path):
     target = tmp_path / "config.toml"
-    target.write_text("port = 18790\n")
+    target.write_text("port = 18791\n")
     cfg = GatewayConfig()
     result = persist_config(cfg, path=target)
     assert result.backup_path is not None
@@ -122,16 +124,99 @@ def test_persist_validates_before_writing():
 
 def test_load_returns_gateway_config(tmp_path):
     target = tmp_path / "config.toml"
-    target.write_text("port = 18791\n")
+    target.write_text("port = 18792\n")
     cfg = load_config(target)
-    assert cfg.port == 18791
+    assert cfg.port == 18792
 
 
 def test_load_sets_config_path_for_existing_config(tmp_path):
     target = tmp_path / "config.toml"
-    target.write_text("port = 18791\n")
+    target.write_text("port = 18792\n")
     cfg = load_config(target)
     assert cfg.config_path == str(target)
+
+
+def test_load_migrates_legacy_memory_config_before_validation(tmp_path):
+    target = tmp_path / "config.toml"
+    target.write_text(
+        "\n".join(
+            [
+                "[memory]",
+                'capture_mode = "archive_turn_pair"',
+                "index_captured_turns = false",
+                "prefetch_enabled = true",
+                "prefetch_max_results = 3",
+                "prefetch_min_score = 0.3",
+                "",
+            ]
+        )
+    )
+
+    cfg = load_config(target)
+
+    assert cfg.memory.capture_mode == "turn_pair"
+    assert cfg.config_path == str(target)
+    backups = sorted(tmp_path.glob("config.toml.backup.*"))
+    assert backups
+    backup_text = backups[-1].read_text()
+    assert 'capture_mode = "archive_turn_pair"' in backup_text
+    assert "index_captured_turns = false" in backup_text
+    data = tomllib.loads(target.read_text())
+    assert data["memory"]["capture_mode"] == "turn_pair"
+    assert "index_captured_turns" not in data["memory"]
+    assert "prefetch_enabled" not in data["memory"]
+    assert "prefetch_max_results" not in data["memory"]
+    assert "prefetch_min_score" not in data["memory"]
+
+
+def test_migration_then_persist_keeps_distinct_backups_on_name_collision(
+    tmp_path, monkeypatch
+):
+    class FixedDateTime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = cls(2026, 5, 19, 20, 40, 0)
+            if tz is not None:
+                return value.replace(tzinfo=tz)
+            return value
+
+    monkeypatch.setattr(migration_module.datetime, "datetime", FixedDateTime)
+    target = tmp_path / "config.toml"
+    target.write_text(
+        "\n".join(
+            [
+                "[memory]",
+                'capture_mode = "archive_turn_pair"',
+                "index_captured_turns = false",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = load_config(target)
+    cfg.port = 18793
+    persist_config(cfg, path=target, backup=True)
+
+    backups = sorted(tmp_path.glob("config.toml.backup.*"))
+    assert len(backups) == 2
+    backup_texts = [path.read_text(encoding="utf-8") for path in backups]
+    assert any('capture_mode = "archive_turn_pair"' in text for text in backup_texts)
+    assert any('capture_mode = "turn_pair"' in text for text in backup_texts)
+
+
+def test_validate_config_payload_does_not_migrate_legacy_memory_payload() -> None:
+    with pytest.raises(Exception):
+        validate_config_payload({"memory": {"capture_mode": "archive_turn_pair"}})
+
+    with pytest.raises(Exception):
+        validate_config_payload({"memory": {"index_captured_turns": False}})
+
+    with pytest.raises(Exception):
+        validate_config_payload({"memory": {"prefetch_enabled": True}})
+
+    with pytest.raises(Exception):
+        validate_config_payload({"memory": {"cost": {"embedding_cache": True}}})
 
 
 def test_persist_round_trip_preserves_unrelated(tmp_path):
@@ -142,11 +227,11 @@ def test_persist_round_trip_preserves_unrelated(tmp_path):
         'base_url = "https://openrouter.ai/api/v1"\n'
     )
     cfg = load_config(target)
-    cfg.port = 18792
+    cfg.port = 18793
     persist_config(cfg, path=target)
     text = target.read_text()
     assert "openrouter" in text
-    assert "18792" in text
+    assert "18793" in text
 
 
 def test_persist_omits_runtime_secret_paths(tmp_path):
@@ -189,7 +274,7 @@ def test_env_sourced_llm_key_is_not_persisted(tmp_path, monkeypatch):
 def test_load_nonexistent_returns_default(tmp_path):
     cfg = load_config(tmp_path / "missing.toml")
     assert isinstance(cfg, GatewayConfig)
-    assert cfg.port == 18790  # default
+    assert cfg.port == 18791  # default
 
 
 def test_persist_omits_empty_agents_table(tmp_path):

@@ -19,6 +19,11 @@ def register_channel(name: str, channel: object) -> None:
     _channels[name] = channel
 
 
+def unregister_channel(name: str) -> None:
+    """Remove a channel adapter from messaging tool routing."""
+    _channels.pop(name, None)
+
+
 def _outgoing_metadata(channel: str, target: str, thread_id: str | None) -> dict[str, str]:
     """Build adapter-recognized target metadata for the public message tool."""
     if channel == "telegram":

@@ -17,6 +17,7 @@ from opensquilla.gateway.channel_dispatch import (
     _ChannelInFlightSet,
     _compute_channel_cap,
     _deliver_runtime_channel_reply,
+    _resolve_channel_overflow_policy,
 )
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -671,3 +672,266 @@ async def test_debounce_reservation_enforced() -> None:
     assert len(busy_replies) == 1, (
         f"expected 1 busy reply, got {len(busy_replies)}"
     )
+
+
+# ── Per-channel overflow policy resolution ──────────────────────────────────
+
+
+def _make_channel_with_id(channel_id: str) -> Any:
+    ch = MagicMock()
+    ch.channel_id = channel_id
+    return ch
+
+
+def test_resolve_channel_overflow_policy_returns_none_without_config() -> None:
+    assert _resolve_channel_overflow_policy(_make_channel_with_id("feishu"), None) is None
+
+
+def test_resolve_channel_overflow_policy_returns_none_when_map_empty() -> None:
+    cfg = MagicMock()
+    cfg.task_runtime.pending_overflow_policy_per_channel = {}
+    assert _resolve_channel_overflow_policy(_make_channel_with_id("feishu"), cfg) is None
+
+
+def test_resolve_channel_overflow_policy_returns_none_when_channel_unmapped() -> None:
+    cfg = MagicMock()
+    cfg.task_runtime.pending_overflow_policy_per_channel = {"slack": "drop_oldest"}
+    assert _resolve_channel_overflow_policy(_make_channel_with_id("feishu"), cfg) is None
+
+
+def test_resolve_channel_overflow_policy_returns_mapped_value() -> None:
+    cfg = MagicMock()
+    cfg.task_runtime.pending_overflow_policy_per_channel = {"feishu": "drop_oldest"}
+    assert (
+        _resolve_channel_overflow_policy(_make_channel_with_id("feishu"), cfg)
+        == "drop_oldest"
+    )
+
+
+def test_resolve_channel_overflow_policy_handles_missing_channel_id() -> None:
+    cfg = MagicMock()
+    cfg.task_runtime.pending_overflow_policy_per_channel = {"feishu": "drop_oldest"}
+    channel_no_id = MagicMock(spec=[])
+    assert _resolve_channel_overflow_policy(channel_no_id, cfg) is None
+
+
+@pytest.mark.asyncio
+async def test_apply_overflow_policy_invoked_when_channel_override_present() -> None:
+    """When a channel has an override configured, channel_dispatch invokes
+    runtime.apply_overflow_policy(session_key, policy=<override>) before
+    start_turn_via_runtime so the override takes effect for that turn.
+    """
+    from opensquilla.channels.types import IncomingMessage
+    from opensquilla.gateway.channel_dispatch import _ChannelInFlightSet, run_channel_dispatch
+
+    msg = MagicMock()
+    msg.content = "hello"
+    msg.metadata = {}
+    msg.sender_id = "u-1"
+    msg.channel_id = "ch-test"
+    msg.thread_id = None
+    msg.id = "msg-1"
+
+    channel = MagicMock()
+    channel.channel_id = "feishu"
+    channel.send = AsyncMock()
+    channel.build_reply_message = None
+    channel.streaming_reply_kwargs = None
+
+    call_count = 0
+
+    async def _receive() -> IncomingMessage:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return msg
+        raise asyncio.CancelledError
+
+    channel.receive = _receive
+
+    task_runtime = MagicMock()
+    task_runtime.enqueue = AsyncMock()
+    task_runtime.apply_overflow_policy = AsyncMock()
+
+    session_manager = MagicMock()
+    session_manager.get_or_create = AsyncMock(return_value=(MagicMock(), False))
+    session_manager.update = AsyncMock()
+    session_manager.read_transcript = AsyncMock(return_value=[])
+
+    cfg = _make_config(channel_inflight_cap=8, max_concurrency=4)
+    cfg.task_runtime.pending_overflow_policy_per_channel = {"feishu": "drop_oldest"}
+
+    fake_envelope = MagicMock()
+    fake_envelope.thread_id = None
+    fake_envelope.channel_id = "ch-test"
+
+    ifs = _ChannelInFlightSet(cap=8)
+
+    with (
+        patch(
+            "opensquilla.gateway.routing.build_channel_route_envelope",
+            return_value=fake_envelope,
+        ),
+        patch(
+            "opensquilla.gateway.channel_dispatch._append_channel_user_message",
+            new=AsyncMock(return_value=(MagicMock(), "hello")),
+        ),
+        patch(
+            "opensquilla.gateway.channel_dispatch.start_turn_via_runtime",
+            new=AsyncMock(return_value=MagicMock(task_id="t-1")),
+        ),
+        patch(
+            "opensquilla.gateway.channel_dispatch._record_delivery_context",
+            new=AsyncMock(return_value=(MagicMock(), False)),
+        ),
+        patch("opensquilla.gateway.channel_dispatch._should_skip_unmentioned", return_value=False),
+        patch(
+            "opensquilla.gateway.channel_dispatch._ingest_channel_message_attachments",
+            new=AsyncMock(return_value=MagicMock(text="hello", attachments=[])),
+        ),
+        patch("opensquilla.gateway.channel_dispatch._status_reactor") as mock_reactor_factory,
+        patch(
+            "opensquilla.gateway.channel_dispatch._RuntimeChannelStreamRelay",
+        ) as mock_relay_cls,
+        patch(
+            "opensquilla.gateway.channel_dispatch._deliver_runtime_channel_reply",
+            new=AsyncMock(),
+        ),
+        patch("opensquilla.gateway.channel_dispatch._emit_events", new=AsyncMock()),
+    ):
+        mock_relay_cls.maybe_start.return_value = None
+        mock_reactor = MagicMock()
+        mock_reactor.received = AsyncMock()
+        mock_reactor.completed = AsyncMock()
+        mock_reactor.running = AsyncMock()
+        mock_reactor.failed = AsyncMock()
+        mock_reactor_factory.return_value = mock_reactor
+
+        turn_runner = MagicMock(spec=[])
+
+        try:
+            await run_channel_dispatch(
+                channel=channel,
+                turn_runner=turn_runner,
+                session_manager=session_manager,
+                session_key_builder=lambda _msg: "s:override",
+                session_prefix="feishu",
+                task_runtime=task_runtime,
+                config=cfg,
+                _in_flight=ifs,
+            )
+        except asyncio.CancelledError:
+            pass
+
+    # Override hook fired with the per-channel policy.
+    task_runtime.apply_overflow_policy.assert_awaited_once()
+    args, kwargs = task_runtime.apply_overflow_policy.call_args
+    assert kwargs.get("policy") == "drop_oldest"
+
+
+@pytest.mark.asyncio
+async def test_apply_overflow_policy_not_invoked_without_channel_override() -> None:
+    """No override hook fires when the channel has no per-channel mapping."""
+    from opensquilla.channels.types import IncomingMessage
+    from opensquilla.gateway.channel_dispatch import _ChannelInFlightSet, run_channel_dispatch
+
+    msg = MagicMock()
+    msg.content = "hello"
+    msg.metadata = {}
+    msg.sender_id = "u-1"
+    msg.channel_id = "ch-test"
+    msg.thread_id = None
+    msg.id = "msg-1"
+
+    channel = MagicMock()
+    channel.channel_id = "discord"  # not in override map
+    channel.send = AsyncMock()
+    channel.build_reply_message = None
+    channel.streaming_reply_kwargs = None
+
+    call_count = 0
+
+    async def _receive() -> IncomingMessage:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return msg
+        raise asyncio.CancelledError
+
+    channel.receive = _receive
+
+    task_runtime = MagicMock()
+    task_runtime.enqueue = AsyncMock()
+    task_runtime.apply_overflow_policy = AsyncMock()
+
+    session_manager = MagicMock()
+    session_manager.get_or_create = AsyncMock(return_value=(MagicMock(), False))
+    session_manager.update = AsyncMock()
+    session_manager.read_transcript = AsyncMock(return_value=[])
+
+    cfg = _make_config(channel_inflight_cap=8, max_concurrency=4)
+    cfg.task_runtime.pending_overflow_policy_per_channel = {"feishu": "drop_oldest"}
+
+    fake_envelope = MagicMock()
+    fake_envelope.thread_id = None
+    fake_envelope.channel_id = "ch-test"
+
+    ifs = _ChannelInFlightSet(cap=8)
+
+    with (
+        patch(
+            "opensquilla.gateway.routing.build_channel_route_envelope",
+            return_value=fake_envelope,
+        ),
+        patch(
+            "opensquilla.gateway.channel_dispatch._append_channel_user_message",
+            new=AsyncMock(return_value=(MagicMock(), "hello")),
+        ),
+        patch(
+            "opensquilla.gateway.channel_dispatch.start_turn_via_runtime",
+            new=AsyncMock(return_value=MagicMock(task_id="t-1")),
+        ),
+        patch(
+            "opensquilla.gateway.channel_dispatch._record_delivery_context",
+            new=AsyncMock(return_value=(MagicMock(), False)),
+        ),
+        patch("opensquilla.gateway.channel_dispatch._should_skip_unmentioned", return_value=False),
+        patch(
+            "opensquilla.gateway.channel_dispatch._ingest_channel_message_attachments",
+            new=AsyncMock(return_value=MagicMock(text="hello", attachments=[])),
+        ),
+        patch("opensquilla.gateway.channel_dispatch._status_reactor") as mock_reactor_factory,
+        patch(
+            "opensquilla.gateway.channel_dispatch._RuntimeChannelStreamRelay",
+        ) as mock_relay_cls,
+        patch(
+            "opensquilla.gateway.channel_dispatch._deliver_runtime_channel_reply",
+            new=AsyncMock(),
+        ),
+        patch("opensquilla.gateway.channel_dispatch._emit_events", new=AsyncMock()),
+    ):
+        mock_relay_cls.maybe_start.return_value = None
+        mock_reactor = MagicMock()
+        mock_reactor.received = AsyncMock()
+        mock_reactor.completed = AsyncMock()
+        mock_reactor.running = AsyncMock()
+        mock_reactor.failed = AsyncMock()
+        mock_reactor_factory.return_value = mock_reactor
+
+        turn_runner = MagicMock(spec=[])
+
+        try:
+            await run_channel_dispatch(
+                channel=channel,
+                turn_runner=turn_runner,
+                session_manager=session_manager,
+                session_key_builder=lambda _msg: "s:no-override",
+                session_prefix="discord",
+                task_runtime=task_runtime,
+                config=cfg,
+                _in_flight=ifs,
+            )
+        except asyncio.CancelledError:
+            pass
+
+    task_runtime.apply_overflow_policy.assert_not_called()

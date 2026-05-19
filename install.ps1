@@ -1,22 +1,10 @@
-# install.ps1 — user-local OpenSquilla installer (no admin).
+# install.ps1 - OpenSquilla release installer for Windows PowerShell.
 #
-# Installer contract:
-#   - installs into a user-owned prefix (never Program Files or system32)
-#   - prefers uv tool install; falls back to pip --user; errors clearly if neither exists
-#   - defaults to the "recommended" runtime profile (memory + bundled v4 router)
-#     and allows `$env:OPENSQUILLA_INSTALL_PROFILE="core"` to opt back down
-#   - on Windows, best-effort installs Microsoft Visual C++ Redistributable
-#     before the recommended router profile because onnxruntime requires it
-#   - prints a post-install banner documenting the default bind
-#     (127.0.0.1:18790) and the explicit opt-in required to expose the gateway
-#     on the network (-Listen 0.0.0.0 or $env:OPENSQUILLA_LISTEN="0.0.0.0")
-#   - adds an extra WARNING when the operator requested network exposure at
-#     install time via $env:OPENSQUILLA_LISTEN="0.0.0.0"
-#
-# Dry-run: set $env:OPENSQUILLA_INSTALL_DRY_RUN="1" to print the install plan +
-# banner without touching the system.
+# This script installs uv if needed, installs a release wheel with uv tool, then
+# prints the explicit next steps. It does not run onboarding or start the gateway.
 
 param(
+    [string]$Version = "",
     [string]$Profile = "",
     [string[]]$Extras = @()
 )
@@ -24,23 +12,22 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# --- prefix resolution ------------------------------------------------------
-
-if ($env:OPENSQUILLA_PREFIX) {
-    $prefix = $env:OPENSQUILLA_PREFIX
-} elseif ($env:LOCALAPPDATA) {
-    $prefix = Join-Path $env:LOCALAPPDATA 'opensquilla'
-} else {
-    $prefix = Join-Path $HOME '.local'
-}
-
+$defaultVersion = 'v0.2.0rc1'
+$repoSlug = if ($env:OPENSQUILLA_REPOSITORY) { $env:OPENSQUILLA_REPOSITORY } else { 'opensquilla/opensquilla' }
+$pythonVersion = if ($env:OPENSQUILLA_PYTHON_VERSION) { $env:OPENSQUILLA_PYTHON_VERSION } else { '3.12' }
+$originalPath = if ($env:Path) { $env:Path } else { '' }
 $dryRun = $env:OPENSQUILLA_INSTALL_DRY_RUN -eq '1'
 $script:isWindowsHost = if (Get-Variable IsWindows -ErrorAction SilentlyContinue) {
     $IsWindows
 } else {
     $env:OS -eq 'Windows_NT'
 }
-$profile = if ($Profile) {
+
+if (-not $Version) {
+    $Version = if ($env:OPENSQUILLA_VERSION) { $env:OPENSQUILLA_VERSION } else { $defaultVersion }
+}
+
+$profileName = if ($Profile) {
     $Profile
 } elseif ($env:OPENSQUILLA_INSTALL_PROFILE) {
     $env:OPENSQUILLA_INSTALL_PROFILE
@@ -54,7 +41,6 @@ $validExtras = @(
     'dingtalk',
     'wecom',
     'qq',
-    'msteams',
     'matrix',
     'matrix-e2e',
     'document-extras'
@@ -84,88 +70,90 @@ if ($env:OPENSQUILLA_INSTALL_EXTRAS) {
 }
 $extraInputs += $Extras
 $installExtras = @(Split-InstallExtras $extraInputs)
-
 $unknownExtras = @($installExtras | Where-Object { $_ -notin $validExtras })
 if ($unknownExtras.Count -gt 0) {
     Write-Error "install.ps1: unsupported extras: $($unknownExtras -join ', '). Supported extras: $($validExtras -join ', ')."
     exit 1
 }
 
-switch ($profile) {
+switch ($profileName) {
     'core' { $targetExtras = @() }
-    'minimal' { $profile = 'core'; $targetExtras = @() }
+    'minimal' { $profileName = 'core'; $targetExtras = @() }
     'recommended' { $targetExtras = @('recommended') }
     default {
-        Write-Error "install.ps1: unsupported OPENSQUILLA_INSTALL_PROFILE='$profile'. Supported profiles: core, recommended."
+        Write-Error "install.ps1: unsupported OPENSQUILLA_INSTALL_PROFILE='$profileName'. Supported profiles: core, recommended."
         exit 1
     }
 }
 
 $targetExtras += $installExtras
-$installTarget = if ($targetExtras.Count -gt 0) {
-    ".[$($targetExtras -join ',')]"
+$packageName = if ($targetExtras.Count -gt 0) {
+    "opensquilla[$($targetExtras -join ',')]"
 } else {
-    '.'
+    'opensquilla'
 }
 
-function Test-SquillaRouterAssets {
-    param(
-        [switch]$WarnOnly
+function Test-ReleaseVersion {
+    param([string]$Value)
+    return $Value -match '^v?\d+\.\d+\.\d+((a|b|rc)\d+)?$'
+}
+
+if ($Version -notin @('latest', 'stable') -and -not (Test-ReleaseVersion $Version)) {
+    Write-Error "install.ps1: unsupported OPENSQUILLA_VERSION='$Version'. The release installer only supports latest, stable, or release versions like v0.2.0rc1. Use git clone plus scripts/install_source.ps1 for main, dev, branch, or source installs."
+    exit 1
+}
+
+switch -Regex ($Version) {
+    '^(latest|stable)$' {
+        $wheelUrl = "https://github.com/$repoSlug/releases/latest/download/opensquilla-latest-py3-none-any.whl"
+        $displayVersion = $Version
+        break
+    }
+    '^v' {
+        $releaseVersion = $Version.Substring(1)
+        $wheelUrl = "https://github.com/$repoSlug/releases/download/$Version/opensquilla-$releaseVersion-py3-none-any.whl"
+        $displayVersion = $Version
+        break
+    }
+    default {
+        $releaseVersion = $Version
+        $releaseTag = "v$releaseVersion"
+        $wheelUrl = "https://github.com/$repoSlug/releases/download/$releaseTag/opensquilla-$releaseVersion-py3-none-any.whl"
+        $displayVersion = $releaseTag
+    }
+}
+
+$installSpec = "$packageName @ $wheelUrl"
+
+function Resolve-Uv {
+    $cmd = Get-Command uv -ErrorAction SilentlyContinue
+    if ($cmd) {
+        return $cmd.Source
+    }
+
+    $candidateDirs = @(
+        (Join-Path $env:USERPROFILE '.local\bin'),
+        (Join-Path $env:USERPROFILE '.cargo\bin')
     )
+    $env:Path = ($candidateDirs -join ';') + ';' + $env:Path
 
-    if ($profile -ne 'recommended') {
-        return
-    }
-
-    $modelRoot = 'src/opensquilla/squilla_router/models'
-    $required = @(
-        "$modelRoot/v4.2_phase3_inference/lgbm_main.bin",
-        "$modelRoot/v4.2_phase3_inference/router.runtime.yaml",
-        "$modelRoot/v4.2_phase3_inference/mlp/model.onnx",
-        "$modelRoot/v4.2_phase3_inference/features/tfidf.pkl",
-        "$modelRoot/v4.2_phase3_inference/bge_onnx/model.onnx"
-    )
-    $pointerLine = 'version https://git-lfs.github.com/spec/v1'
-    $missing = New-Object System.Collections.Generic.List[string]
-    $pointers = New-Object System.Collections.Generic.List[string]
-
-    foreach ($path in $required) {
-        if (-not (Test-Path $path -PathType Leaf)) {
-            $missing.Add($path)
-            continue
-        }
-        $firstLine = Get-Content -Path $path -TotalCount 1 -ErrorAction SilentlyContinue
-        if ($firstLine -eq $pointerLine) {
-            $pointers.Add($path)
+    foreach ($dir in $candidateDirs) {
+        $candidate = Join-Path $dir 'uv.exe'
+        if (Test-Path $candidate -PathType Leaf) {
+            return $candidate
         }
     }
 
-    if ($missing.Count -gt 0 -or $pointers.Count -gt 0) {
-        if ($WarnOnly) {
-            Write-Host 'install.ps1: dry-run note — real recommended install would fail until bundled squilla-router v4 assets are available in this checkout.'
-        }
-        else {
-            Write-Error 'install.ps1: bundled squilla-router v4 assets are unavailable in this checkout.'
-        }
-        if ($missing.Count -gt 0) {
-            $message = "install.ps1: missing squilla-router assets: $($missing -join ', ')"
-            if ($WarnOnly) { Write-Host $message } else { Write-Error $message }
-        }
-        if ($pointers.Count -gt 0) {
-            $message = "install.ps1: Git LFS pointer files detected: $($pointers -join ', ')"
-            if ($WarnOnly) { Write-Host $message } else { Write-Error $message }
-        }
-        $lfsMessage = 'install.ps1: run `git lfs install` once, then `git lfs pull --include="src/opensquilla/squilla_router/models/**"`.'
-        $coreMessage = 'install.ps1: or retry with `$env:OPENSQUILLA_INSTALL_PROFILE="core"` for the minimal runtime.'
-        if ($WarnOnly) {
-            Write-Host $lfsMessage
-            Write-Host $coreMessage
-            return
-        }
-        Write-Error $lfsMessage
-        Write-Error $coreMessage
-        exit 1
+    $cmd = Get-Command uv -ErrorAction SilentlyContinue
+    if ($cmd) {
+        return $cmd.Source
     }
+    return $null
+}
+
+function Install-Uv {
+    Write-Host 'install.ps1: uv not found; installing uv first.'
+    Invoke-RestMethod -Uri 'https://astral.sh/uv/install.ps1' | Invoke-Expression
 }
 
 function Test-WindowsVCRedistInstalled {
@@ -190,7 +178,7 @@ function Test-WindowsVCRedistInstalled {
 }
 
 function Install-WindowsVCRedistIfNeeded {
-    if (-not $script:isWindowsHost -or $profile -ne 'recommended') {
+    if (-not $script:isWindowsHost -or $profileName -ne 'recommended') {
         return
     }
     if ($env:OPENSQUILLA_SKIP_VC_REDIST -eq '1') {
@@ -223,90 +211,68 @@ function Install-WindowsVCRedistIfNeeded {
         Write-Warning "install.ps1: winget could not install Microsoft Visual C++ Redistributable (exit $LASTEXITCODE)."
     }
 
-    Write-Warning 'install.ps1: Microsoft Visual C++ Redistributable is needed for the bundled router on many Windows machines.'
-    Write-Warning "install.ps1: install it from $redistUrl, then restart PowerShell if onnxruntime reports DLL load failures."
-}
-
-# --- installer selection ----------------------------------------------------
-
-$installer = $null
-$installArgs = @()
-
-if (Get-Command uv -ErrorAction SilentlyContinue) {
-    $installer = 'uv'
-    $installArgs = @('tool', 'install', '--force', '--reinstall-package', 'opensquilla', $installTarget)
-} elseif (Get-Command python -ErrorAction SilentlyContinue) {
-    $installer = 'pip'
-    $installArgs = @('-m', 'pip', 'install', '--user', $installTarget)
-} else {
-    Write-Error "install.ps1: neither 'uv' nor 'python' is available on PATH. Install uv (https://docs.astral.sh/uv/) or Python 3.12+ and retry."
-    exit 1
-}
-
-$installCmd = if ($installer -eq 'uv') {
-    "uv $($installArgs -join ' ')"
-} else {
-    "python $($installArgs -join ' ')"
-}
-
-# --- banner -----------------------------------------------------------------
-
-function Write-Banner {
-    @"
-----------------------------------------------------------------------------
-OpenSquilla installed via $installer -> $prefix (profile: $profile)
-Extras: $(if ($installExtras.Count -gt 0) { $installExtras -join ', ' } else { 'none' })
-
-Default gateway bind: 127.0.0.1:18790 (loopback only)
-Network exposure is opt-in only. To expose the gateway on the network you
-must use one of:
-  - CLI flag:  opensquilla gateway run --listen 0.0.0.0
-  - Env var:   `$env:OPENSQUILLA_LISTEN="0.0.0.0"; opensquilla gateway run
-
-Reminder: only expose 0.0.0.0 behind a trusted reverse proxy or VPN. The
-gateway's first-class auth assumes loopback-scope by default.
-----------------------------------------------------------------------------
-"@ | Write-Host
-}
-
-function Write-ListenWarning {
-    @"
-WARNING: you have selected network-exposed default - ensure you
-   understand the blast radius. The gateway will bind to 0.0.0.0 and be
-   reachable from every interface on this host.
-"@ | Write-Host
+    Write-Warning 'OpenSquilla: Microsoft Visual C++ Redistributable 2015-2022 x64 is required for the bundled ONNX router.'
+    Write-Warning 'OpenSquilla can still start with safe router fallback, but bundled ONNX model routing is disabled until this runtime is installed.'
+    Write-Warning "If automatic installation fails, install it manually: $redistUrl"
+    Write-Warning 'After installing, reopen PowerShell and restart OpenSquilla.'
 }
 
 if ($dryRun) {
-    Write-Host "install.ps1: dry-run — would run: $installCmd"
-    Write-Host "install.ps1: dry-run — prefix: $prefix"
-    Test-SquillaRouterAssets -WarnOnly
-    Write-Banner
-    if ($env:OPENSQUILLA_LISTEN -eq '0.0.0.0') {
-        Write-ListenWarning
-    }
+    Write-Host "install.ps1: dry-run - would install OpenSquilla $displayVersion"
+    Write-Host "install.ps1: dry-run - would run: uv tool install --python $pythonVersion --force --reinstall-package opensquilla `"$installSpec`""
     exit 0
 }
 
-# --- execute ---------------------------------------------------------------
+$uvBin = Resolve-Uv
+if (-not $uvBin) {
+    Install-Uv
+    $uvBin = Resolve-Uv
+}
+
+if (-not $uvBin) {
+    Write-Error "install.ps1: uv was not found after installation. Restart PowerShell or add '$env:USERPROFILE\.local\bin' to PATH, then retry."
+    exit 1
+}
 
 Install-WindowsVCRedistIfNeeded
-Test-SquillaRouterAssets
 
-Write-Host "install.ps1: installing via $installer into prefix $prefix"
-Write-Host "install.ps1: running: $installCmd"
-if ($installer -eq 'uv') {
-    & uv @installArgs
-} else {
-    & python @installArgs
-}
+Write-Host "install.ps1: installing OpenSquilla $displayVersion ($profileName)"
+& $uvBin tool install --python $pythonVersion --force --reinstall-package opensquilla $installSpec
 if ($LASTEXITCODE -ne 0) {
     Write-Error "install.ps1: install command failed with exit code $LASTEXITCODE."
-    Write-Error 'install.ps1: Close any running OpenSquilla gateway or shell using the existing tool environment, then retry.'
     exit $LASTEXITCODE
 }
 
-Write-Banner
-if ($env:OPENSQUILLA_LISTEN -eq '0.0.0.0') {
-    Write-ListenWarning
+$toolBinDir = ''
+try {
+    $toolBinDir = (& $uvBin tool dir --bin 2>$null).Trim()
+} catch {
+    $toolBinDir = ''
+}
+
+@"
+----------------------------------------------------------------------------
+OpenSquilla installed from $displayVersion.
+
+Next steps:
+  opensquilla onboard
+  opensquilla gateway run
+
+Default gateway bind: 127.0.0.1:18791 (loopback only).
+Do not expose the gateway on 0.0.0.0 unless it is behind a trusted reverse
+proxy or VPN.
+----------------------------------------------------------------------------
+"@ | Write-Host
+
+if ($toolBinDir -and -not (($originalPath -split ';') -contains $toolBinDir)) {
+    @"
+
+PATH note:
+  Your current PowerShell may not find 'opensquilla' until PATH is refreshed.
+  Run this command, then retry the next steps:
+
+    `$env:Path = "$toolBinDir;" + `$env:Path
+
+  Or open a new PowerShell window.
+"@ | Write-Host
 }

@@ -11,6 +11,7 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -21,6 +22,15 @@ from starlette.routing import Route
 
 from opensquilla.channels._reactions import NULL_STATUS_REACTOR, SlackStatusReactor
 from opensquilla.channels._util import ChannelAccessPolicy, EventDedupeCache, StreamThrottle
+from opensquilla.channels.contract import (
+    ChannelCapabilities,
+    ChannelCapabilityProfile,
+    ChannelPlatformCapability,
+    ChannelPlatformCapabilityStatus,
+    ChannelPlatformCategories,
+    ChannelPlatformManifest,
+    ChannelSendResult,
+)
 from opensquilla.channels.types import ChannelHealth, IncomingMessage, OutgoingMessage
 from opensquilla.env import trust_env as _trust_env
 
@@ -97,6 +107,56 @@ class SlackChannel:
     )
     supports_slash_commands: bool = True
 
+    @property
+    def capability_profile(self) -> ChannelCapabilityProfile:
+        return ChannelCapabilityProfile(
+            channel_type="slack",
+            group_chat=True,
+            mentions=True,
+            native_file_upload=True,
+            media=True,
+            reactions=self.status_reactions_enabled,
+            outbound_status_reactions=self.status_reactions_enabled,
+            threads=True,
+            thread_reply=True,
+            edit=True,
+            delete=True,
+            transports=("webhook",),
+        )
+
+    @property
+    def platform_capability_manifest(self) -> ChannelPlatformManifest:
+        return ChannelPlatformManifest.from_channel_profile(
+            self.capability_profile,
+            has_send_file=True,
+        ).with_capabilities(
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.FILES,
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=("files.getUploadURLExternal", "files.completeUploadExternal"),
+                required_scopes=("files:write",),
+                mutates=True,
+                notes=(
+                    "Slack file delivery uses the external upload flow and requires files:write.",
+                ),
+            ),
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.THREADS,
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=("thread_ts",),
+                notes=("Slack uploads and replies can target an existing thread_ts.",),
+            ),
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.ATTACHMENTS,
+                status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
+                notes=("Inbound Slack file download is not implemented in this adapter.",),
+            ),
+        )
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self.capability_profile.capability_tags()
+
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
@@ -156,6 +216,7 @@ class SlackChannel:
             "thread_ts": thread_ts,
             "team": event.get("team"),
             "channel_type": channel_type,
+            "is_group": channel_type in {"channel", "group"},
         }
 
         # Detect thread root: thread_ts == ts
@@ -202,6 +263,52 @@ class SlackChannel:
             log.error("slack.send_failed", error=data.get("error"), channel=self.slack_channel_id)
             raise RuntimeError(f"Slack API error: {data.get('error')}")
         log.debug("slack.send", channel=self.slack_channel_id, ts=data.get("ts"))
+
+    async def send_file(
+        self,
+        channel_id: str,
+        file_path: str,
+        content: str = "",
+    ) -> ChannelSendResult:
+        """Upload a local file to Slack using the external upload flow."""
+        path = Path(file_path)
+        client = self._get_client()
+        start_resp = await client.post(
+            "/files.getUploadURLExternal",
+            json={"filename": path.name, "length": path.stat().st_size},
+        )
+        start_resp.raise_for_status()
+        start_data = start_resp.json()
+        if not start_data.get("ok"):
+            raise RuntimeError(f"Slack file upload init error: {start_data.get('error')}")
+        upload_url = str(start_data.get("upload_url", ""))
+        file_id = str(start_data.get("file_id", ""))
+        if not upload_url or not file_id:
+            raise RuntimeError("Slack file upload init response missing upload_url/file_id")
+
+        with path.open("rb") as f:
+            upload_resp = await client.post(upload_url, files={"file": (path.name, f)})
+        upload_resp.raise_for_status()
+
+        complete_payload: dict[str, Any] = {
+            "files": [{"id": file_id, "title": path.name}],
+            "channel_id": channel_id,
+        }
+        if content:
+            complete_payload["initial_comment"] = content
+        complete_resp = await client.post(
+            "/files.completeUploadExternal",
+            json=complete_payload,
+        )
+        complete_resp.raise_for_status()
+        complete_data = complete_resp.json()
+        if not complete_data.get("ok"):
+            raise RuntimeError(f"Slack file upload complete error: {complete_data.get('error')}")
+        return ChannelSendResult.sent(
+            capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+            target_id=channel_id,
+            provider_file_id=file_id,
+        )
 
     async def edit(self, message_id: str, content: str) -> None:
         """Update an existing Slack message via chat.update."""

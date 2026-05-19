@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -138,20 +139,42 @@ def search_all(
 ) -> dict[str, object]:
     results: list[dict[str, object]] = []
     errors: list[EngineError] = []
+    handlers: list[tuple[str, Callable[[str, int], list[Result]] | None, str | None]] = []
     for name in engines:
         handler = ENGINES.get(name)
         if handler is None:
-            errors.append(EngineError(name, "unknown engine"))
+            handlers.append((name, None, "unknown engine"))
             if strict:
                 break
             continue
-        try:
-            for r in handler(query, limit):
+        handlers.append((name, handler, None))
+
+    def _run_engine(handler: Callable[[str, int], list[Result]]) -> list[Result]:
+        return handler(query, limit)
+
+    max_workers = max(1, len(handlers))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            name: executor.submit(_run_engine, handler)
+            for name, handler, known_error in handlers
+            if handler is not None and known_error is None
+        }
+
+        for name, _handler, known_error in handlers:
+            if known_error is not None:
+                errors.append(EngineError(name, known_error))
+                if strict:
+                    break
+                continue
+            try:
+                engine_results = futures[name].result()
+            except Exception as exc:  # network, key missing, parser breaks — keep going
+                errors.append(EngineError(name, str(exc)))
+                if strict:
+                    break
+                continue
+            for r in engine_results:
                 results.append(r.__dict__)
-        except Exception as exc:  # network, key missing, parser breaks — keep going
-            errors.append(EngineError(name, str(exc)))
-            if strict:
-                break
     return {
         "query": query,
         "results": results,

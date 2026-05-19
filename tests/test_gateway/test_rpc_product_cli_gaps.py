@@ -9,7 +9,7 @@ import pytest
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
-from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
+from opensquilla.gateway.scopes import ADMIN_SCOPE, METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.memory.types import MemorySearchResult, MemorySource, SearchIntent
 from opensquilla.search.registry import register_provider
 from opensquilla.search.types import SearchProviderError, SearchProviderSpec, SearchResult
@@ -19,10 +19,11 @@ from opensquilla.tools.builtin.web import configure_search, run_web_search_paylo
 @dataclass
 class FakeMemoryManager:
     workspace_dir: Any
-    memory_config: Any = field(
-        default_factory=lambda: SimpleNamespace(index_captured_turns=False)
-    )
+    memory_config: Any = field(default_factory=SimpleNamespace)
     search_calls: list[tuple[str, Any, Any]] | None = None
+    status_payload: dict[str, Any] | None = None
+    sync_calls: list[tuple[str, bool]] = field(default_factory=list)
+    store: Any = None
 
     async def search(self, query: str, opts: Any, *, intent: Any) -> list[MemorySearchResult]:
         if self.search_calls is None:
@@ -43,6 +44,29 @@ class FakeMemoryManager:
                 citation="memory/a.md#L1-L2",
             )
         ]
+
+    async def status(self) -> dict[str, Any]:
+        return self.status_payload or {
+            "agent_id": "main",
+            "file_count": 0,
+            "chunk_count": 0,
+            "total_size_bytes": 0,
+            "source_counts": {},
+            "vec_available": False,
+            "fts_available": True,
+            "degraded": [],
+        }
+
+    async def sync(self, *, reason: str = "manual", force: bool = False) -> None:
+        self.sync_calls.append((reason, force))
+
+
+class FakeStore:
+    def __init__(self) -> None:
+        self.rebuild_calls = 0
+
+    async def rebuild(self) -> None:
+        self.rebuild_calls += 1
 
 
 def _ctx(**kwargs: Any) -> RpcContext:
@@ -72,6 +96,37 @@ async def test_new_product_rpc_methods_are_classified_read_scope():
         entry = dispatcher.get_entry(method)
         assert entry is not None
         assert entry.required_scope == READ_SCOPE
+
+
+@pytest.mark.asyncio
+async def test_memory_admin_rpc_methods_are_classified_admin_scope_and_deny_read_only():
+    dispatcher = get_dispatcher()
+    for method in (
+        "memory.index",
+        "memory.raw_fallbacks.list",
+        "memory.raw_fallbacks.show",
+    ):
+        assert METHOD_SCOPES[method] == ADMIN_SCOPE
+        entry = dispatcher.get_entry(method)
+        assert entry is not None
+        assert entry.required_scope == ADMIN_SCOPE
+
+    read_only = Principal(
+        role="operator",
+        scopes=frozenset({READ_SCOPE}),
+        is_owner=False,
+        authenticated=True,
+    )
+    manager = FakeMemoryManager(workspace_dir="/tmp/memory")
+    res = await dispatcher.dispatch(
+        "r1",
+        "memory.index",
+        {"agentId": "main", "force": True},
+        _ctx(principal=read_only, memory_managers={"main": manager}),
+    )
+
+    assert res.error is not None
+    assert res.error.code == "UNAUTHORIZED"
 
 
 @pytest.mark.asyncio
@@ -105,7 +160,7 @@ async def test_memory_search_uses_admin_intent_and_returns_wire_rows(tmp_path):
     res = await get_dispatcher().dispatch(
         "r1",
         "memory.search",
-        {"query": "alpha", "agentId": "main", "limit": 3},
+        {"query": "alpha", "agentId": "main", "limit": 3, "minScore": 0.0},
         _ctx(memory_managers={"main": manager}),
     )
 
@@ -115,6 +170,80 @@ async def test_memory_search_uses_admin_intent_and_returns_wire_rows(tmp_path):
     assert manager.search_calls is not None
     assert manager.search_calls[0][2] is SearchIntent.ADMIN
     assert manager.search_calls[0][1].max_results == 3
+    assert manager.search_calls[0][1].min_score == 0.0
+
+
+@pytest.mark.asyncio
+async def test_memory_search_accepts_source_filter(tmp_path):
+    manager = FakeMemoryManager(workspace_dir=tmp_path)
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "memory.search",
+        {"query": "alpha", "agentId": "main", "source": "sessions"},
+        _ctx(memory_managers={"main": manager}),
+    )
+
+    assert res.error is None, res.error
+    assert manager.search_calls is not None
+    assert manager.search_calls[0][1].source is MemorySource.sessions
+
+
+@pytest.mark.asyncio
+async def test_memory_search_rejects_invalid_source_filter(tmp_path):
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "memory.search",
+        {"query": "alpha", "agentId": "main", "source": "raw"},
+        _ctx(memory_managers={"main": FakeMemoryManager(workspace_dir=tmp_path)}),
+    )
+
+    assert res.error is not None
+    assert res.error.code == "INVALID_REQUEST"
+
+
+@pytest.mark.asyncio
+async def test_memory_search_defaults_to_bundled_query_shape(tmp_path):
+    manager = FakeMemoryManager(workspace_dir=tmp_path)
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "memory.search",
+        {"query": "alpha", "agentId": "main"},
+        _ctx(memory_managers={"main": manager}),
+    )
+
+    assert res.error is None, res.error
+    assert manager.search_calls is not None
+    opts = manager.search_calls[0][1]
+    assert opts.max_results == 6
+    assert opts.min_score == 0.35
+
+
+@pytest.mark.asyncio
+async def test_memory_search_clamps_numeric_min_score_range(tmp_path):
+    manager = FakeMemoryManager(workspace_dir=tmp_path)
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "memory.search",
+        {"query": "alpha", "agentId": "main", "minScore": 2.0},
+        _ctx(memory_managers={"main": manager}),
+    )
+
+    assert res.error is None, res.error
+    assert manager.search_calls is not None
+    assert manager.search_calls[0][1].min_score == 1.0
+
+
+@pytest.mark.asyncio
+async def test_memory_search_rejects_non_numeric_min_score(tmp_path):
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "memory.search",
+        {"query": "alpha", "agentId": "main", "minScore": "bad"},
+        _ctx(memory_managers={"main": FakeMemoryManager(workspace_dir=tmp_path)}),
+    )
+
+    assert res.error is not None
+    assert res.error.code == "INVALID_REQUEST"
 
 
 @pytest.mark.asyncio
@@ -139,7 +268,7 @@ async def test_memory_search_reports_unavailable_and_missing_agent(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_memory_list_returns_public_source_files_only(tmp_path):
+async def test_memory_list_returns_curated_source_files_only(tmp_path):
     (tmp_path / "MEMORY.md").write_text("root\n", encoding="utf-8")
     memory_dir = tmp_path / "memory"
     archive_dir = memory_dir / "archive"
@@ -147,7 +276,7 @@ async def test_memory_list_returns_public_source_files_only(tmp_path):
     archive_dir.mkdir(parents=True)
     hidden_dir.mkdir(parents=True)
     (memory_dir / "a.md").write_text("one\ntwo\n", encoding="utf-8")
-    (archive_dir / "x.md").write_text("private\n", encoding="utf-8")
+    (archive_dir / "x.md").write_text("curated\n", encoding="utf-8")
     (hidden_dir / "x.md").write_text("hidden\n", encoding="utf-8")
 
     res = await get_dispatcher().dispatch(
@@ -159,7 +288,7 @@ async def test_memory_list_returns_public_source_files_only(tmp_path):
 
     assert res.error is None, res.error
     paths = [row["path"] for row in res.payload["files"]]
-    assert paths == ["MEMORY.md", "memory/a.md"]
+    assert paths == ["MEMORY.md", "memory/a.md", "memory/archive/x.md"]
     assert res.payload["files"][1]["lineCount"] == 2
 
 
@@ -194,11 +323,11 @@ async def test_memory_show_line_slice_and_truncation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_memory_show_rejects_traversal_archive_excess_lines_and_big_unsliced_file(tmp_path):
+async def test_memory_show_rejects_traversal_excess_lines_and_big_unsliced_file(tmp_path):
     memory_dir = tmp_path / "memory"
     archive_dir = memory_dir / "archive"
     archive_dir.mkdir(parents=True)
-    (archive_dir / "x.md").write_text("private", encoding="utf-8")
+    (archive_dir / "x.md").write_text("curated", encoding="utf-8")
     big = memory_dir / "big.md"
     big.write_text("x" * (1024 * 1024 + 1), encoding="utf-8")
     manager = FakeMemoryManager(workspace_dir=tmp_path)
@@ -236,8 +365,8 @@ async def test_memory_show_rejects_traversal_archive_excess_lines_and_big_unslic
 
     assert traversal.error is not None
     assert traversal.error.code == "INVALID_REQUEST"
-    assert archive.error is not None
-    assert archive.error.code == "INVALID_REQUEST"
+    assert archive.error is None, archive.error
+    assert archive.payload["content"] == "curated"
     assert too_many_lines.error is not None
     assert too_many_lines.error.code == "INVALID_REQUEST"
     assert sliced_big.error is None, sliced_big.error
@@ -245,6 +374,168 @@ async def test_memory_show_rejects_traversal_archive_excess_lines_and_big_unslic
     assert sliced_big.payload["truncated"] is True
     assert too_big.error is not None
     assert too_big.error.code == "INVALID_REQUEST"
+
+
+@pytest.mark.asyncio
+async def test_doctor_memory_status_deep_redacts_paths_and_raw_errors(tmp_path):
+    leaky_path = tmp_path / "state" / "memory.db"
+
+    class LeakyBackend:
+        async def health_check(self):
+            return {
+                "backend": "sqlite",
+                "status": "error",
+                "entryCount": 1,
+                "sizeBytes": 2,
+                "error": f"{leaky_path} failed",
+            }
+
+    manager = FakeMemoryManager(
+        workspace_dir=tmp_path,
+        status_payload={
+            "agent_id": "main",
+            "db_path": str(leaky_path),
+            "workspace_dir": str(tmp_path),
+            "memory_dir": str(tmp_path / "memory"),
+            "file_count": 1,
+            "chunk_count": 2,
+            "total_size_bytes": 3,
+            "source_counts": {"memory": 1},
+            "vec_available": False,
+            "fts_available": True,
+            "degraded": [
+                {
+                    "component": "store",
+                    "operation": "probe",
+                    "error": f"{leaky_path} exploded",
+                }
+            ],
+            "retrieval_mode": "fts_only",
+        },
+    )
+    ctx = _ctx(memory_managers={"main": manager})
+    ctx.memory_backend = LeakyBackend()
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "doctor.memory.status",
+        {"agentId": "main", "deep": True},
+        ctx,
+    )
+
+    assert res.error is None, res.error
+    rendered = repr(res.payload)
+    assert str(tmp_path) not in rendered
+    assert "memory.db" not in rendered
+    assert "exploded" not in rendered
+    assert res.payload["vecAvailable"] is False
+    assert res.payload["ftsAvailable"] is True
+    assert res.payload["degraded"][0] == {
+        "component": "store",
+        "operation": "probe",
+        "error": "redacted",
+    }
+
+
+@pytest.mark.asyncio
+async def test_doctor_memory_status_accepts_memory_backend_protocol_health(tmp_path):
+    class ProtocolBackend:
+        async def health(self):
+            return {
+                "backend": "sqlite",
+                "status": "ok",
+                "entryCount": 4,
+                "sizeBytes": 5,
+            }
+
+    manager = FakeMemoryManager(workspace_dir=tmp_path)
+    ctx = _ctx(memory_managers={"main": manager})
+    ctx.memory_backend = ProtocolBackend()
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "doctor.memory.status",
+        {"agentId": "main"},
+        ctx,
+    )
+
+    assert res.error is None, res.error
+    assert res.payload["backend"] == "sqlite"
+    assert res.payload["status"] == "ok"
+    assert res.payload["entryCount"] == 4
+    assert res.payload["sizeBytes"] == 5
+
+
+@pytest.mark.asyncio
+async def test_memory_index_force_rebuilds_then_force_syncs(tmp_path):
+    store = FakeStore()
+    manager = FakeMemoryManager(workspace_dir=tmp_path, store=store)
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "memory.index",
+        {"agentId": "main", "force": True},
+        _ctx(memory_managers={"main": manager}),
+    )
+
+    assert res.error is None, res.error
+    assert store.rebuild_calls == 1
+    assert manager.sync_calls == [("manual", True)]
+    assert res.payload["force"] is True
+
+
+@pytest.mark.asyncio
+async def test_memory_index_non_force_uses_ordinary_sync(tmp_path):
+    store = FakeStore()
+    manager = FakeMemoryManager(workspace_dir=tmp_path, store=store)
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "memory.index",
+        {"agentId": "main"},
+        _ctx(memory_managers={"main": manager}),
+    )
+
+    assert res.error is None, res.error
+    assert store.rebuild_calls == 0
+    assert manager.sync_calls == [("manual", False)]
+    assert res.payload["force"] is False
+
+
+@pytest.mark.asyncio
+async def test_raw_fallback_admin_list_show_is_sidecar_only(tmp_path):
+    raw_dir = tmp_path / "memory" / ".raw_fallbacks"
+    raw_dir.mkdir(parents=True)
+    raw_path = raw_dir / "raw.md"
+    raw_path.write_text("# Raw flush (timeout)\nsecret transcript\n", encoding="utf-8")
+    (tmp_path / "memory" / "a.md").write_text("curated\n", encoding="utf-8")
+    manager = FakeMemoryManager(workspace_dir=tmp_path)
+
+    listed = await get_dispatcher().dispatch(
+        "r1",
+        "memory.raw_fallbacks.list",
+        {"agentId": "main"},
+        _ctx(memory_managers={"main": manager}),
+    )
+    shown = await get_dispatcher().dispatch(
+        "r2",
+        "memory.raw_fallbacks.show",
+        {"agentId": "main", "path": "memory/.raw_fallbacks/raw.md"},
+        _ctx(memory_managers={"main": manager}),
+    )
+    traversal = await get_dispatcher().dispatch(
+        "r3",
+        "memory.raw_fallbacks.show",
+        {"agentId": "main", "path": "memory/.raw_fallbacks/../a.md"},
+        _ctx(memory_managers={"main": manager}),
+    )
+
+    assert listed.error is None, listed.error
+    assert listed.payload["files"][0]["path"] == "memory/.raw_fallbacks/raw.md"
+    assert shown.error is None, shown.error
+    assert "secret transcript" in shown.payload["content"]
+    assert traversal.error is not None
+    assert traversal.error.code == "INVALID_REQUEST"
 
 
 @pytest.mark.asyncio

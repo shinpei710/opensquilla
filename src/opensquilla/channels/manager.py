@@ -99,6 +99,7 @@ class ChannelManager:
                 continue
 
             channels[entry.name] = adapter
+            cls._register_tool_channel(entry.name, adapter)
             agent_ids[entry.name] = getattr(entry, "agent_id", "main")
             channel_types[entry.name] = entry.type
             setattr(adapter, "debounce_window_s", getattr(entry, "debounce_window_s", 0.0))
@@ -116,6 +117,52 @@ class ChannelManager:
             _agent_ids=agent_ids,
             _channel_types=channel_types,
         )
+
+    @staticmethod
+    def _register_tool_channel(name: str, adapter: ManagedChannel) -> None:
+        try:
+            from opensquilla.tools.builtin.messaging import register_channel
+
+            register_channel(name, adapter)
+        except Exception as exc:
+            log.debug("channel.tool_register_failed", name=name, tool="message", error=str(exc))
+        if type(adapter).__name__ != "FeishuChannel":
+            return
+        try:
+            from opensquilla.channels.feishu import FeishuChannel
+            from opensquilla.tools.builtin.feishu_platform import register_feishu_channel
+
+            if isinstance(adapter, FeishuChannel):
+                register_feishu_channel(name, adapter)
+        except Exception as exc:
+            log.debug(
+                "channel.tool_register_failed",
+                name=name,
+                tool="feishu_platform",
+                error=str(exc),
+            )
+
+    @staticmethod
+    def _unregister_tool_channel(name: str, adapter: ManagedChannel | None) -> None:
+        try:
+            from opensquilla.tools.builtin.messaging import unregister_channel
+
+            unregister_channel(name)
+        except Exception as exc:
+            log.debug("channel.tool_unregister_failed", name=name, tool="message", error=str(exc))
+        if adapter is not None and type(adapter).__name__ != "FeishuChannel":
+            return
+        try:
+            from opensquilla.tools.builtin.feishu_platform import unregister_feishu_channel
+
+            unregister_feishu_channel(name)
+        except Exception as exc:
+            log.debug(
+                "channel.tool_unregister_failed",
+                name=name,
+                tool="feishu_platform",
+                error=str(exc),
+            )
 
     # ── Webhook routes ───────────────────────────────────────
 
@@ -172,12 +219,15 @@ class ChannelManager:
         adapter = self._channels[name]
         startup_timeout = float(getattr(adapter, "startup_timeout_s", 30.0))
         try:
+            self._unregister_tool_channel(name, adapter)
             await asyncio.wait_for(adapter.start(), timeout=startup_timeout)
+            self._register_tool_channel(name, adapter)
         except Exception:
             stop = getattr(adapter, "stop", None)
             if callable(stop):
                 with contextlib.suppress(Exception):
                     await stop()
+            self._unregister_tool_channel(name, adapter)
             raise
         entry_agent_id = self._agent_ids.get(name, "main")
         key_builder = partial(self._build_session_key, name, agent_id=entry_agent_id)
@@ -287,7 +337,7 @@ class ChannelManager:
 
     async def stop_all(self) -> None:
         """Stop every managed channel (dispatch task + adapter)."""
-        for name in list(self._tasks):
+        for name in list(self._channels):
             await self.stop_channel(name)
         await self._debounce_coordinator.cancel_all()
 
@@ -313,6 +363,7 @@ class ChannelManager:
         adapter = self._channels.get(name)
         if adapter:
             await adapter.stop()
+        self._unregister_tool_channel(name, adapter)
 
     async def restart_channel(self, name: str) -> None:
         """Stop then re-start a single channel.
@@ -473,7 +524,9 @@ class ChannelManager:
                 channel=channel_name,
                 peer_id=msg.channel_id,  # group/room ID, NOT sender
             )
-            thread_id = meta.get("thread_ts") or meta.get("thread_id")
+            thread_id = (
+                meta.get("native_thread_id") or meta.get("thread_ts") or meta.get("thread_id")
+            )
             if isinstance(thread_id, str) and thread_id:
                 return build_thread_key(base_key, thread_id, channel_hint=channel_name)
             return base_key

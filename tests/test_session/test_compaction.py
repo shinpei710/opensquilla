@@ -50,6 +50,9 @@ async def test_compaction_occurs_when_over_budget():
     assert result.summary != ""
     assert result.chunks_processed >= 1
     assert result.summary_source == "fallback"
+    assert result.tokens_before == 4000
+    assert result.tokens_after < result.tokens_before
+    assert result.remaining_budget_tokens >= 0
 
 
 @pytest.mark.asyncio
@@ -226,3 +229,78 @@ async def test_call_compaction_llm_adds_openrouter_app_attribution(monkeypatch) 
         "X-OpenRouter-Title": "OpenSquilla",
         "X-OpenRouter-Categories": "cli-agent,personal-agent",
     }
+
+
+@pytest.mark.asyncio
+async def test_call_compaction_llm_timeout_returns_none(monkeypatch) -> None:
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, json, headers):
+            raise TimeoutError("summary timed out")
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.httpx.AsyncClient",
+        lambda **kwargs: FakeClient(),
+    )
+
+    result = await call_compaction_llm(
+        chunk_text="old conversation",
+        identifier_instruction="",
+        model="openai/gpt-4o-mini",
+        api_key="test-key",
+        timeout=0.01,
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_custom_instructions_are_user_scoped_and_identifier_policy_stays_system(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": "summary"}}]}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, json, headers):
+            captured["json"] = json
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction.httpx.AsyncClient",
+        lambda **kwargs: FakeClient(),
+    )
+
+    await call_compaction_llm(
+        chunk_text="old conversation",
+        identifier_instruction="Preserve exact IDs.",
+        model="openai/gpt-4o-mini",
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        timeout=10.0,
+        custom_instructions="Focus on deployment decisions.",
+    )
+
+    messages = captured["json"]["messages"]
+    assert messages[0]["role"] == "system"
+    assert "Preserve exact IDs." in messages[0]["content"]
+    assert "Focus on deployment decisions." not in messages[0]["content"]
+    assert messages[1]["role"] == "user"
+    assert "Focus on deployment decisions." in messages[1]["content"]

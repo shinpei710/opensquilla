@@ -15,6 +15,7 @@ const ChatView = (() => {
   // Browser-scoped elevated mode. "full" maps to /elevated full.
   const _ELEVATED_MODE_KEY = 'opensquilla.elevatedMode';
   let _elevatedMode = '';
+  let _globalElevatedMode = '';
   // The /api/elevated-mode endpoint is owner-only. When the gateway is bound
   // to a wildcard address (LAN deploy), no peer is treated as owner and the
   // endpoint always returns 403. We latch this state on the first failed
@@ -140,12 +141,42 @@ const ChatView = (() => {
   let _thinkingDelayTimer = null;
   const _THINKING_DELAY_MS = 400;  // don't show for fast responses
   const _THINKING_TTL_MS = 60000;  // 60s auto-hide
+  // kept in sync with stream.py WaitingIndicator._verbs
+  const SQUILLA_VERBS = ['Watching','Tracking','Sensing','Pulsing','Thinking','Drafting','Composing','Polishing'];
+  const SQUILLA_DWELL_MS = 2500;
 
   // Inline directive tags — control signals the LLM emits per system prompt
   // instructions (e.g. reply threading).  Must be stripped before display.
   const _DIRECTIVE_TAG_RE = /\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*/g;
   function _stripDirectiveTags(text) {
     return text.replace(_DIRECTIVE_TAG_RE, '').replace(/^\n+/, '');
+  }
+  const _PROTOCOL_TEXT_MARKER_RE = /<\s*(?:minimax:tool_call|tool_calls?|tvoe_calls|invoke\b|parameter\b|effect_calls\b|details\b|angle\s+brackets\b)/i;
+  const _PROTOCOL_TEXT_PARAMETER_RE = /<\s*parameter\s+name\s*=\s*["'](?:path|content|command|code|patch)["']/i;
+  const _PROTOCOL_TEXT_INVOKE_RE = /<\s*invoke\s+name\s*=\s*["'][A-Za-z_][A-Za-z0-9_.:-]*["']/i;
+  const _PROTOCOL_TEXT_HTML_RE = /<!doctype\s+html\b|<html\b|<\/html\s*>/i;
+  const _PROTOCOL_TEXT_CLOSE_RE = /<\/\s*invoke\s*>|<\/\s*(?:tool_calls?|tvoe_calls)\s*>/i;
+  const _PROTOCOL_TEXT_STANDALONE_RE = /<\s*(?:parameter|effect_calls|tool_calls?|tvoe_calls|angle\s+brackets)\s*>/i;
+  const _PROTOCOL_TEXT_DETAILS_RE = /<\s*details\s*>\s*<\s*summary\s*>\s*View areas around line\b/i;
+
+  function _looksLikeProtocolTextSuffix(suffix) {
+    if (/<\s*minimax:tool_call\s*>/i.test(suffix)) return true;
+    if (_PROTOCOL_TEXT_STANDALONE_RE.test(suffix)) return true;
+    if (_PROTOCOL_TEXT_DETAILS_RE.test(suffix)) return true;
+    if (_PROTOCOL_TEXT_PARAMETER_RE.test(suffix)) return true;
+    if (_PROTOCOL_TEXT_INVOKE_RE.test(suffix) && _PROTOCOL_TEXT_CLOSE_RE.test(suffix)) return true;
+    if (_PROTOCOL_TEXT_HTML_RE.test(suffix) && _PROTOCOL_TEXT_INVOKE_RE.test(suffix)) return true;
+    return false;
+  }
+
+  function _stripProtocolTextLeak(text) {
+    text = String(text || '');
+    if (!text) return text;
+    const match = _PROTOCOL_TEXT_MARKER_RE.exec(text);
+    if (!match) return text;
+    const suffix = text.slice(match.index);
+    if (!_looksLikeProtocolTextSuffix(suffix)) return text;
+    return text.slice(0, match.index).trimEnd();
   }
 
   // Server-side per-turn time prefix: [YYYY-MM-DDTHH:MM±HH:MM Day TZ_NAME]\n{body}
@@ -165,14 +196,38 @@ const ChatView = (() => {
   let _searchProvider = '';
   const _PROVIDER_LOGOS = { brave: '\uD83E\uDD81', duckduckgo: '\uD83E\uDD86' }; // 🦁 🦆
 
+  function _normalizeProvider(provider) {
+    return String(provider || '').trim();
+  }
+
   function _injectProviderBadge(summary, provider) {
+    provider = _normalizeProvider(provider);
     if (!summary || !provider) return;
-    if (summary.querySelector('.chat-tool-provider')) return;
-    const badge = document.createElement('span');
-    badge.className = 'chat-tool-provider';
+    let badge = summary.querySelector('.chat-tool-provider');
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'chat-tool-provider';
+      summary.appendChild(badge);
+    }
     badge.textContent = (_PROVIDER_LOGOS[provider] || '') + ' ' + provider;
     badge.title = 'Search provider: ' + provider;
-    summary.appendChild(badge);
+  }
+
+  function _refreshRunningSearchProviderBadges(provider) {
+    provider = _normalizeProvider(provider);
+    if (!_el || !provider) return;
+    _el
+      .querySelectorAll('.chat-tools-collapse--running[data-tool-name="web_search"] .chat-tools-summary')
+      .forEach(summary => _injectProviderBadge(summary, provider));
+  }
+
+  function _setSearchProvider(provider, options = {}) {
+    provider = _normalizeProvider(provider);
+    if (!provider) return;
+    _searchProvider = provider;
+    if (options.refreshRunning !== false) {
+      _refreshRunningSearchProviderBadges(provider);
+    }
   }
 
   function _toolResultProvider(payloadOrSegment, content) {
@@ -194,11 +249,9 @@ const ChatView = (() => {
   let _slashOpen = false;
   let _slashIdx = 0;
   let _filteredCmds = [];
-  const _SLASH_CMDS = [
-    { cmd: '/new',     label: 'New chat',        desc: 'Start a fresh chat session in the current agent' },
-    { cmd: '/reset',   label: 'Reset session',   desc: 'Clear session history' },
-    { cmd: '/compact', label: 'Compact context',  desc: 'Compact session context' },
-  ];
+  let _slashCmds = [];
+  let _slashCommandMap = new Map();
+  let _slashCatalogLoaded = false;
 
   // Tool icon mapping
   const _TOOL_EMOJI = {
@@ -218,9 +271,8 @@ const ChatView = (() => {
     return _TOOL_EMOJI[name] || '\u26A1'; // ⚡ default
   }
 
-  // Context-usage tracking
-  let _totalTokens = 0;
-  const _CTX_WARN_THRESHOLD = 170000;
+  // Context-pressure tracking. This is current provider context, not lifetime usage.
+  let _contextStatus = null;
 
   // Token visualization shim. Gated by window.OPENSQUILLA_FEATURES.tokenViz; when off
   // every method is a no-op so downstream call sites don't need to special-case
@@ -285,7 +337,7 @@ const ChatView = (() => {
     if (!_sessionKey) return;
     try {
       await _rpc.waitForConnection();
-      const usage = await _rpc.call('usage.status');
+      const usage = await _rpc.call('usage.status', { sessionKey: _sessionKey });
       const sessions = usage?.sessions || [];
       const current = sessions.find(s =>
         (s.session || s.sessionKey || s.key) === _sessionKey
@@ -299,9 +351,14 @@ const ChatView = (() => {
         _usageAccum.cost = costVal > 0 ? costVal : null;
         _usageModel = current.model || '';
         _viz.update({ ..._usageAccum, model: _usageModel });
+        _applyContextStatus(current.contextStatus || current.context_status || null);
         _saveWidgetState();
+      } else {
+        _clearContextStatus();
       }
-    } catch { /* usage load optional */ }
+    } catch {
+      _clearContextStatus();
+    }
   }
 
   // Messages (for export)
@@ -649,7 +706,28 @@ const ChatView = (() => {
       const span = document.createElement('span');
       span.className = 'msg-meta__tokens';
       span.textContent = `↑${_fmtTok(totalIn)} ↓${_fmtTok(totalOut)}`;
-      span.title = `Session API total — input: ${totalIn.toLocaleString()}, output: ${totalOut.toLocaleString()} tokens`;
+      span.title = `Turn — input: ${totalIn.toLocaleString()}, output: ${totalOut.toLocaleString()} tokens`;
+      meta.appendChild(span);
+    }
+    if (u.cached_tokens > 0) {
+      const span = document.createElement('span');
+      span.className = 'msg-meta__cached';
+      span.textContent = `cache:${_fmtTok(u.cached_tokens)}`;
+      span.title = `Cached tokens: ${u.cached_tokens.toLocaleString()}`;
+      meta.appendChild(span);
+    }
+    if (u.reasoning_tokens > 0) {
+      const span = document.createElement('span');
+      span.className = 'msg-meta__reasoning';
+      span.textContent = `think:${_fmtTok(u.reasoning_tokens)}`;
+      span.title = `Reasoning tokens: ${u.reasoning_tokens.toLocaleString()}`;
+      meta.appendChild(span);
+    }
+    if (u.cost_usd > 0) {
+      const span = document.createElement('span');
+      span.className = 'msg-meta__cost';
+      span.textContent = `$${u.cost_usd.toFixed(6).replace(/\.?0+$/, '')}`;
+      span.title = `Turn cost: $${u.cost_usd.toFixed(6)}`;
       meta.appendChild(span);
     }
     if (hasSaved) {
@@ -786,7 +864,7 @@ const ChatView = (() => {
     // Fetch active search provider on every render so config changes take effect immediately
     if (_rpc) {
       _rpc.call('tools.search_provider', {}).then(res => {
-        if (res && res.provider) _searchProvider = res.provider;
+        if (res && res.provider) _setSearchProvider(res.provider);
       }).catch(() => { /* ignore; badge will fill in from result JSON */ });
     }
 
@@ -895,7 +973,7 @@ const ChatView = (() => {
     _composer     = _el.querySelector('#chat-composer');
 
     _messages = [];
-    _totalTokens = 0;
+    _clearContextStatus();
     _lastHeaderRole = '';
     _lastHeaderDay = '';
     _applySessionRunState({ run_status: 'idle' });
@@ -912,6 +990,7 @@ const ChatView = (() => {
     _subscribeSession();
     _loadHistory();
     _loadFeatureToggles();
+    _loadSlashCommands();
 
     // Autofocus chat input
     if (_textarea) _textarea.focus();
@@ -1005,6 +1084,9 @@ const ChatView = (() => {
       const routerToggle = _el?.querySelector('#toggle-router');
       if (routerToggle) routerToggle.checked = routerEnabled;
       _toolbarState.router = routerEnabled;
+      _globalElevatedMode = _normalizeElevatedMode(cfg?.permissions?.default_mode);
+      _toolbarState.bypass = _isApprovalBypassMode(_effectiveElevatedMode());
+      _updateElevatedPill();
       _refreshToolbarTriggerGlow();
 
       // Load current session usage for the token widget (survives page refresh)
@@ -1062,6 +1144,7 @@ const ChatView = (() => {
   function _normalizeRunStatus(status) {
     const value = String(status || '').toLowerCase();
     if (value === 'abandoned') return 'interrupted';
+    if (value === 'killed') return 'cancelled';
     if (value === 'succeeded' || value === 'success' || value === 'complete') return 'idle';
     if (['queued', 'running', 'interrupted', 'failed', 'timeout', 'cancelled'].includes(value)) {
       return value;
@@ -1101,6 +1184,31 @@ const ChatView = (() => {
 
   function _clearActiveTaskGroups() {
     _activeTaskGroups.clear();
+  }
+
+  function _isCurrentSessionPayload(payload) {
+    const key = payload?.key || payload?.session_key || payload?.sessionKey || '';
+    return !key || !_sessionKey || key === _sessionKey;
+  }
+
+  function _sessionChangeIsTerminal(payload) {
+    const reason = String(payload?.reason || '').toLowerCase();
+    if (reason === 'turn_complete' || reason === 'task_terminal') return true;
+    const lifecycle = String(payload?.status || '').toLowerCase();
+    if (['done', 'failed', 'killed', 'timeout'].includes(lifecycle)) return true;
+    const runStatus = _normalizeRunStatus(payload?.run_status || payload?.runStatus);
+    return ['failed', 'timeout', 'cancelled', 'interrupted'].includes(runStatus);
+  }
+
+  function _syncTerminalSessionChange(payload = {}) {
+    if (!_isCurrentSessionPayload(payload)) return false;
+    _clearActiveTaskGroups();
+    const state = _sessionRunStatus(payload);
+    const interrupted = state.status === 'cancelled' || state.status === 'interrupted';
+    if (_isStreaming) _endStreaming(interrupted ? { reason: 'aborted' } : undefined);
+    _applySessionRunState(payload);
+    _scheduleHistorySync();
+    return true;
   }
 
   function _activeTaskGroupRunState(payload = {}) {
@@ -1181,7 +1289,7 @@ const ChatView = (() => {
     _pendingSessionIntent = null;
     _pendingQueue = []; if (_pendingArea) _renderPendingQueue();
     _applySessionRunState({ run_status: 'idle' });
-    _totalTokens = 0;
+    _clearContextStatus();
     _lastHeaderRole = '';
     _lastHeaderDay = '';
     _usageAccum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: null, routedTurns: 0, sessionSaved: 0 };
@@ -1463,7 +1571,15 @@ const ChatView = (() => {
     // Bypass warning chip — only "Approvals bypassed" rises to a visible chip.
     // Tool compress and router-off are non-default but not safety-critical.
     const warn = _el && _el.querySelector('#chat-bypass-warn');
-    if (warn) warn.classList.toggle('hidden', !bypass);
+    if (warn) {
+      const text = warn.querySelector('.chat-bypass-warn__text');
+      if (text) {
+        text.textContent = _elevatedMode
+          ? 'Approvals bypassed for this session'
+          : 'Approvals bypassed by global default';
+      }
+      warn.classList.toggle('hidden', !bypass);
+    }
   }
 
   function _bindToolbarTrigger() {
@@ -1569,6 +1685,14 @@ const ChatView = (() => {
     return mode === 'on' || mode === 'bypass' || mode === 'full' ? mode : '';
   }
 
+  function _effectiveElevatedMode() {
+    return _normalizeElevatedMode(_elevatedMode || _globalElevatedMode);
+  }
+
+  function _isApprovalBypassMode(mode) {
+    return mode === 'bypass' || mode === 'full';
+  }
+
   function _loadElevatedMode() {
     let mode = '';
     try { mode = localStorage.getItem(_ELEVATED_MODE_KEY) || ''; } catch {}
@@ -1584,14 +1708,16 @@ const ChatView = (() => {
         else localStorage.removeItem(_ELEVATED_MODE_KEY);
       } catch {}
     }
-    _toolbarState.bypass = !!normalized;
+    _toolbarState.bypass = _isApprovalBypassMode(_effectiveElevatedMode());
     _refreshToolbarTriggerGlow();
     _updateElevatedPill();
     if (options.toast) {
       UI.toast(
         normalized
           ? `Bypass mode: ${normalized}`
-          : 'Bypass mode disabled',
+          : (_globalElevatedMode
+              ? `Session override cleared; global mode: ${_globalElevatedMode}`
+              : 'Bypass mode disabled'),
         normalized ? 'warn' : 'info',
         2500
       );
@@ -1644,14 +1770,24 @@ const ChatView = (() => {
       _elevatedPill.setAttribute('aria-disabled', 'true');
       return;
     }
-    const active = !!_elevatedMode;
+    const effective = _effectiveElevatedMode();
+    const active = !!effective;
     _elevatedPill.classList.remove('chat-pill--disabled');
     _elevatedPill.removeAttribute('aria-disabled');
     _elevatedPill.classList.toggle('is-active', active);
-    _elevatedPill.textContent = active ? `Bypass ${_elevatedMode.toUpperCase()}` : 'Bypass Off';
-    _elevatedPill.title = active
-      ? 'Bypass all permissions is ON for this browser session. Click to turn it off.'
-      : 'Approval prompts active. Click to enable full bypass for this browser session.';
+    if (_elevatedMode) {
+      _elevatedPill.textContent = `Session ${_elevatedMode.toUpperCase()}`;
+      _elevatedPill.title =
+        'Session permission override is active. Click to clear the browser session override.';
+    } else if (_globalElevatedMode) {
+      _elevatedPill.textContent = `Global ${_globalElevatedMode.toUpperCase()}`;
+      _elevatedPill.title =
+        'Global permission default is controlled by opensquilla sandbox on|bypass|full|reset.';
+    } else {
+      _elevatedPill.textContent = 'Bypass Off';
+      _elevatedPill.title =
+        'Approval prompts active. Click to enable full bypass for this browser session.';
+    }
   }
 
   /* ── Event Bindings ─────────────────────────────────────────────────── */
@@ -1677,7 +1813,7 @@ const ChatView = (() => {
       _persistSession(key);
       _pendingSessionIntent = 'new_chat'; _pendingQueue = []; if (_pendingArea) _renderPendingQueue();
       _messages = [];
-      _totalTokens = 0;
+      _clearContextStatus();
       _lastHeaderRole = '';
       _lastHeaderDay = '';
       _usageAccum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: null, routedTurns: 0, sessionSaved: 0 };
@@ -1802,8 +1938,7 @@ const ChatView = (() => {
       }
     });
 
-    // Document-level ESC: works regardless of focus. Priority chain mirrors
-    // claude-code-rebuilt useCancelRequest:
+    // Document-level ESC: works regardless of focus. Priority chain:
     //   1. streaming  → _onStop (which also recovers pending)
     //   2. pending    → _popAllPendingIntoComposer
     //   3. otherwise drop through to the textarea handler / popovers / no-op
@@ -1889,11 +2024,53 @@ const ChatView = (() => {
 
   /* ── Slash Command Menu ─────────────────────────────────────────────── */
 
+  function _slashCommandKey(value) {
+    const raw = String(value || '').trim().split(/\s+/, 1)[0].toLowerCase();
+    if (!raw) return '';
+    return raw.startsWith('/') ? raw : '/' + raw;
+  }
+
+  function _normalizeSlashCommand(cmd) {
+    const name = cmd?.name || cmd?.cmd || '';
+    return {
+      ...cmd,
+      name,
+      cmd: name,
+      label: cmd?.label || name,
+      desc: cmd?.description || cmd?.desc || cmd?.usage || '',
+      aliases: Array.isArray(cmd?.aliases) ? cmd.aliases : [],
+    };
+  }
+
+  async function _loadSlashCommands() {
+    if (!_rpc) return;
+    try {
+      await _rpc.waitForConnection();
+      const res = await _rpc.call('commands.list_for_surface', { surface: 'web_chat' });
+      _slashCmds = (Array.isArray(res?.commands) ? res.commands : []).map(_normalizeSlashCommand);
+      _slashCommandMap = new Map();
+      _slashCmds.forEach((cmd) => {
+        _slashCommandMap.set(_slashCommandKey(cmd.name), cmd);
+        (cmd.aliases || []).forEach((alias) => {
+          _slashCommandMap.set(_slashCommandKey(alias), cmd);
+        });
+      });
+      _slashCatalogLoaded = true;
+      _handleSlashInput();
+    } catch {
+      _slashCmds = [];
+      _slashCommandMap = new Map();
+      _slashCatalogLoaded = false;
+    }
+  }
+
   function _handleSlashInput() {
+    if (!_textarea) return;
     const val = _textarea.value;
+    if (val.startsWith('//')) { _closeSlashMenu(); return; }
     if (val.startsWith('/') && !val.includes(' ')) {
       const query = val.slice(1).toLowerCase();
-      _filteredCmds = _SLASH_CMDS.filter(c => c.cmd.slice(1).startsWith(query));
+      _filteredCmds = _slashCmds.filter(c => c.cmd.slice(1).startsWith(query));
       if (_filteredCmds.length > 0) {
         _slashOpen = true;
         _slashIdx = 0;
@@ -1934,12 +2111,15 @@ const ChatView = (() => {
     }
   }
 
-  function _selectSlashCmd(cmd) {
+  function _selectSlashCmd(cmd, args = '') {
     _closeSlashMenu();
     _textarea.value = '';
     _autoResizeTextarea();
 
-    switch (cmd.cmd) {
+    const action = cmd?.execution?.action || cmd.cmd || cmd.name;
+    const commandName = cmd?.cmd || cmd?.name || '';
+    switch (action) {
+      case 'new_chat':
       case '/new': {
         _unsubscribeSession();
         const key = _genKey();
@@ -1947,7 +2127,7 @@ const ChatView = (() => {
         _persistSession(key);
         _pendingSessionIntent = 'new_chat'; _pendingQueue = []; if (_pendingArea) _renderPendingQueue();
         _messages = [];
-        _totalTokens = 0;
+        _clearContextStatus();
         _lastHeaderRole = '';
         _lastHeaderDay = '';
         _usageAccum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: null, routedTurns: 0, sessionSaved: 0 };
@@ -1958,35 +2138,76 @@ const ChatView = (() => {
         UI.toast('New chat session in the current agent: ' + key, 'info');
         break;
       }
+      case 'reset_session':
+      case 'sessions.reset':
       case '/reset':
+        if (commandName === '/new') {
+          _selectSlashCmd({ ...cmd, execution: { action: 'new_chat' } }, args);
+          return;
+        }
         _rpc.call('sessions.reset', { key: _sessionKey })
           .then(() => {
             _messages = [];
             _pendingQueue = [];
             if (_pendingArea) _renderPendingQueue();
-            _totalTokens = 0;
+            _clearContextStatus();
             _clearActiveTaskGroups();
             _thread.innerHTML = _emptyStateHTML();
             UI.toast('Session reset', 'info');
           })
           .catch((err) => UI.toast('Reset failed: ' + err.message, 'err'));
         break;
+      case 'compact_context':
+      case 'sessions.contextCompact':
       case '/compact':
         _rpc.call('sessions.contextCompact', { key: _sessionKey })
-          .then((result) => {
-            if (result && result.compacted) {
-              const summaryLen = Number(result.summary_len || 0);
-              UI.toast(
-                'Context compacted' + (summaryLen ? ' (summary ' + summaryLen + ' chars)' : ''),
-                'info'
-              );
-            } else {
-              UI.toast('Context already compact enough', 'info');
-            }
-          })
-          .catch((err) => UI.toast('Compact failed: ' + err.message, 'err'));
+          .then(() => {})
+          .catch((err) => _showCompactionToast({
+            source: 'manual',
+            status: 'failed',
+            message: err && err.message || 'unknown error',
+          }));
         break;
+      case 'usage_status':
+      case 'usage.status':
+      case '/usage': {
+        if (args.trim().toLowerCase() === 'page') {
+          UI.toast('Usage page is available from the sidebar', 'info');
+          break;
+        }
+        const usageMethod = args.trim().toLowerCase() === 'cost' ? 'usage.cost' : 'usage.status';
+        _rpc.call(usageMethod)
+          .then((result) => {
+            if (usageMethod === 'usage.cost') {
+              const total = result?.totalCostUsd ?? result?.total_cost_usd ?? result?.totals?.cost ?? result?.totals?.cost_usd;
+              UI.toast(total != null ? `Usage cost: $${Number(total).toFixed(6)}` : 'Usage cost unavailable', 'info');
+              return;
+            }
+            const totals = result?.totals || {};
+            const tokens = Number(result?.totalTokens ?? result?.total_tokens ?? totals.tokens ?? totals.total_tokens ?? totals.totalTokens ?? 0);
+            const cost = result?.totalCostUsd ?? result?.total_cost_usd ?? totals.cost ?? totals.cost_usd ?? totals.costUsd;
+            UI.toast(
+              `Usage: ${tokens.toLocaleString()} tokens` + (cost != null ? ` · $${Number(cost).toFixed(6)}` : ''),
+              'info'
+            );
+          })
+          .catch((err) => UI.toast('Usage failed: ' + err.message, 'err'));
+        break;
+      }
     }
+  }
+
+  async function _executeSlashCommand(text) {
+    if (!_slashCatalogLoaded) await _loadSlashCommands();
+    const [cmdText, ...rest] = text.trim().split(/\s+/);
+    const cmd = _slashCommandMap.get(_slashCommandKey(cmdText));
+    if (!cmd) {
+      _closeSlashMenu();
+      UI.toast('Unsupported command: ' + cmdText, 'warn', 2500);
+      return true;
+    }
+    _selectSlashCmd(cmd, rest.join(' '));
+    return true;
   }
 
   /* ── Session Message Subscription ───────────────────────────────────── */
@@ -2001,7 +2222,9 @@ const ChatView = (() => {
       if (res && res.subscribed === false) throw new Error('No subscription manager available');
       _applySessionRunState(res);
       if (res && res.replay_complete === false) {
-        _lastStreamSeq = typeof res.current_stream_seq === 'number' ? res.current_stream_seq : 0;
+        _lastStreamSeq = typeof res.current_stream_seq === 'number'
+          ? Math.max(_lastStreamSeq, res.current_stream_seq)
+          : _lastStreamSeq;
         UI.toast('Session stream gap detected; reloading transcript.', 'warn', 5000);
         _loadHistory();
       } else if (res && typeof res.current_stream_seq === 'number') {
@@ -2020,6 +2243,64 @@ const ChatView = (() => {
     } catch { /* ignore */ }
   }
 
+  function _compactionTokenStats(payload) {
+    const beforeRaw = payload ? payload.tokens_before : undefined;
+    const afterRaw = payload ? payload.tokens_after : undefined;
+    const before = Number(beforeRaw);
+    const after = Number(afterRaw);
+    const remaining = Number(payload && payload.remaining_budget_tokens || 0);
+    const source = payload && payload.summary_source || '';
+    const summaryLen = Number(payload && payload.summary_len || 0);
+    if (
+      beforeRaw !== undefined &&
+      beforeRaw !== null &&
+      beforeRaw !== '' &&
+      afterRaw !== undefined &&
+      afterRaw !== null &&
+      afterRaw !== '' &&
+      Number.isFinite(before) &&
+      Number.isFinite(after)
+    ) {
+      const remain = remaining ? ', ' + remaining + ' remaining' : '';
+      const by = source ? ', ' + source : '';
+      return ' (' + before + ' -> ' + after + ' tokens' + remain + by + ')';
+    }
+    if (summaryLen) return ' (summary ' + summaryLen + ' chars)';
+    return '';
+  }
+
+  function _showCompactionToast(payload, meta = {}) {
+    if (meta && meta.replayed) return;
+    const status = String(payload && payload.status || '').toLowerCase();
+    const source = String(payload && payload.source || '').toLowerCase();
+    if (status === 'started') {
+      return;
+    }
+    if (status === 'skipped') {
+      return;
+    }
+    if (status === 'failed' || status === 'error') {
+      const msg = payload && payload.message ? ': ' + payload.message : '';
+      UI.toast('Compact failed' + msg, 'err', 5000);
+      return;
+    }
+    if (status === 'cancelled') {
+      UI.toast('Compact cancelled', 'info', 4500);
+      return;
+    }
+    if (status !== 'completed') return;
+    const details = _compactionTokenStats(payload || {});
+    if (source === 'manual') {
+      UI.toast('Context compacted' + details, 'info', 4500);
+      return;
+    }
+    UI.toast(
+      'Context compacted older messages to keep this session within budget' + details,
+      'info',
+      4500,
+    );
+  }
+
   /* ── RPC Event Subscriptions ────────────────────────────────────────── */
 
   function _subscribeRpcEvents() {
@@ -2036,7 +2317,7 @@ const ChatView = (() => {
     // Text delta: accumulate into streaming bubble
     _unsubs.push(_rpc.on('session.event.text_delta', (payload) => {
       if (_isStaleEpoch(payload)) return;
-      _noteStreamSeq(payload);
+      if (!_acceptStreamSeq(payload)) return;
       _resetStreamIdleTimer();
       _appendDelta(payload.text || '');
     }));
@@ -2045,7 +2326,7 @@ const ChatView = (() => {
     _unsubs.push(_rpc.on('session.event.tool_use_start', (payload) => {
       if (_isStaleEpoch(payload)) return;
       if (_aborted) return;
-      _noteStreamSeq(payload);
+      if (!_acceptStreamSeq(payload)) return;
       _resetStreamIdleTimer();
       _appendToolCall(payload);
     }));
@@ -2054,7 +2335,7 @@ const ChatView = (() => {
     _unsubs.push(_rpc.on('session.event.tool_result', (payload) => {
       if (_isStaleEpoch(payload)) return;
       if (_aborted) return;
-      _noteStreamSeq(payload);
+      if (!_acceptStreamSeq(payload)) return;
       _resetStreamIdleTimer();
       _appendToolResult(payload);
     }));
@@ -2062,7 +2343,7 @@ const ChatView = (() => {
     _unsubs.push(_rpc.on('session.event.artifact', (payload) => {
       if (_isStaleEpoch(payload)) return;
       if (_aborted) return;
-      _noteStreamSeq(payload);
+      if (!_acceptStreamSeq(payload)) return;
       _resetStreamIdleTimer();
       _appendArtifact(payload);
     }));
@@ -2070,7 +2351,7 @@ const ChatView = (() => {
     _unsubs.push(_rpc.on('session.event.subagent_completion', (payload) => {
       if (_isStaleEpoch(payload)) return;
       if (_aborted) return;
-      _noteStreamSeq(payload);
+      if (!_acceptStreamSeq(payload)) return;
       _appendSubagentCompletion(payload);
     }));
 
@@ -2078,7 +2359,7 @@ const ChatView = (() => {
     _unsubs.push(_rpc.on('session.event.state_change', (payload) => {
       if (_isStaleEpoch(payload)) return;
       if (!payload || _aborted) return;
-      _noteStreamSeq(payload);
+      if (!_acceptStreamSeq(payload)) return;
       _resetStreamIdleTimer();
       const to = payload.to_state || payload.toState || '';
       // Only use state_change to SHOW thinking indicator (on thinking/tool_calling
@@ -2094,7 +2375,7 @@ const ChatView = (() => {
     _unsubs.push(_rpc.on('session.event.run_heartbeat', (payload) => {
       if (_isStaleEpoch(payload)) return;
       if (_aborted) return;
-      _noteStreamSeq(payload);
+      if (!_acceptStreamSeq(payload)) return;
       if (!_isStreaming) _startStreaming();
       _resetStreamIdleTimer();
       if (!_streamBubble) _showThinkingIndicator();
@@ -2102,7 +2383,7 @@ const ChatView = (() => {
 
     _unsubs.push(_rpc.on('session.event.cron_result', (payload) => {
       if (_isStaleEpoch(payload)) return;
-      _noteStreamSeq(payload);
+      if (!_acceptStreamSeq(payload)) return;
       const msg = payload?.message || payload || {};
       const targetSession = payload?.sessionKey || '';
       if (targetSession && _sessionKey && targetSession !== _sessionKey) return;
@@ -2118,6 +2399,12 @@ const ChatView = (() => {
         msg.timestamp || null,
         { provenanceKind: msg.provenanceKind || '' },
       );
+    }));
+
+    _unsubs.push(_rpc.on('session.event.compaction', (payload, meta) => {
+      if (_isStaleEpoch(payload)) return;
+      if (!_acceptStreamSeq(payload)) return;
+      _showCompactionToast(payload || {}, meta || {});
     }));
 
     // Non-persistent warnings surfaced by the turn runner (e.g. model claimed
@@ -2154,6 +2441,12 @@ const ChatView = (() => {
     // sessions.changed carries epoch — drop if stale.
     _unsubs.push(_rpc.on('sessions.changed', (payload) => {
       if (_isStaleEpoch(payload)) return;
+      if (!_isCurrentSessionPayload(payload)) return;
+      if (_sessionChangeIsTerminal(payload)) {
+        _syncTerminalSessionChange(payload);
+        return;
+      }
+      _applySessionRunState(payload);
     }));
 
     _unsubs.push(_rpc.on('task.queued', (payload) => {
@@ -2172,25 +2465,25 @@ const ChatView = (() => {
 
     _unsubs.push(_rpc.on('session.event.task_group.waiting', (payload) => {
       if (_isStaleEpoch(payload)) return;
-      _noteStreamSeq(payload);
+      if (!_acceptStreamSeq(payload)) return;
       _noteTaskGroupActive(payload);
     }));
 
     _unsubs.push(_rpc.on('session.event.task_group.synthesizing', (payload) => {
       if (_isStaleEpoch(payload)) return;
-      _noteStreamSeq(payload);
+      if (!_acceptStreamSeq(payload)) return;
       _noteTaskGroupActive(payload);
     }));
 
     _unsubs.push(_rpc.on('session.event.task_group.done', (payload) => {
       if (_isStaleEpoch(payload)) return;
-      _noteStreamSeq(payload);
+      if (!_acceptStreamSeq(payload)) return;
       _noteTaskGroupTerminal(payload, 'succeeded');
     }));
 
     _unsubs.push(_rpc.on('session.event.task_group.failed', (payload) => {
       if (_isStaleEpoch(payload)) return;
-      _noteStreamSeq(payload);
+      if (!_acceptStreamSeq(payload)) return;
       _noteTaskGroupTerminal(payload, 'failed');
     }));
 
@@ -2222,11 +2515,10 @@ const ChatView = (() => {
       if (typeof event !== 'string') return;
       // Discard done/error frames that pre-date the current epoch.
       if (event.startsWith('session.event.') && _isStaleEpoch(payload)) return;
-      _noteStreamSeq(payload);
+      if (!_acceptStreamSeq(payload)) return;
       if (event.startsWith('session.event.task_group.')) return;
 
-      if (event === 'sessions.changed' && payload?.reason === 'turn_complete' && (!payload?.key || payload.key === _sessionKey)) {
-        _scheduleHistorySync();
+      if (event === 'sessions.changed') {
         return;
       }
 
@@ -2235,7 +2527,16 @@ const ChatView = (() => {
         // routed_tier, routing_source, ... }
         // Also support nested { usage: { ... } } for future compat
         const u = payload?.usage || payload || {};
-        if (u.input_tokens || u.output_tokens) {
+        const snapshot = u.session_totals;
+        if (snapshot && typeof snapshot === 'object') {
+          // Authoritative: overwrite from snapshot
+          _usageAccum.input = snapshot.input_tokens | 0;
+          _usageAccum.output = snapshot.output_tokens | 0;
+          _usageAccum.cacheRead = snapshot.cache_read_tokens | 0;
+          _usageAccum.cacheWrite = snapshot.cache_write_tokens | 0;
+          _usageAccum.cost = Number(snapshot.cost_usd || 0);
+        } else if (u.input_tokens || u.output_tokens) {
+          // Fallback: legacy accumulation for transcripts without session_totals
           _usageAccum.input += u.input_tokens || 0;
           _usageAccum.output += u.output_tokens || 0;
           _usageAccum.cacheRead += u.cached_tokens || 0;
@@ -2243,18 +2544,19 @@ const ChatView = (() => {
           if (u.cost_usd != null) {
             _usageAccum.cost = (_usageAccum.cost || 0) + u.cost_usd;
           }
-          if (u.savings_usd > 0) {
-            _usageAccum.sessionSaved = (_usageAccum.sessionSaved || 0) + u.savings_usd;
-          }
-          if (u.model) _usageModel = u.model;
-          _viz.update({ ..._usageAccum, model: _usageModel });
-          _saveWidgetState();
         }
-        // Track context usage
-        const total = (u.input_tokens || 0) + (u.output_tokens || 0);
-        if (total > 0) {
-          _totalTokens = total;
-          _updateCtxWarning();
+        if (u.savings_usd > 0) {
+          _usageAccum.sessionSaved = (_usageAccum.sessionSaved || 0) + u.savings_usd;
+        }
+        if (u.model) _usageModel = u.model;
+        _viz.update({ ..._usageAccum, model: _usageModel });
+        _saveWidgetState();
+        const turnContextStatus = u.contextStatus || u.context_status
+          || u.session_totals?.contextStatus || u.session_totals?.context_status || null;
+        if (turnContextStatus) {
+          _applyContextStatus(turnContextStatus);
+        } else {
+          _loadCurrentSessionUsage();
         }
         const finalText = typeof u.text === 'string' ? u.text : '';
         if (finalText && finalText !== _streamRaw) {
@@ -2281,10 +2583,10 @@ const ChatView = (() => {
         _maybeFireSavingsPopup(_finishedBubble, u);
 
         // Attach model + session token footer below the assistant bubble
-        _attachTurnMeta(_finishedBubble, _usageModel, _usageAccum.input, _usageAccum.output, u);
+        _attachTurnMeta(_finishedBubble, _usageModel, u.input_tokens | 0, u.output_tokens | 0, u);
         const _metaIdx = _messages.filter(m => m.role === 'assistant').length - 1;
         if (_metaIdx >= 0) {
-          _storeTurnMeta(_sessionKey, _metaIdx, _usageModel, _usageAccum.input, _usageAccum.output, {
+          _storeTurnMeta(_sessionKey, _metaIdx, _usageModel, u.input_tokens | 0, u.output_tokens | 0, {
             cached_tokens: u.cached_tokens || 0,
             cache_hit_active: !!u.cache_hit_active,
             model: u.model || _usageModel || null,
@@ -2310,7 +2612,12 @@ const ChatView = (() => {
         } else if (_pendingQueue.length > 0) {
           _drainQueueHead();
         }
-        if (_activeTaskGroups.size > 0) {
+        if (_doneWasAborted) {
+          _applySessionRunState({
+            run_status: 'cancelled',
+            last_task: { ...(payload || {}), status: 'cancelled' },
+          });
+        } else if (_activeTaskGroups.size > 0) {
           _applySessionRunState(_activeTaskGroupRunState({ reason: 'task_group_active' }));
         } else {
           _applySessionRunState({ run_status: 'idle', last_task: { status: 'succeeded' } });
@@ -2318,6 +2625,7 @@ const ChatView = (() => {
       } else if (event.endsWith('.error')) {
         _endStreaming();
         _addMessage('error', _sessionErrorMessage(payload));
+        _scheduleHistorySync();
         if (_activeTaskGroups.size > 0) {
           _applySessionRunState(_activeTaskGroupRunState(payload));
         } else {
@@ -2401,14 +2709,38 @@ const ChatView = (() => {
 
   /* ── Context Usage Warning ──────────────────────────────────────────── */
 
+  function _contextStatusNumber(status, ...names) {
+    for (const name of names) {
+      const value = Number(status && status[name]);
+      if (Number.isFinite(value) && value >= 0) return value;
+    }
+    return null;
+  }
+
+  function _applyContextStatus(status) {
+    _contextStatus = status || null;
+    _updateCtxWarning();
+  }
+
+  function _clearContextStatus() {
+    _contextStatus = null;
+    _updateCtxWarning();
+  }
+
   function _updateCtxWarning() {
     if (!_ctxWarn) return;
-    if (_totalTokens > _CTX_WARN_THRESHOLD) {
-      _ctxWarn.classList.remove('hidden');
-      _ctxWarn.textContent = `Context > 85% (~${Math.round(_totalTokens / 1000)}k tokens)`;
-    } else {
+    const status = _contextStatus || {};
+    const tokens = _contextStatusNumber(status, 'contextTokens', 'context_tokens');
+    const windowTokens = _contextStatusNumber(status, 'contextWindowTokens', 'context_window_tokens');
+    let pressure = _contextStatusNumber(status, 'pressure', 'contextPressure', 'context_pressure');
+    if (pressure == null && tokens != null && windowTokens > 0) pressure = tokens / windowTokens;
+    if (pressure != null) pressure = Math.min(1, Math.max(0, pressure));
+    if (tokens == null || !windowTokens || pressure == null || pressure < 0.85) {
       _ctxWarn.classList.add('hidden');
+      return;
     }
+    _ctxWarn.classList.remove('hidden');
+    _ctxWarn.textContent = `Request ctx ${Math.round(pressure * 100)}% (~${Math.round(tokens / 1000)}k/${Math.round(windowTokens / 1000)}k)`;
   }
 
   /* ── Chat History ───────────────────────────────────────────────────── */
@@ -2428,6 +2760,15 @@ const ChatView = (() => {
       const data = await _rpc.call('chat.history', { sessionKey: _sessionKey });
       const messages = data.messages || [];
       if (messages.length === 0) {
+        if (_isStreaming && _streamBubble) {
+          _thread.querySelectorAll('.msg').forEach((el) => {
+            if (el !== _streamBubble) el.remove();
+          });
+          _thread.querySelectorAll('.chat-day-sep, .chat-empty').forEach((el) => el.remove());
+          if (!_streamBubble.isConnected) _thread.appendChild(_streamBubble);
+          _scrollToBottom();
+          return;
+        }
         _thread.innerHTML = '';
         _messages = [];
         _lastHeaderRole = '';
@@ -2585,7 +2926,7 @@ const ChatView = (() => {
   }
 
   function _historyFallbackText(role, text) {
-    if (role === 'assistant') return _stripDirectiveTags(text || '').trim();
+    if (role === 'assistant') return _stripProtocolTextLeak(_stripDirectiveTags(text || '')).trim();
     if (role === 'user') return _stripTimePrefix(text || '').trim();
     return (text || '').trim();
   }
@@ -2686,18 +3027,29 @@ const ChatView = (() => {
 
   /* ── Send Message ───────────────────────────────────────────────────── */
 
-  function _onSend() {
-    const text = _textarea.value.trim();
-    const hasPayload = text || _pendingAttachments.length > 0;
+  async function _onSend() {
+    let text = _textarea.value.trim();
+    let hasPayload = text || _pendingAttachments.length > 0;
+    let isLiteralSlash = false;
 
     if (_hasPendingAttachmentWork()) {
       UI.toast('Wait for file attachment processing to finish', 'warn', 2500);
       return;
     }
 
+    if (text.startsWith('//')) {
+      isLiteralSlash = true;
+      text = text.slice(1);
+      hasPayload = text || _pendingAttachments.length > 0;
+    }
+
     // While a turn is streaming, Send enqueues (Proposal C). Use ESC or the
     // Stop button to actually halt the current response.
     if (_isStreaming) {
+      if (!isLiteralSlash && text.startsWith('/')) {
+        UI.toast(`Wait for the current response before running ${text.split(/\s+/, 1)[0]}.`, 'warn', 2500);
+        return;
+      }
       if (!hasPayload) return; // empty + streaming = no-op
       if (_pendingQueue.length >= _MAX_PENDING) {
         UI.toast(
@@ -2722,17 +3074,12 @@ const ChatView = (() => {
       return;
     }
 
-    if (!hasPayload || !_sessionKey) return;
-
-    // Intercept slash commands
-    if (text.startsWith('/')) {
-      const cmdText = text.split(' ')[0].toLowerCase();
-      const match = _SLASH_CMDS.find(c => c.cmd === cmdText);
-      if (match) {
-        _selectSlashCmd(match);
-        return;
-      }
+    if (!isLiteralSlash && text.startsWith('/')) {
+      const handled = await _executeSlashCommand(text);
+      if (handled) return;
     }
+
+    if (!hasPayload || !_sessionKey) return;
 
     // Reset abort flag for new message
     _aborted = false;
@@ -2879,9 +3226,26 @@ const ChatView = (() => {
       return 'The task was cancelled before it finished.';
     }
     if (status === 'failed') {
+      const failedDetail = _payloadErrorDetail(payload);
+      if (failedDetail) return failedDetail;
       return 'The task failed before it could finish.';
     }
     return 'The task ended before it could finish.';
+  }
+
+  function _payloadErrorDetail(payload) {
+    const candidates = [
+      payload?.error,
+      payload?.message,
+      payload?.error_message,
+      payload?.detail,
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate === 'string' && candidate.trim()) {
+        return candidate.trim();
+      }
+    }
+    return '';
   }
 
   function _sessionErrorMessage(payload) {
@@ -2897,11 +3261,12 @@ const ChatView = (() => {
     return 'Agent error';
   }
 
-  function _noteStreamSeq(payload) {
+  function _acceptStreamSeq(payload) {
     const seq = payload && payload.stream_seq;
-    if (typeof seq === 'number' && Number.isFinite(seq) && seq > _lastStreamSeq) {
-      _lastStreamSeq = seq;
-    }
+    if (typeof seq !== 'number' || !Number.isFinite(seq)) return true;
+    if (seq <= _lastStreamSeq) return false;
+    _lastStreamSeq = seq;
+    return true;
   }
 
   // Returns true when a session event payload carries an epoch that
@@ -2962,8 +3327,11 @@ const ChatView = (() => {
 
     const elapsed = document.createElement('span');
     elapsed.className = 'thinking-elapsed';
-    const secs = Math.floor((Date.now() - _thinkingStartTime) / 1000);
-    elapsed.textContent = 'Working (' + secs + 's)';
+    elapsed.setAttribute('aria-live', 'off');
+    const elapsedMs = Date.now() - _thinkingStartTime;
+    const seconds = Math.floor(elapsedMs / 1000);
+    const verb = SQUILLA_VERBS[Math.floor(elapsedMs / SQUILLA_DWELL_MS) % SQUILLA_VERBS.length];
+    elapsed.textContent = `${verb} (${seconds}s)`;
 
     status.appendChild(dots);
     status.appendChild(elapsed);
@@ -2974,9 +3342,11 @@ const ChatView = (() => {
 
     _thinkingTimerInterval = setInterval(() => {
       if (!_thinkingEl) { clearInterval(_thinkingTimerInterval); return; }
-      const s = Math.floor((Date.now() - _thinkingStartTime) / 1000);
+      const eMs = Date.now() - _thinkingStartTime;
+      const s = Math.floor(eMs / 1000);
+      const v = SQUILLA_VERBS[Math.floor(eMs / SQUILLA_DWELL_MS) % SQUILLA_VERBS.length];
       const label = _thinkingEl.querySelector('.thinking-elapsed');
-      if (label) label.textContent = 'Working (' + s + 's)';
+      if (label) label.textContent = `${v} (${s}s)`;
 
       if (s >= _THINKING_TTL_MS / 1000) {
         _hideThinkingIndicator();
@@ -3095,11 +3465,20 @@ const ChatView = (() => {
     }
   }
 
+  function _flushPendingTextSegment() {
+    if (!_renderDirty) return;
+    if (_renderRafId) {
+      cancelAnimationFrame(_renderRafId);
+      _renderRafId = null;
+    }
+    _flushRender();
+  }
+
   function _flushRender() {
     _renderRafId = null;
     if (!_renderDirty || !_streamBubble) { _renderDirty = false; return; }
     if (_activeTextSeg && _activeTextRaw) {
-      _activeTextSeg.innerHTML = Markdown.render(_stripDirectiveTags(_activeTextRaw));  // eslint-disable-line no-unsanitized/property
+      _activeTextSeg.innerHTML = Markdown.render(_stripProtocolTextLeak(_stripDirectiveTags(_activeTextRaw)));  // eslint-disable-line no-unsanitized/property
       Markdown.bindCopy(_activeTextSeg);
     }
     _renderDirty = false;
@@ -3117,7 +3496,7 @@ const ChatView = (() => {
     _streamIdlePausedForApproval = false;
     if (_streamBubble) {
       _streamBubble.classList.remove('streaming');
-      const cleanedText = _stripDirectiveTags(_streamRaw).trim();
+      const cleanedText = _stripProtocolTextLeak(_stripDirectiveTags(_streamRaw)).trim();
 
       // Suppress sentinel tokens that the LLM may emit instead of a real reply.
       // Don't suppress when aborted — we want the interrupted bubble to show
@@ -3152,7 +3531,7 @@ const ChatView = (() => {
       // Final render: render each text segment with its own content
       for (const seg of _segments) {
         if (seg.type !== 'text' || !seg.el) continue;
-        const segText = _stripDirectiveTags(seg.raw).trim();
+        const segText = _stripProtocolTextLeak(_stripDirectiveTags(seg.raw)).trim();
         if (segText) {
           seg.el.innerHTML = Markdown.render(segText);  // eslint-disable-line no-unsanitized/property
           Markdown.bindCopy(seg.el);
@@ -3218,7 +3597,43 @@ const ChatView = (() => {
 
   /* ── Tool Call / Tool Result Display ────────────────────────────────── */
 
+  function _toolInputObject(input) {
+    if (!input) return null;
+    if (typeof input === 'object') return input;
+    if (typeof input !== 'string') return null;
+    const trimmed = input.trim();
+    if (!trimmed || !trimmed.startsWith('{')) return null;
+    try {
+      const parsed = JSON.parse(trimmed);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function _basename(path) {
+    const raw = String(path || '').trim();
+    if (!raw) return '';
+    const parts = raw.split(/[\\/]+/).filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : raw;
+  }
+
+  function _publishArtifactTargetName(input) {
+    input = _toolInputObject(input);
+    if (!input) return '';
+    return _basename(input.name || input.path);
+  }
+
+  function _toolDisplayName(name, input) {
+    if (name === 'publish_artifact') {
+      const target = _publishArtifactTargetName(input);
+      if (target) return `${name} - ${target}`;
+    }
+    return name || 'tool';
+  }
+
   function _buildToolCallDOM(name, toolId, input, isRunning) {
+    const displayName = _toolDisplayName(name, input);
     const preview = _truncate(
       typeof input === 'string' ? input : JSON.stringify(input || '', null, 2),
       200
@@ -3227,6 +3642,7 @@ const ChatView = (() => {
     const details = document.createElement('details');
     details.className = 'chat-tools-collapse' + (isRunning ? ' chat-tools-collapse--running' : '');
     if (toolId) details.setAttribute('data-tool-id', toolId);
+    details.setAttribute('data-tool-name', name || 'tool');
 
     const summary = document.createElement('summary');
     summary.className = 'chat-tools-summary';
@@ -3239,7 +3655,7 @@ const ChatView = (() => {
     iconSpan.className = 'chat-tools-icon';
     iconSpan.textContent = _toolEmoji(name);
     summary.appendChild(iconSpan);
-    summary.appendChild(document.createTextNode(' ' + name));
+    summary.appendChild(document.createTextNode(' ' + displayName));
 
     const toolsBody = document.createElement('div');
     toolsBody.className = 'chat-tools-body';
@@ -3257,17 +3673,106 @@ const ChatView = (() => {
     return details;
   }
 
-  function _buildToolResultDOM(content, isError) {
+  function _findToolDetailsById(root, toolId) {
+    if (!root || !toolId) return null;
+    return Array.from(root.querySelectorAll('[data-tool-id]')).find(
+      (el) => el.getAttribute('data-tool-id') === toolId
+    ) || null;
+  }
+
+  function _findToolResultById(root, toolId) {
+    if (!root || !toolId) return null;
+    return Array.from(root.querySelectorAll('[data-tool-result-for]')).find(
+      (el) => el.getAttribute('data-tool-result-for') === toolId
+    ) || null;
+  }
+
+  function _toolExecutionStatus(payload) {
+    const status = payload && (payload.execution_status || payload.executionStatus);
+    return status && typeof status === 'object' ? status : null;
+  }
+
+  function _toolResultIsError(payload) {
+    const status = _toolExecutionStatus(payload);
+    if (status && typeof status.status === 'string') {
+      return ['error', 'timeout', 'cancelled'].includes(status.status);
+    }
+    return !!(payload && (payload.is_error || payload.isError || payload.error));
+  }
+
+  function _toolResultStateClass(payload) {
+    const status = _toolExecutionStatus(payload);
+    if (status && status.status === 'success') return 'chat-tools-collapse--success';
+    if (status && status.status === 'unknown') return 'chat-tools-collapse--unknown';
+    return _toolResultIsError(payload) ? 'chat-tools-collapse--error' : 'chat-tools-collapse--success';
+  }
+
+  function _toolResultIsTruncated(payload) {
+    const status = _toolExecutionStatus(payload);
+    return !!(status && status.truncated);
+  }
+
+  function _memorySearchSourceRows(content) {
+    if (!content || typeof content !== 'string') return [];
+    const rows = [];
+    const pattern = /^\[(\d+)\]\s+(.+?)\s+\(source:\s*([^;]+);\s*lines\s+([^;]+);\s*citation:\s*([^;]+);/;
+    for (const line of content.split('\n')) {
+      const match = line.match(pattern);
+      if (!match) continue;
+      rows.push({
+        index: match[1],
+        path: match[2],
+        source: match[3],
+        lines: match[4],
+        citation: match[5],
+      });
+      if (rows.length >= 6) break;
+    }
+    return rows;
+  }
+
+  function _buildMemorySearchSourceDOM(content) {
+    const rows = _memorySearchSourceRows(content);
+    if (!rows.length) return null;
+
+    const wrap = document.createElement('div');
+    wrap.className = 'chat-memory-sources';
+    for (const row of rows) {
+      const item = document.createElement('div');
+      item.className = 'chat-memory-source';
+
+      const badge = document.createElement('span');
+      badge.className = 'chat-memory-source-badge chat-memory-source-badge--' + row.source;
+      badge.textContent = row.source;
+      item.appendChild(badge);
+
+      const cite = document.createElement('span');
+      cite.className = 'chat-memory-source-citation';
+      cite.textContent = row.citation || (row.path + '#L' + row.lines);
+      item.appendChild(cite);
+      wrap.appendChild(item);
+    }
+    return wrap;
+  }
+
+  function _buildToolResultDOM(content, isError, isTruncated = false, toolName = '') {
     const preview = _truncate(content, 200);
     if (!preview || preview.trim() === '') return null;
 
     const div = document.createElement('div');
-    div.className = 'chat-tool-result' + (isError ? ' chat-tool-result--error' : '');
+    div.className = 'chat-tool-result'
+      + (isError ? ' chat-tool-result--error' : '')
+      + (isTruncated ? ' chat-tool-result--warn' : '');
 
     const previewDiv = document.createElement('div');
     previewDiv.className = 'chat-tool-result-preview';
     previewDiv.textContent = preview;
     div.appendChild(previewDiv);
+
+    if (toolName === 'memory_search') {
+      const sources = _buildMemorySearchSourceDOM(content);
+      if (sources) div.appendChild(sources);
+    }
 
     if (content.length > 200) {
       const viewBtn = document.createElement('button');
@@ -3293,11 +3798,20 @@ const ChatView = (() => {
 
     const bubble = _ensureStreamBubble();
     const body = bubble.querySelector('.msg-body');
+    const existing = _findToolDetailsById(body, toolId);
+    if (existing) {
+      if (name === 'web_search' && _searchProvider) {
+        _injectProviderBadge(existing.querySelector('.chat-tools-summary'), _searchProvider);
+      }
+      if (_autoScroll) _scrollToBottom();
+      return;
+    }
 
     const details = _buildToolCallDOM(name, toolId, input, true);
     if (name === 'web_search' && _searchProvider) {
       _injectProviderBadge(details.querySelector('.chat-tools-summary'), _searchProvider);
     }
+    _flushPendingTextSegment();
     body.appendChild(details);
     _segments.push({ type: 'tool', el: details });
 
@@ -3311,8 +3825,9 @@ const ChatView = (() => {
     if (!payload) return;
     const raw = payload.result || payload.content || payload.output || '';
     const content = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
-    const isError = !!(payload.is_error || payload.isError || payload.error);
+    const isError = _toolResultIsError(payload);
     const toolId = payload.tool_use_id || '';
+    let toolName = payload.name || payload.tool_name || '';
 
     const bubble = _ensureStreamBubble();
     const body = bubble.querySelector('.msg-body');
@@ -3320,31 +3835,44 @@ const ChatView = (() => {
     // Transition tool container from running → success/error and find target container
     let resultTarget = body; // default: append to msg-body
     if (toolId) {
-      const details = body.querySelector('[data-tool-id="' + toolId + '"]');
+      const details = _findToolDetailsById(body, toolId);
       if (details) {
+        toolName = toolName || details.getAttribute('data-tool-name') || '';
         details.classList.remove('chat-tools-collapse--running');
-        details.classList.add(isError ? 'chat-tools-collapse--error' : 'chat-tools-collapse--success');
+        details.classList.add(_toolResultStateClass(payload));
         const summary = details.querySelector('.chat-tools-summary');
         if (summary) summary.removeAttribute('aria-disabled');
         const toolsBody = details.querySelector('.chat-tools-body');
         if (toolsBody) resultTarget = toolsBody;
 
         // web_search: add provider badge to collapsible summary (may already be present from running state)
-        const provider = _toolResultProvider(payload, content);
-        if (provider) {
-          if (!_searchProvider) _searchProvider = provider;
-          _injectProviderBadge(details.querySelector('.chat-tools-summary'), provider);
+        if (toolName === 'web_search') {
+          const provider = _toolResultProvider(payload, content);
+          if (provider) {
+            _setSearchProvider(provider, { refreshRunning: false });
+            _injectProviderBadge(details.querySelector('.chat-tools-summary'), provider);
+          }
         }
       }
     }
+    if (toolId && _findToolResultById(resultTarget, toolId)) {
+      if (_autoScroll) _scrollToBottom();
+      return;
+    }
 
     // Only show result preview if non-empty
-    const resultDiv = _buildToolResultDOM(content, isError);
+    const resultDiv = _buildToolResultDOM(
+      content,
+      isError,
+      _toolResultIsTruncated(payload),
+      toolName
+    );
     if (!resultDiv) {
       if (_autoScroll) _scrollToBottom();
       return;
     }
 
+    if (toolId) resultDiv.setAttribute('data-tool-result-for', toolId);
     resultTarget.appendChild(resultDiv);
     if (_autoScroll) _scrollToBottom();
   }
@@ -3476,7 +4004,7 @@ const ChatView = (() => {
 
       for (const seg of segments) {
         if (seg.type === 'text') {
-          const text = _stripDirectiveTags(seg.text || '').trim();
+          const text = _stripDirectiveTags(_stripProtocolTextLeak(seg.text || '')).trim();
           if (!text) continue;
           const textDiv = document.createElement('div');
           textDiv.className = 'msg-text-seg';
@@ -3485,28 +4013,38 @@ const ChatView = (() => {
           Markdown.bindHighlight(textDiv);
           body.appendChild(textDiv);
         } else if (seg.type === 'tool_use') {
+          if (_findToolDetailsById(body, seg.tool_use_id || '')) continue;
           const details = _buildToolCallDOM(seg.name || 'tool', seg.tool_use_id || '', seg.input || '', false);
           body.appendChild(details);
         } else if (seg.type === 'tool_result') {
           const toolId = seg.tool_use_id || '';
-          const isError = !!seg.is_error;
+          const isError = _toolResultIsError(seg);
           const content = seg.result || '';
 
           if (toolId) {
-            const details = body.querySelector('[data-tool-id="' + toolId + '"]');
+            const details = _findToolDetailsById(body, toolId);
             if (details) {
               details.classList.remove('chat-tools-collapse--running');
-              details.classList.add(isError ? 'chat-tools-collapse--error' : 'chat-tools-collapse--success');
+              details.classList.add(_toolResultStateClass(seg));
               const toolsBody = details.querySelector('.chat-tools-body');
-              const resultDiv = _buildToolResultDOM(content, isError);
-              if (resultDiv && toolsBody) toolsBody.appendChild(resultDiv);
-              else if (resultDiv) details.appendChild(resultDiv);
+              const resultTarget = toolsBody || details;
+              if (_findToolResultById(resultTarget, toolId)) continue;
+              const resultDiv = _buildToolResultDOM(
+                content,
+                isError,
+                _toolResultIsTruncated(seg),
+                _toolNameById[toolId] || ''
+              );
+              if (resultDiv) {
+                resultDiv.setAttribute('data-tool-result-for', toolId);
+                resultTarget.appendChild(resultDiv);
+              }
 
               // web_search: inject provider badge and seed _searchProvider from persisted result
               if (_toolNameById[toolId] === 'web_search' && content) {
                 const provider = _toolResultProvider(seg, content);
                 if (provider) {
-                  if (!_searchProvider) _searchProvider = provider;
+                  _setSearchProvider(provider, { refreshRunning: false });
                   _injectProviderBadge(details.querySelector('.chat-tools-summary'), provider);
                 }
               }
@@ -3673,7 +4211,7 @@ const ChatView = (() => {
     body.className = 'msg-body';
     body.textContent = '';
     if (role === 'assistant' && text) {
-      body.innerHTML = Markdown.render(_stripDirectiveTags(text));
+      body.innerHTML = Markdown.render(_stripProtocolTextLeak(_stripDirectiveTags(text)));
       Markdown.bindCopy(body);
       Markdown.bindHighlight(body);
     } else if (isSubagentCompletion) {
@@ -4036,7 +4574,7 @@ const ChatView = (() => {
   }
 
   // Recover the entire pending queue back into the composer for editing.
-  // Modeled on claude-code-rebuilt's popAllEditable: queued texts join the
+  // Queued texts join the
   // current textarea content with newlines (FIFO), attachments stack into
   // _pendingAttachments, and the queue is cleared. The caller decides
   // whether to send — recovery never auto-fires. Returns true when the
@@ -4177,7 +4715,7 @@ const ChatView = (() => {
     _pendingQueue = [];
     _stopRequestedByUser = false;
     _messages = [];
-    _totalTokens = 0;
+    _clearContextStatus();
     _lastHeaderRole = '';
     _lastHeaderDay = '';
     _composing = false;

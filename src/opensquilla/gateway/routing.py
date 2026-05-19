@@ -74,6 +74,7 @@ class RouteEnvelope:
         is_owner: bool = False,
         workspace_dir: str | None = None,
         workspace_strict: bool = False,
+        default_elevated: str | None = None,
     ) -> ToolContext:
         """Build the ToolContext for this route."""
         return tool_context_from_envelope(
@@ -81,6 +82,7 @@ class RouteEnvelope:
             is_owner=is_owner,
             workspace_dir=workspace_dir,
             workspace_strict=workspace_strict,
+            default_elevated=default_elevated,
         )
 
 
@@ -161,7 +163,7 @@ def build_cli_route_envelope(
     metadata: dict[str, Any] = {}
     if principal_is_owner is not None:
         metadata["principal_is_owner"] = principal_is_owner
-    if elevated in ("bypass", "full"):
+    if elevated in ("on", "bypass", "full"):
         metadata["elevated"] = elevated
     return RouteEnvelope(
         source_kind=SourceKind.CLI,
@@ -235,6 +237,10 @@ def build_cron_route_envelope(
     job_name = str(getattr(job, "name", ""))
     sender_id = f"cron-job-{job_id}"
     metadata: dict[str, Any] = {"job_id": job_id, "job_name": job_name}
+    creator_is_owner = bool(getattr(job, "creator_is_owner", False))
+    if creator_is_owner:
+        metadata["principal_is_owner"] = True
+        metadata["cron_trusted_owner"] = True
     tool_policy = getattr(job, "tool_policy", None)
     if isinstance(tool_policy, dict) and tool_policy:
         metadata["tool_policy"] = dict(tool_policy)
@@ -337,20 +343,27 @@ def tool_context_from_envelope(
     is_owner: bool = False,
     workspace_dir: str | None = None,
     workspace_strict: bool = False,
+    default_elevated: str | None = None,
 ) -> ToolContext:
     """Build the runtime ToolContext from the canonical route envelope."""
     caller_kind = _caller_kind(envelope.source_kind)
     allowed_tools: set[str] | None = None
     denied_tools: set[str] = set()
     interaction_mode = _interaction_mode(envelope.interaction_mode)
+    cron_trusted_owner = (
+        caller_kind is CallerKind.CRON
+        and bool(envelope.metadata.get("cron_trusted_owner"))
+        and is_owner
+    )
     if caller_kind is CallerKind.CRON:
-        allowed_tools = set(CRON_AGENT_ALLOW)
-        denied_tools = set(CRON_AGENT_DENY)
+        if not cron_trusted_owner:
+            allowed_tools = set(CRON_AGENT_ALLOW)
+            denied_tools = set(CRON_AGENT_DENY)
     elif caller_kind is CallerKind.SUBAGENT:
         denied_tools = set(SUBAGENT_TOOL_DENY)
     source_kind = envelope.metadata.get("tool_source_kind") or envelope.source_kind.value
     source_name = envelope.metadata.get("tool_source_name") or envelope.source_name
-    elevated = envelope.metadata.get("elevated")
+    elevated = envelope.metadata.get("elevated") or default_elevated
     if elevated not in ("on", "bypass", "full") or not is_owner:
         elevated = None
     ctx = ToolContext(
@@ -370,14 +383,18 @@ def tool_context_from_envelope(
         allowed_tools=allowed_tools,
         denied_tools=denied_tools,
         elevated=elevated,
+        tool_policy=(
+            envelope.metadata.get("tool_policy") if cron_trusted_owner else None
+        ),
     )
     if caller_kind is CallerKind.CRON:
-        ctx = apply_tool_policy_layer(
-            ctx,
-            envelope.metadata.get("tool_policy"),
-            available_tools=CRON_AGENT_ALLOW | CRON_AGENT_DENY,
-            hard_denied=CRON_AGENT_DENY,
-        )
+        if not cron_trusted_owner:
+            ctx = apply_tool_policy_layer(
+                ctx,
+                envelope.metadata.get("tool_policy"),
+                available_tools=CRON_AGENT_ALLOW | CRON_AGENT_DENY,
+                hard_denied=CRON_AGENT_DENY,
+            )
     return ctx
 
 

@@ -6,14 +6,16 @@ import asyncio
 import time
 import uuid
 from dataclasses import asdict, replace
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
+from opensquilla.engine.cache_break_monitor import notify_compaction
 from opensquilla.engine.start_turn import start_turn_via_runtime
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
+from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.gateway.session_services import (
     get_session_epoch,
     get_session_lock,
@@ -26,8 +28,13 @@ from opensquilla.session.compaction import (
     build_compaction_config_from_provider,
     call_compact_with_optional_config,
 )
+from opensquilla.session.compaction_lifecycle import (
+    flush_receipt_allows_destructive_compaction,
+    flush_receipt_to_dict,
+    pre_compaction_flush_enabled,
+)
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id
-from opensquilla.session.terminal_reply import build_terminal_reply
+from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 
 _d = get_dispatcher()
 log = structlog.get_logger(__name__)
@@ -396,13 +403,18 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
         "error_message": raw_text,
         **payload,
     }
+    _, safe_error_message = sanitize_agent_error(
+        terminal_payload,
+        fallback_error_class=str(code) if code else None,
+        fallback_error_message=raw_text,
+    )
     terminal_message = build_terminal_reply(terminal_payload)
     return {
         **payload,
         "message": terminal_message,
         "terminal_message": terminal_message,
         "terminal_reason": terminal_payload["terminal_reason"],
-        "error_message": raw_text,
+        "error_message": safe_error_message,
     }
 
 
@@ -580,14 +592,28 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
         [s.session_key for s in sessions],
     )
 
+    # Batch transcript counts in one round-trip to avoid N+1 against
+    # count_transcript_entries. Storage layers that don't implement the batch
+    # method fall back gracefully to the legacy per-row path so old FakeStorage
+    # / channel-only test doubles keep working.
+    entry_counts: dict[str, int] = {}
+    batch_count = getattr(storage, "count_transcript_entries_batch", None)
+    if callable(batch_count):
+        try:
+            entry_counts = await batch_count([s.session_id for s in sessions])
+        except Exception:
+            log.warning("sessions.list.count_batch_failed", exc_info=True)
+            entry_counts = {}
+
     result = []
     for s in sessions:
         # Fetch entry count for metadata
-        entry_count = 0
-        try:
-            entry_count = await storage.count_transcript_entries(s.session_id)
-        except Exception:
-            pass
+        entry_count = entry_counts.get(s.session_id, 0)
+        if not entry_count and not entry_counts:
+            try:
+                entry_count = await storage.count_transcript_entries(s.session_id)
+            except Exception:
+                pass
 
         row = {
             "key": s.session_key,
@@ -827,6 +853,30 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
         async with _persist_lock:
             await _persist_user_message()
 
+    async def _rollback_persisted_user_message(reason: str) -> tuple[str | None, bool]:
+        message_id = getattr(persisted_entry, "message_id", None)
+        if not message_id or not hasattr(ctx.session_manager, "remove_message"):
+            return message_id, False
+        try:
+            removed = await ctx.session_manager.remove_message(key, message_id)
+        except Exception as rb_exc:  # noqa: BLE001 — rollback is best-effort
+            log.warning(
+                "sessions.send.rollback_failed",
+                session_key=key,
+                message_id=message_id,
+                reason=reason,
+                error=str(rb_exc),
+            )
+            return message_id, False
+        if removed:
+            log.info(
+                "sessions.send.rollback_succeeded",
+                session_key=key,
+                message_id=message_id,
+                reason=reason,
+            )
+        return message_id, bool(removed)
+
     task_runtime = getattr(ctx, "task_runtime", None)
     if task_runtime is not None:
         requested_mode = (
@@ -846,6 +896,7 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
                 run_kind=run_kind,
                 no_memory_capture=bool(capture_controls["no_memory_capture"]),
                 semantic_message=semantic_message_text,
+                persisted_user_message_id=getattr(persisted_entry, "message_id", None),
             )
         except Exception as exc:
             # Ensure the uuid eviction does NOT fire on this
@@ -863,19 +914,7 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
             # storage error under load), surface a non-retryable error and
             # hand the orphan message_id to the client as an idempotency
             # token — clients must dedup before retrying.
-            orphan_id = getattr(persisted_entry, "message_id", None)
-            rollback_ok = False
-            if orphan_id and hasattr(ctx.session_manager, "remove_message"):
-                try:
-                    rollback_ok = await ctx.session_manager.remove_message(key, orphan_id)
-                except Exception as rb_exc:  # noqa: BLE001 — rollback is best-effort
-                    log.warning(
-                        "sessions.send.rollback_failed",
-                        session_key=key,
-                        message_id=orphan_id,
-                        error=str(rb_exc),
-                    )
-                    rollback_ok = False
+            orphan_id, rollback_ok = await _rollback_persisted_user_message("queue_full")
 
             if rollback_ok:
                 raise RpcHandlerError(
@@ -970,6 +1009,7 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
             from opensquilla.agents.scope import resolve_agent_workspace_dir
             from opensquilla.engine.stream_wrappers import wrap_stream
             from opensquilla.gateway.routing import tool_context_from_envelope
+            from opensquilla.permissions import configured_default_elevated
 
             workspace_dir = resolve_agent_workspace_dir(agent_id, ctx.config)
             workspace_strict = getattr(ctx.config, "workspace_strict", None)
@@ -980,6 +1020,7 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
                 is_owner=ctx.principal.is_owner,
                 workspace_dir=str(workspace_dir),
                 workspace_strict=workspace_strict,
+                default_elevated=configured_default_elevated(ctx.config),
             )
             raw_stream = ctx.turn_runner.run(
                 message_text,
@@ -995,7 +1036,7 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
                 semantic_message=semantic_message_text,
             )
             stream_idle_timeout = _optional_positive_timeout(
-                ctx.config, "agent_stream_idle_timeout_seconds", 180.0
+                ctx.config, "agent_stream_idle_timeout_seconds", 600.0
             )
             heartbeat_interval = _optional_positive_timeout(
                 ctx.config, "agent_stream_heartbeat_interval_seconds", 15.0
@@ -1009,12 +1050,27 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
                 event_dict = asdict(event)
                 event_kind = event_dict.pop("kind", event.__class__.__name__)
                 if event_kind in ("done", "error"):
+                    if (
+                        event_kind == "error"
+                        and event_dict.get("code")
+                        in {
+                            "provider_request_budget_exhausted",
+                            "provider_request_too_large",
+                            "current_turn_context_exhausted",
+                        }
+                    ):
+                        await _rollback_persisted_user_message(
+                            str(event_dict.get("code") or "provider_request_too_large")
+                        )
                     await _emit_terminal_once(f"session.event.{event_kind}", event_dict)
                 else:
                     await _emit_to_subscribers(ctx, key, f"session.event.{event_kind}", event_dict)
 
             await _emit_to_subscribers(
-                ctx, key, "sessions.changed", {"key": key, "reason": "turn_complete"}
+                ctx,
+                key,
+                "sessions.changed",
+                build_sessions_changed_payload(key, "turn_complete"),
             )
         except asyncio.CancelledError:
             log.info("sessions.send.aborted", session_key=key)
@@ -1024,19 +1080,44 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
                 pass
         except TimeoutError:
             log.warning("sessions.send.stream_idle_timeout", session_key=key)
+            timeout_message = build_terminal_reply(
+                {
+                    "status": "timeout",
+                    "terminal_reason": "timeout",
+                    "error_class": _STREAM_IDLE_TIMEOUT_CODE,
+                    "error_message": _STREAM_IDLE_TIMEOUT_MESSAGE,
+                }
+            )
             await ctx.session_manager.append_message(
-                key, role="system", content=f"Error: {_STREAM_IDLE_TIMEOUT_MESSAGE}"
+                key, role="system", content=timeout_message
             )
             await _emit_terminal_once(
                 "session.event.error",
                 {"message": _STREAM_IDLE_TIMEOUT_MESSAGE, "code": _STREAM_IDLE_TIMEOUT_CODE},
             )
         except Exception as exc:
+            error_code, error_message = sanitize_agent_error(
+                {
+                    "status": "failed",
+                    "terminal_reason": "error",
+                    "error_class": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+                fallback_error_class="agent_error",
+                fallback_error_message=str(exc) or "Agent error",
+            )
+            event_code = (
+                error_code if error_code == "provider_request_too_large" else "agent_error"
+            )
             log.error("sessions.send.agent_failed", session_key=key, error=str(exc), exc_info=True)
-            await ctx.session_manager.append_message(key, role="system", content=f"Error: {exc}")
+            await ctx.session_manager.append_message(
+                key,
+                role="system",
+                content=f"Error: {error_message}",
+            )
             await _emit_terminal_once(
                 "session.event.error",
-                {"message": str(exc), "code": "agent_error"},
+                {"message": error_message, "code": event_code},
             )
         finally:
             if not _terminal_emitted:
@@ -1356,17 +1437,17 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
                 },
             ) from exc
 
-        # ``flush_service.execute`` can return ``mode="error"`` (no raise) when
-        # both the LLM path and the raw-dump fallback fail. Treat that as a
-        # hard failure so the transcript is preserved instead of cleared.
-        if receipt.mode == "error":
+        if not flush_receipt_allows_destructive_compaction(receipt):
             raise RpcHandlerError(
                 code="flush_disk_error",
-                message=f"Reset aborted: flush failed ({receipt.error or 'unknown error'})",
+                message=(
+                    "Reset aborted: flush did not produce a complete LLM receipt."
+                ),
                 details={
                     "flush_receipt": receipt.to_dict(),
                     "key": key,
                     "session_id": previous_session_id,
+                    "reason": "compaction_flush_failed",
                 },
             )
 
@@ -1489,47 +1570,175 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
         raise KeyError("No session manager available")
 
     context_window_tokens = _context_window_tokens(params, ctx)
+    custom_instructions = (params or {}).get("instructions")
+    if custom_instructions is not None and not isinstance(custom_instructions, str):
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="instructions must be a string when provided.",
+            details={"field": "instructions"},
+        )
     turn_runner = ctx.turn_runner
     lock = get_session_lock(turn_runner, key)
 
     async def _run_locked() -> dict[str, Any]:
+        receipt = None
         storage = get_session_storage(ctx.session_manager)
         session = None
         if storage is not None and await storage.get_session(key) is None:
             raise KeyError(f"Session not found: {key}")
         if storage is not None:
             session = await storage.get_session(key)
-
-        compaction_config = build_compaction_config_from_provider(
-            _resolve_compaction_provider(ctx, session),
-            model_override=_effective_compaction_model(session),
-            compaction_config=getattr(getattr(ctx, "config", None), "compaction", None),
+        notify_compaction(
+            key,
+            source="manual",
+            phase="manual",
+            status="started",
+            context_window_tokens=context_window_tokens,
         )
+        transcript = []
+        flush_enabled = pre_compaction_flush_enabled(ctx.config)
+        try:
+            if flush_enabled:
+                get_transcript = getattr(ctx.session_manager, "get_transcript", None)
+                if not callable(get_transcript):
+                    log.warning(
+                        "sessions.context_compact.flush_skipped",
+                        key=key,
+                        reason="transcript_reader_unavailable",
+                    )
+                    flush_enabled = False
+                else:
+                    transcript = await get_transcript(key)
 
-        compact_with_result = getattr(ctx.session_manager, "compact_with_result", None)
-        if callable(compact_with_result):
-            result = await compact_with_result(key, context_window_tokens, compaction_config)
-            summary = getattr(result, "summary", "") or ""
-            removed_count = int(getattr(result, "removed_count", 0) or 0)
-            summary_source = getattr(result, "summary_source", "unknown") or "unknown"
-        else:
-            compact = ctx.session_manager.compact
-            summary = await call_compact_with_optional_config(
-                compact,
-                key,
-                context_window_tokens,
-                compaction_config,
+            if flush_enabled and transcript:
+                if ctx.flush_service is None:
+                    log.warning(
+                        "sessions.context_compact.flush_skipped",
+                        key=key,
+                        reason="flush_service_unavailable",
+                    )
+                else:
+                    agent_id = normalize_agent_id(getattr(session, "agent_id", None) or "main")
+                    memory_cfg = getattr(getattr(ctx, "config", None), "memory", None)
+                    raw_timeout = getattr(
+                        memory_cfg,
+                        "flush_background_timeout_seconds",
+                        120.0,
+                    )
+                    try:
+                        flush_timeout = max(float(raw_timeout), 0.0)
+                    except (TypeError, ValueError):
+                        flush_timeout = 120.0
+                    try:
+                        receipt = await ctx.flush_service.execute(
+                            transcript,
+                            key,
+                            agent_id=agent_id,
+                            timeout=flush_timeout,
+                            message_window=0,
+                            segment_mode="auto",
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning(
+                            "sessions.context_compact.flush_failed",
+                            key=key,
+                            error=str(exc),
+                        )
+                    else:
+                        if not flush_receipt_allows_destructive_compaction(receipt):
+                            log.warning(
+                                "sessions.context_compact.flush_degraded",
+                                key=key,
+                                flush_receipt=flush_receipt_to_dict(receipt),
+                            )
+
+            compaction_config = build_compaction_config_from_provider(
+                _resolve_compaction_provider(ctx, session),
+                model_override=_effective_compaction_model(session),
+                compaction_config=getattr(getattr(ctx, "config", None), "compaction", None),
             )
-            removed_count = 1 if summary else 0
-            summary_source = "unknown"
-        return {
+
+            compact_with_result = getattr(ctx.session_manager, "compact_with_result", None)
+            if callable(compact_with_result):
+                result = await compact_with_result(
+                    key,
+                    context_window_tokens,
+                    compaction_config,
+                    custom_instructions=custom_instructions,
+                )
+                summary = getattr(result, "summary", "") or ""
+                removed_count = int(getattr(result, "removed_count", 0) or 0)
+                summary_source = getattr(result, "summary_source", "unknown") or "unknown"
+                kept_count = len(getattr(result, "kept_entries", []) or [])
+                tokens_before = int(getattr(result, "tokens_before", 0) or 0)
+                tokens_after = int(getattr(result, "tokens_after", 0) or 0)
+                remaining_budget_tokens = int(
+                    getattr(result, "remaining_budget_tokens", 0) or 0
+                )
+            else:
+                compact = ctx.session_manager.compact
+                summary = await call_compact_with_optional_config(
+                    compact,
+                    key,
+                    context_window_tokens,
+                    compaction_config,
+                )
+                removed_count = 1 if summary else 0
+                summary_source = "unknown"
+                kept_count = 0
+                tokens_before = 0
+                tokens_after = 0
+                remaining_budget_tokens = 0
+        except asyncio.CancelledError:
+            notify_compaction(
+                key,
+                source="manual",
+                phase="manual",
+                status="cancelled",
+                message="Compaction was cancelled.",
+                context_window_tokens=context_window_tokens,
+            )
+            raise
+        except Exception as exc:
+            notify_compaction(
+                key,
+                source="manual",
+                phase="manual",
+                status="failed",
+                message=str(exc),
+                context_window_tokens=context_window_tokens,
+            )
+            raise
+        payload = {
             "key": key,
             "compacted": removed_count > 0,
             "mode": "summary",
             "summary_len": len(summary),
             "summary_source": summary_source,
             "context_window_tokens": context_window_tokens,
+            "tokens_before": tokens_before,
+            "tokens_after": tokens_after,
+            "remaining_budget_tokens": remaining_budget_tokens,
+            "removed_count": removed_count,
+            "kept_count": kept_count,
         }
+        if receipt is not None:
+            payload["flush_receipt"] = flush_receipt_to_dict(receipt)
+        notify_compaction(
+            key,
+            source="manual",
+            phase="manual",
+            status="completed" if removed_count > 0 else "skipped",
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
+            remaining_budget_tokens=remaining_budget_tokens,
+            removed_count=removed_count,
+            kept_count=kept_count,
+            summary_len=len(summary),
+            summary_source=summary_source,
+            context_window_tokens=context_window_tokens,
+        )
+        return payload
 
     if lock is None:
         return await _run_locked()
@@ -1539,6 +1748,11 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
 
 @_d.method("sessions.compact", scope="operator.write")
 async def _handle_sessions_compact(params: dict | None, ctx: RpcContext) -> dict:
+    return cast(dict, await _handle_sessions_context_compact(params, ctx))
+
+
+@_d.method("sessions.truncate", scope="operator.write")
+async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dict:
     from opensquilla.memory.session_flush import FlushReceipt
 
     key = _require_key(params)
@@ -1567,7 +1781,7 @@ async def _handle_sessions_compact(params: dict | None, ctx: RpcContext) -> dict
                 raise RpcHandlerError(
                     code="flush_unavailable",
                     message=(
-                        "Compact aborted: flush service is unavailable and "
+                        "Truncate aborted: flush service is unavailable and "
                         "the transcript is non-empty. Re-run with force=true "
                         "(admin) to truncate without backup."
                     ),
@@ -1581,7 +1795,7 @@ async def _handle_sessions_compact(params: dict | None, ctx: RpcContext) -> dict
             if transcript and force and "operator.admin" not in ctx.principal.scopes:
                 raise RpcHandlerError(
                     code="permission_denied",
-                    message="force=true on sessions.compact requires operator.admin scope.",
+                    message="force=true on sessions.truncate requires operator.admin scope.",
                     details={"key": key, "session_id": previous_session_id},
                 )
         else:
@@ -1612,8 +1826,8 @@ async def _handle_sessions_compact(params: dict | None, ctx: RpcContext) -> dict
                         error=str(exc),
                     )
                     raise RpcHandlerError(
-                        code="flush_disk_error",
-                        message=f"Compact aborted: flush failed ({receipt.error})",
+                        code="CONTEXT_FLUSH_FAILED",
+                        message=f"Truncate aborted: flush failed ({receipt.error})",
                         details={
                             "flush_receipt": receipt.to_dict(),
                             "key": key,
@@ -1621,19 +1835,18 @@ async def _handle_sessions_compact(params: dict | None, ctx: RpcContext) -> dict
                         },
                     ) from exc
 
-                # ``flush_service.execute`` can return ``mode="error"`` (no
-                # raise) when both LLM and raw-dump fallbacks fail. Treat as
-                # hard failure so the transcript is preserved.
-                if receipt.mode == "error":
+                if not flush_receipt_allows_destructive_compaction(receipt):
                     raise RpcHandlerError(
-                        code="flush_disk_error",
+                        code="CONTEXT_FLUSH_FAILED",
                         message=(
-                            f"Compact aborted: flush failed ({receipt.error or 'unknown error'})"
+                            "Truncate aborted: flush did not produce a complete "
+                            "LLM receipt."
                         ),
                         details={
-                            "flush_receipt": receipt.to_dict(),
+                            "flush_receipt": flush_receipt_to_dict(receipt),
                             "key": key,
                             "session_id": previous_session_id,
+                            "reason": "compaction_flush_failed",
                         },
                     )
             else:
@@ -1651,6 +1864,7 @@ async def _handle_sessions_compact(params: dict | None, ctx: RpcContext) -> dict
         payload = {
             "key": key,
             "compacted": result["truncated"],
+            "mode": "truncate",
             "before_count": result["before_count"],
             "after_count": result["after_count"],
         }
@@ -1695,7 +1909,11 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
         conn = get_registry().get(ctx.conn_id)
         if conn is not None:
             for event in replay.events:
-                await conn.send_event(event.event_name, event.payload)
+                await conn.send_event(
+                    event.event_name,
+                    event.payload,
+                    meta={"replayed": True},
+                )
                 replayed_count += 1
 
     storage = get_session_storage(getattr(ctx, "session_manager", None))

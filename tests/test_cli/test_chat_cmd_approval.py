@@ -31,7 +31,7 @@ async def test_maybe_handle_approval_pending_prompts_and_resolves(monkeypatch) -
     )
     calls: list[tuple[str, bool, bool]] = []
 
-    async def _prompt(_: str) -> str:
+    async def _prompt(_: str, **_kwargs) -> str:
         return "o"
 
     monkeypatch.setattr(chat_cmd, "prompt_approval", _prompt)
@@ -67,7 +67,7 @@ async def test_maybe_handle_approval_required_invokes_prompt_and_resolver(monkey
         Console(file=buffer, force_terminal=False, width=100, highlight=False),
     )
 
-    async def _prompt(_: str) -> str:
+    async def _prompt(_: str, **_kwargs) -> str:
         return "o"
 
     monkeypatch.setattr(chat_cmd, "prompt_approval", _prompt)

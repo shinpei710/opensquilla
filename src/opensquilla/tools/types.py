@@ -43,6 +43,8 @@ class ToolContext:
     workspace_dir: str | None = None
     memory_source_dir: str | None = None
     workspace_strict: bool = False
+    scratch_dir: str | None = None
+    workspace_lockdown: bool = False
     session_key: str | None = None
     channel_kind: str | None = None
     channel_id: str | None = None
@@ -55,17 +57,23 @@ class ToolContext:
     artifact_max_bytes: int | None = None
     artifact_disk_budget_bytes: int | None = None
     published_artifacts: list[dict[str, Any]] = field(default_factory=list)
+    workspace_file_writes: list[dict[str, Any]] = field(default_factory=list)
     allowed_tools: set[str] | None = None
     denied_tools: set[str] = field(default_factory=set)
     on_memory_source_write: Callable[[str, str], None] | None = None
     on_bootstrap_source_write: Callable[[str, str], None] | None = None
     # Elevated mode: None/"off" = sandboxed, "on" = host exec with approval,
-    # "full" = host exec and skip approvals (trusted operators only). See
-    # docs/elevated-modes.md for matrix and gate bypass details.
+    # "full" = host exec and skip approvals (trusted operators only).
     elevated: str | None = None
     # Additive per-call tool surface overrides (surfaced tools are made visible even
     # when exposed_by_default=False). Does NOT relax allowed_tools strict denylist.
     surfaced_tools: set[str] | None = None
+    tool_policy: dict[str, Any] | None = None
+    tool_result_budget_policy: Any | None = None
+    tool_result_budget_tracker_factory: Callable[[], Any] | None = None
+    tool_run_budget_policy: Any | None = None
+    tool_run_budget_tracker_factory: Callable[[], Any] | None = None
+    tool_run_budget_key: str | None = None
 
 
 # Request-scoped context — set by build_tool_handler before each dispatch.
@@ -82,6 +90,9 @@ SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
         "gateway",
         "agents_list",
         "subagents",
+        "memory_get",
+        "memory_search",
+        "session_search",
         "message",
         "publish_artifact",
     }
@@ -95,8 +106,6 @@ CRON_AGENT_ALLOW: frozenset[str] = frozenset(
         "glob_search",
         "grep_search",
         "list_dir",
-        "memory_get",
-        "memory_search",
         "pdf",
         "read_file",
         "session_status",
@@ -136,6 +145,7 @@ class ToolSpec:
     execution_timeout_seconds: float | None = None
     execution_timeout_argument: str | None = None
     execution_timeout_padding: float = 0.0
+    result_budget_class: str | None = None
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.
@@ -172,6 +182,24 @@ class SafeToolError(SafeToolUserMessage, ToolError):
             self.user_message = user_message
 
 
+class InvalidToolArgumentsError(SafeToolUserMessage, ValueError):
+    """Raised when provider output did not produce executable tool arguments."""
+
+    user_message = (
+        "The tool call arguments were not valid JSON. Reissue the tool call with "
+        "valid JSON that matches the tool schema."
+    )
+
+
+class ProjectedToolArgumentsError(SafeToolUserMessage, ValueError):
+    """Raised when provider-context argument projections reach dispatch."""
+
+    user_message = (
+        "The tool call arguments were compacted for model context and cannot be "
+        "executed. Reissue the tool call with the real schema fields."
+    )
+
+
 class UnsupportedSurfaceError(SafeToolError):
     """Raised when a tool needs an interactive surface that is unavailable."""
 
@@ -196,9 +224,9 @@ class SSRFBlockedError(SafeToolUserMessage, ValueError):
 
 
 class WorkspaceAccessError(SafeToolError):
-    """Raised when a filesystem write/edit escapes the active workspace."""
+    """Raised when a filesystem operation escapes the active workspace."""
 
     user_message = (
-        "File writes and edits must stay inside the active workspace. Use a relative "
+        "Filesystem operations must stay inside the active workspace. Use a relative "
         "path within the workspace or choose an approved workspace file."
     )

@@ -12,7 +12,7 @@ import mimetypes
 import re
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,6 +38,12 @@ from opensquilla.channels._util import (
     RateLimiter,
     retry_request,
 )
+from opensquilla.channels.contract import (
+    ChannelCapabilities,
+    ChannelCapabilityProfile,
+    ChannelPlatformManifest,
+    ChannelSendResult,
+)
 from opensquilla.channels.transports import InboundEventEnvelope, InboundEventHandler
 from opensquilla.channels.types import (
     Attachment,
@@ -58,6 +64,8 @@ _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _FEISHU_WS_STARTUP_TIMEOUT_S = 1.0
 _FEISHU_WS_STARTUP_GRACE_S = 0.05
 _FEISHU_WS_JOIN_TIMEOUT_S = 1.0
+_FEISHU_WS_SINGLETON_LOCK = threading.Lock()
+_FEISHU_WS_ACTIVE_TRANSPORT: FeishuWebSocketTransport | None = None
 _FEISHU_INBOUND_RESOURCE_DEFAULTS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
     "image": ("image.png", "image/png", "image", ("image_key",)),
     "file": ("file", "application/octet-stream", "file", ("file_key",)),
@@ -152,9 +160,7 @@ def _import_lark_oapi() -> Any:
         import lark_oapi as lark  # type: ignore[import-not-found, import-untyped]
     except ImportError as exc:
         raise RuntimeError(
-            "Feishu websocket mode requires lark-oapi. Use the latest recommended "
-            "portable package, or install Feishu support with "
-            "`pip install 'opensquilla[feishu]'` / `uv sync --extra feishu`."
+            "Feishu adapter dependency missing — reinstall OpenSquilla"
         ) from exc
     return lark
 
@@ -198,8 +204,15 @@ class FeishuAuthError(Exception):
 class FeishuApiError(Exception):
     """Raised when a Feishu API call returns a non-zero code."""
 
-    def __init__(self, msg: str, *, code: int | None = None) -> None:
+    def __init__(
+        self,
+        msg: str,
+        *,
+        code: int | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> None:
         self.code = code
+        self.data = data or {}
         super().__init__(msg)
 
 
@@ -316,6 +329,7 @@ class FeishuWebSocketTransport:
         self._lark: Any | None = None
         self._stop_requested = threading.Event()
         self._worker_loop: asyncio.AbstractEventLoop | None = None
+        self._active_registration = False
 
     async def start(self, handler: InboundEventHandler) -> None:
         lark = _import_lark_oapi()
@@ -328,9 +342,23 @@ class FeishuWebSocketTransport:
             self.config.encrypt_key or "",
             self.config.verification_token or "",
         ).register_p2_im_message_receive_v1(self._on_message_sync)
-        read_receipt_registrar = getattr(builder, "register_p2_im_message_message_read_v1", None)
-        if callable(read_receipt_registrar):
-            builder = read_receipt_registrar(self._ignore_message_read_sync)
+        builder = self._register_optional_event(
+            builder,
+            "register_p2_im_message_message_read_v1",
+            self._ignore_message_read_sync,
+        )
+        for registrar_name, event_type in (
+            ("register_p2_im_chat_member_bot_added_v1", "im.chat.member.bot.added_v1"),
+            ("register_p2_im_chat_member_bot_deleted_v1", "im.chat.member.bot.deleted_v1"),
+            ("register_p2_im_message_reaction_created_v1", "im.message.reaction.created_v1"),
+            ("register_p2_im_message_reaction_deleted_v1", "im.message.reaction.deleted_v1"),
+            ("register_p2_card_action_trigger", "card.action.trigger"),
+        ):
+            builder = self._register_optional_event(
+                builder,
+                registrar_name,
+                self._event_callback(event_type),
+            )
         event_handler = builder.build()
 
         domain = (
@@ -383,9 +411,20 @@ class FeishuWebSocketTransport:
                     worker_loop.close()
                 if self._worker_loop is worker_loop:
                     self._worker_loop = None
+                self._release_active_client()
 
-        self._thread = threading.Thread(target=_run, daemon=True, name="opensquilla-feishu-ws")
-        self._thread.start()
+        try:
+            self._register_active_client()
+            self._thread = threading.Thread(target=_run, daemon=True, name="opensquilla-feishu-ws")
+            self._thread.start()
+        except Exception:
+            self._handler = None
+            self._loop = None
+            self._lark = None
+            self._ws_client = None
+            self._thread = None
+            self._release_active_client()
+            raise
         startup_deadline = time.monotonic() + _FEISHU_WS_STARTUP_TIMEOUT_S
         while not startup_event.is_set() and time.monotonic() < startup_deadline:
             await asyncio.sleep(0.01)
@@ -434,6 +473,26 @@ class FeishuWebSocketTransport:
         )
 
     def _on_message_sync(self, event: Any) -> None:
+        self._on_event_sync(event, default_event_type="im.message.receive_v1")
+
+    def _event_callback(self, default_event_type: str) -> Callable[[Any], None]:
+        def _callback(event: Any) -> None:
+            self._on_event_sync(event, default_event_type=default_event_type)
+
+        return _callback
+
+    @staticmethod
+    def _register_optional_event(
+        builder: Any,
+        registrar_name: str,
+        callback: Callable[[Any], None],
+    ) -> Any:
+        registrar = getattr(builder, registrar_name, None)
+        if not callable(registrar):
+            return builder
+        return registrar(callback)
+
+    def _on_event_sync(self, event: Any, *, default_event_type: str) -> None:
         if self._loop is None or self._handler is None:
             return
         try:
@@ -442,7 +501,7 @@ class FeishuWebSocketTransport:
             envelope = InboundEventEnvelope(
                 source="feishu:websocket",
                 event_id=header.get("event_id"),
-                event_type=header.get("event_type", "im.message.receive_v1"),
+                event_type=header.get("event_type", default_event_type),
                 raw=raw,
                 received_at=datetime.now(UTC),
             )
@@ -545,6 +604,27 @@ class FeishuWebSocketTransport:
         with contextlib.suppress(Exception):
             loop.run_until_complete(loop.shutdown_asyncgens())
 
+    def _register_active_client(self) -> None:
+        global _FEISHU_WS_ACTIVE_TRANSPORT
+        with _FEISHU_WS_SINGLETON_LOCK:
+            active = _FEISHU_WS_ACTIVE_TRANSPORT
+            if active is not None and active is not self:
+                raise RuntimeError(
+                    "only one Feishu websocket channel can run in one OpenSquilla gateway "
+                    "process because lark-oapi uses a process-global asyncio event loop; "
+                    "disable duplicate Feishu websocket channels or run the second bot in "
+                    "a separate gateway process."
+                )
+            _FEISHU_WS_ACTIVE_TRANSPORT = self
+            self._active_registration = True
+
+    def _release_active_client(self) -> None:
+        global _FEISHU_WS_ACTIVE_TRANSPORT
+        with _FEISHU_WS_SINGLETON_LOCK:
+            if _FEISHU_WS_ACTIVE_TRANSPORT is self:
+                _FEISHU_WS_ACTIVE_TRANSPORT = None
+            self._active_registration = False
+
 
 @dataclass
 class FeishuChannel:
@@ -596,6 +676,37 @@ class FeishuChannel:
             self._transport = FeishuWebSocketTransport(self.config)
         else:
             raise ValueError(f"Unsupported Feishu connection_mode: {self.config.connection_mode}")
+
+    @property
+    def capability_profile(self) -> ChannelCapabilityProfile:
+        return ChannelCapabilityProfile(
+            channel_type="feishu",
+            group_chat=True,
+            mentions=True,
+            native_file_upload=True,
+            media=True,
+            reactions=self.config.status_reactions_enabled,
+            outbound_status_reactions=self.config.status_reactions_enabled,
+            cards=True,
+            interactive_cards=True,
+            member_events=True,
+            edit=True,
+            delete=True,
+            reply=True,
+            thread_reply=True,
+            scope_diagnostics=True,
+            transports=(self.config.connection_mode,),
+        )
+
+    @property
+    def platform_capability_manifest(self) -> ChannelPlatformManifest:
+        from opensquilla.tools.builtin.feishu_platform import build_feishu_platform_manifest
+
+        return build_feishu_platform_manifest()
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self.capability_profile.capability_tags()
 
     @property
     def transport_name(self) -> str:
@@ -755,33 +866,40 @@ class FeishuChannel:
             self.enqueue(self.parse_event(envelope.raw))
         elif envelope.event_type == "im.chat.member.bot.added_v1":
             chat_id = envelope.raw.get("event", {}).get("chat_id", "unknown")
-            self.enqueue(
-                IncomingMessage(
-                    sender_id="system",
-                    channel_id=chat_id,
-                    content="[bot added to group]",
-                    metadata={
-                        "event_type": envelope.event_type,
-                        "event_id": envelope.event_id,
-                    },
-                )
+            log.info(
+                "feishu.bot_added",
+                chat_id=chat_id,
+                event_id=envelope.event_id,
             )
-        elif envelope.event_type == "im.message.reaction.created_v1":
+        elif envelope.event_type == "im.chat.member.bot.deleted_v1":
+            chat_id = envelope.raw.get("event", {}).get("chat_id", "unknown")
+            log.info(
+                "feishu.bot_deleted",
+                chat_id=chat_id,
+                event_id=envelope.event_id,
+            )
+        elif envelope.event_type in {
+            "im.message.reaction.created_v1",
+            "im.message.reaction.deleted_v1",
+        }:
             event_body = envelope.raw.get("event", {})
-            self.enqueue(
-                IncomingMessage(
-                    sender_id=event_body.get("user_id", {}).get("open_id", "unknown"),
-                    channel_id=event_body.get("message_id", "unknown"),
-                    content="",
-                    metadata={
-                        "event_type": envelope.event_type,
-                        "event_id": envelope.event_id,
-                        "reaction_type": event_body.get("reaction_type", {}).get(
-                            "emoji_type",
-                            "",
-                        ),
-                    },
-                )
+            reaction = event_body.get("reaction_type", {}).get("emoji_type", "")
+            user = event_body.get("user_id", {}).get("open_id", "unknown")
+            log.info(
+                "feishu.reaction_event",
+                event_type=envelope.event_type,
+                event_id=envelope.event_id,
+                message_id=event_body.get("message_id", ""),
+                user_id=user,
+                reaction_type=reaction,
+            )
+        elif envelope.event_type == "card.action.trigger":
+            log.info("feishu.card_action_ignored", event_id=envelope.event_id)
+        else:
+            log.info(
+                "feishu.event_ignored",
+                event_type=envelope.event_type,
+                event_id=envelope.event_id,
             )
 
     def _verify_signature(self, timestamp: str, nonce: str, body: str, signature: str) -> bool:
@@ -823,11 +941,25 @@ class FeishuChannel:
             if key and user_id:
                 mention_map[key] = user_id
 
+        chat_type = str(message.get("chat_type") or "")
+        conversation_kind = self._conversation_kind(message)
         metadata: dict[str, Any] = {
             "message_id": message.get("message_id"),
-            "chat_type": message.get("chat_type"),
+            "chat_id": chat_id,
+            "root_id": message.get("root_id"),
+            "parent_id": message.get("parent_id"),
+            "chat_type": chat_type,
+            "is_group": chat_type in {"group", "topic_group"},
             "event_id": header.get("event_id"),
             "message_type": msg_type,
+            "conversation_kind": conversation_kind,
+            "native_message_id": message.get("message_id"),
+            "native_chat_id": chat_id,
+            "native_root_id": message.get("root_id"),
+            "native_parent_id": message.get("parent_id"),
+            "native_thread_id": message.get("thread_id"),
+            "reply_target_id": message.get("message_id"),
+            "mentions": mentions_raw,
             "mention_map": mention_map,
         }
 
@@ -838,6 +970,16 @@ class FeishuChannel:
             attachments=attachments,
             metadata=metadata,
         )
+
+    @staticmethod
+    def _conversation_kind(message: dict[str, Any]) -> str:
+        chat_type = str(message.get("chat_type") or "")
+        has_thread = bool(message.get("thread_id"))
+        if chat_type == "topic_group":
+            return "topic" if has_thread else "group"
+        if chat_type == "group":
+            return "thread" if has_thread else "group"
+        return "dm"
 
     def _extract_content(self, msg_type: str, raw: str) -> str:
         """Extract plain text content from Feishu's JSON-wrapped message body."""
@@ -867,6 +1009,31 @@ class FeishuChannel:
             return []
         if not isinstance(parsed, dict):
             return []
+
+        if msg_type == "post":
+            attachments: list[Attachment] = []
+            for paragraph in parsed.get("content", []):
+                if not isinstance(paragraph, list):
+                    continue
+                for element in paragraph:
+                    if not isinstance(element, dict) or element.get("tag") != "img":
+                        continue
+                    resource_key = element.get("image_key")
+                    if not isinstance(resource_key, str) or not resource_key:
+                        continue
+                    attachments.append(
+                        Attachment(
+                            name="image.png",
+                            mime_type="image/png",
+                            metadata={
+                                "feishu_message_id": message_id,
+                                "feishu_message_type": msg_type,
+                                "feishu_resource_key": resource_key,
+                                "feishu_resource_type": "image",
+                            },
+                        )
+                    )
+            return attachments
 
         defaults = _FEISHU_INBOUND_RESOURCE_DEFAULTS.get(msg_type)
         if defaults is None:
@@ -961,30 +1128,41 @@ class FeishuChannel:
         inbound: IncomingMessage,
     ) -> OutgoingMessage:
         """Build a Feishu reply that targets the inbound chat."""
-        return OutgoingMessage(content=content, reply_to=inbound.channel_id)
+        metadata: dict[str, Any] = {}
+        reply_message_id = inbound.metadata.get("reply_target_id") or inbound.metadata.get(
+            "native_message_id"
+        )
+        if isinstance(reply_message_id, str) and reply_message_id:
+            metadata["reply_message_id"] = reply_message_id
+        native_thread_id = inbound.metadata.get("native_thread_id")
+        if isinstance(native_thread_id, str) and native_thread_id:
+            metadata["native_thread_id"] = native_thread_id
+        return OutgoingMessage(content=content, reply_to=inbound.channel_id, metadata=metadata)
 
     def streaming_reply_kwargs(self, inbound: IncomingMessage) -> dict[str, Any]:
         """Return Feishu streaming target kwargs for the inbound chat."""
         return {"chat_id": inbound.channel_id}
 
-    async def send(self, message: OutgoingMessage) -> None:
+    @staticmethod
+    def _raise_api_error(data: dict[str, Any], fallback: str) -> None:
+        if data.get("code") != 0:
+            raise FeishuApiError(
+                data.get("msg", fallback),
+                code=data.get("code"),
+                data=data,
+            )
+
+    async def send_text(self, chat_id: str, content: str) -> str:
+        """Send a text message to a chat/open_id and return Feishu message_id."""
         await self._rate_limiter.acquire()
         headers = await self._auth_headers()
         client = self._get_client()
-        chat_id = message.reply_to or self.config.default_chat_id
-
         receive_id_type = _feishu_receive_id_type(chat_id)
-
         payload: dict[str, Any] = {
             "receive_id": chat_id,
             "msg_type": "text",
-            "content": json.dumps({"text": _normalize_outbound_text(message.content)}),
+            "content": json.dumps({"text": _normalize_outbound_text(content)}),
         }
-
-        if message.metadata.get("card"):
-            payload["msg_type"] = "interactive"
-            payload["content"] = json.dumps(message.metadata["card"])
-
         resp = await retry_request(
             client.post,
             f"/im/v1/messages?receive_id_type={receive_id_type}",
@@ -993,11 +1171,83 @@ class FeishuChannel:
         )
         resp.raise_for_status()
         data = resp.json()
-        if data.get("code") != 0:
-            raise FeishuApiError(data.get("msg", "send failed"), code=data.get("code"))
+        self._raise_api_error(data, "send failed")
+        return str(data.get("data", {}).get("message_id", ""))
+
+    async def reply_text(self, message_id: str, content: str) -> str:
+        """Reply to a Feishu message and return the reply message_id."""
+        await self._rate_limiter.acquire()
+        headers = await self._auth_headers()
+        client = self._get_client()
+        resp = await retry_request(
+            client.post,
+            f"/im/v1/messages/{message_id}/reply",
+            json={
+                "msg_type": "text",
+                "content": json.dumps({"text": _normalize_outbound_text(content)}),
+            },
+            headers=headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        self._raise_api_error(data, "reply failed")
+        return str(data.get("data", {}).get("message_id", ""))
+
+    async def read_message(self, message_id: str) -> dict[str, Any]:
+        """Fetch a Feishu message payload."""
+        await self._rate_limiter.acquire()
+        headers = await self._auth_headers()
+        client = self._get_client()
+        resp = await retry_request(
+            client.get,
+            f"/im/v1/messages/{message_id}",
+            headers=headers,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        self._raise_api_error(data, "read failed")
+        payload = data.get("data", {})
+        return payload if isinstance(payload, dict) else {}
+
+    async def send(self, message: OutgoingMessage) -> None:
+        reply_message_id = message.metadata.get("reply_message_id")
+        if isinstance(reply_message_id, str) and reply_message_id:
+            await self.reply_text(reply_message_id, message.content)
+            log.debug("feishu.reply", message_id=reply_message_id)
+            return
+        chat_id = message.reply_to or self.config.default_chat_id
+
+        if message.metadata.get("card"):
+            await self._rate_limiter.acquire()
+            headers = await self._auth_headers()
+            client = self._get_client()
+            receive_id_type = _feishu_receive_id_type(chat_id)
+            payload: dict[str, Any] = {
+                "receive_id": chat_id,
+                "msg_type": "text",
+                "content": json.dumps({"text": _normalize_outbound_text(message.content)}),
+            }
+            payload["msg_type"] = "interactive"
+            payload["content"] = json.dumps(message.metadata["card"])
+            resp = await retry_request(
+                client.post,
+                f"/im/v1/messages?receive_id_type={receive_id_type}",
+                json=payload,
+                headers=headers,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            self._raise_api_error(data, "send failed")
+        else:
+            await self.send_text(chat_id, message.content)
         log.debug("feishu.send", chat_id=chat_id)
 
-    async def send_file(self, chat_id: str, file_path: str, file_type: str = "file") -> None:
+    async def send_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        file_type: str = "file",
+    ) -> ChannelSendResult:
         """Upload and send a file to a Feishu chat."""
         await self._rate_limiter.acquire()
         headers = await self._auth_headers()
@@ -1015,12 +1265,9 @@ class FeishuChannel:
                 )
             upload_resp.raise_for_status()
             upload_data = upload_resp.json()
-            if upload_data.get("code") != 0:
-                raise FeishuApiError(
-                    upload_data.get("msg", "image upload failed"),
-                    code=upload_data.get("code"),
-                )
+            self._raise_api_error(upload_data, "image upload failed")
             key = upload_data["data"]["image_key"]
+            provider_file_id = str(key)
             message_type = "image"
             content = {"image_key": key}
         else:
@@ -1035,12 +1282,9 @@ class FeishuChannel:
                 )
             upload_resp.raise_for_status()
             upload_data = upload_resp.json()
-            if upload_data.get("code") != 0:
-                raise FeishuApiError(
-                    upload_data.get("msg", "file upload failed"),
-                    code=upload_data.get("code"),
-                )
+            self._raise_api_error(upload_data, "file upload failed")
             key = upload_data["data"]["file_key"]
+            provider_file_id = str(key)
             message_type = "file"
             content = {"file_key": key}
 
@@ -1058,8 +1302,14 @@ class FeishuChannel:
         )
         resp.raise_for_status()
         data = resp.json()
-        if data.get("code") != 0:
-            raise FeishuApiError(data.get("msg", "send file failed"), code=data.get("code"))
+        self._raise_api_error(data, "send file failed")
+        message_id = str(data.get("data", {}).get("message_id", ""))
+        return ChannelSendResult.sent(
+            capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+            target_id=chat_id,
+            provider_message_id=message_id,
+            provider_file_id=provider_file_id,
+        )
 
     async def edit(self, message_id: str, content: str) -> None:
         await self._rate_limiter.acquire()
@@ -1076,8 +1326,7 @@ class FeishuChannel:
         )
         resp.raise_for_status()
         data = resp.json()
-        if data.get("code") != 0:
-            raise FeishuApiError(data.get("msg", "edit failed"), code=data.get("code"))
+        self._raise_api_error(data, "edit failed")
         log.debug("feishu.edit", message_id=message_id)
 
     async def delete(self, message_id: str) -> None:
@@ -1091,8 +1340,7 @@ class FeishuChannel:
         )
         resp.raise_for_status()
         data = resp.json()
-        if data.get("code") != 0:
-            raise FeishuApiError(data.get("msg", "delete failed"), code=data.get("code"))
+        self._raise_api_error(data, "delete failed")
 
     # ------------------------------------------------------------------
     # Streaming
@@ -1135,7 +1383,11 @@ class FeishuChannel:
     def is_mentioned(self, text: str, mention_map: dict[str, str]) -> bool:
         """Check if the bot is mentioned in the message."""
         bot_id = self.bot_open_id
-        return bool(bot_id and bot_id in self.extract_mentions(text, mention_map))
+        if not bot_id:
+            return False
+        return bot_id in set(mention_map.values()) or bot_id in self.extract_mentions(
+            text, mention_map
+        )
 
     def is_group_mentioned(self, msg: IncomingMessage) -> bool:
         """Uniform mention check for group gating. Reads mention_map from metadata."""

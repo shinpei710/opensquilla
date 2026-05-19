@@ -10,7 +10,8 @@ import contextlib
 import hashlib
 import json
 import time
-from collections.abc import AsyncIterator
+import uuid
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -19,6 +20,7 @@ from typing import Any
 import structlog
 
 from opensquilla.artifacts import artifact_payload
+from opensquilla.context_budget import ContextBudgetClass, ContextBudgetGovernor
 from opensquilla.engine.cache_break_monitor import (
     check_response_for_cache_break,
     notify_compaction,
@@ -27,13 +29,23 @@ from opensquilla.engine.cache_break_monitor import (
 from opensquilla.engine.fallback import FallbackPolicy, backoff_sleep
 from opensquilla.engine.history import limit_turns, repair_tool_pairing
 from opensquilla.engine.session_sanitize import (
+    project_historical_tool_payloads,
     sanitize_session_messages,
     session_payload_chars,
 )
 from opensquilla.engine.thinking import drop_reasoning
+from opensquilla.engine.tool_result_store import (
+    ToolResultRecord,
+    ToolResultStore,
+    ToolResultStoreBudgetError,
+)
 from opensquilla.engine.tool_text_compat import strip_synthetic_tool_call_suffix
 from opensquilla.engine.tool_truncation import estimate_tokens as get_approx_tokens
 from opensquilla.engine.tool_truncation import truncate_result
+from opensquilla.execution_status import (
+    mark_execution_status_truncated,
+    runtime_execution_status,
+)
 from opensquilla.observability.turn_call_log import TurnCallLogger
 from opensquilla.provider import (
     ChatConfig,
@@ -61,12 +73,21 @@ from opensquilla.provider import (
 )
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.types import ContentBlockImage
+from opensquilla.result_budget import (
+    ToolResultBudgetClass,
+    compact_tool_result_content,
+    resolve_budget_class,
+)
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
     build_compaction_config_from_provider,
     compact_context,
 )
+from opensquilla.session.compaction_lifecycle import (
+    flush_receipt_allows_destructive_compaction,
+)
+from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
 
 from .context import ContextAssembly
@@ -93,6 +114,21 @@ from .types import (
 
 logger = structlog.get_logger("opensquilla.engine.agent")
 
+_PROVIDER_OUTPUT_TRUNCATED_REPLY = build_terminal_reply(
+    {
+        "status": "failed",
+        "terminal_reason": "output_truncated",
+        "error_class": "provider_output_truncated",
+        "error_message": "Provider output limit reached before completion",
+    }
+)
+_PROVIDER_OUTPUT_CONTINUE_PROMPT = (
+    "The previous provider response reached its output limit before the task finished. "
+    "Continue from the exact point where it stopped. Do not repeat text that has already "
+    "been written. If a tool call was interrupted or incomplete, regenerate a complete "
+    "tool call from scratch."
+)
+
 
 def _is_deepseek_model_id(model_id: str | None) -> bool:
     normalized = (model_id or "").strip().lower()
@@ -112,6 +148,18 @@ _TOOL_RESULT_SUMMARY_SYSTEM = (
 )
 _LARGE_JSON_TOOL_FIELD_KEYS: frozenset[str] = frozenset({"body", "body_base64"})
 _LARGE_JSON_TOOL_FIELD_CHARS = 20_000
+_TOOL_ARGUMENT_PROJECTION_PREFIX = "[tool_use_argument_projection]\n"
+_HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX = "[historical_tool_argument_omitted]\n"
+_INVALID_PROVIDER_CONTEXT_PROJECTION_PREFIX = "[invalid_provider_context_projection:"
+_INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY = "_invalid_provider_context_arguments"
+_TOOL_ARGUMENT_HEARTBEAT_CHARS = 4096
+_PROVIDER_CONTEXT_PROJECTION_REUSED_REASON = "provider_context_projection_reused"
+_COMPACTED_TOOL_ARGUMENT_MARKERS = frozenset(
+    {
+        "_opensquilla_compacted_tool_arguments",
+        "_opensquilla_compacted_tool_input",
+    }
+)
 
 
 def _large_json_field_replacement(value: str) -> dict[str, object]:
@@ -174,6 +222,58 @@ def _is_threshold_denial(result: ToolResult) -> bool:
     )
 
 
+_PENDING_APPROVAL_STATUSES: frozenset[str] = frozenset(
+    {"approval_required", "approval_pending"}
+)
+
+
+def _pending_approval_payload(content: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("status") not in _PENDING_APPROVAL_STATUSES:
+        return None
+    approval_id = payload.get("approval_id")
+    if not isinstance(approval_id, str) or not approval_id:
+        return None
+    return payload
+
+
+async def _wait_for_pending_approval_resolution(
+    payload: dict[str, Any],
+    *,
+    timeout: float,
+) -> None:
+    approval_id = payload.get("approval_id")
+    if not isinstance(approval_id, str) or not approval_id:
+        return
+    try:
+        from opensquilla.gateway.approval_queue import get_approval_queue
+
+        await get_approval_queue().wait(approval_id, timeout=timeout)
+    except KeyError:
+        return
+
+
+def _tool_result_content_has_artifact(content: str) -> bool:
+    try:
+        payload = json.loads(content)
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if isinstance(payload.get("artifact"), dict) or isinstance(payload.get("artifacts"), list):
+        return True
+    return payload.get("status") in {"published", "already_published"}
+
+
+def _tool_result_budget_tokens(content: str) -> int:
+    return max(get_approx_tokens(content), len(content) // 4)
+
+
 def _artifact_event_kwargs(payload: dict[str, Any]) -> dict[str, Any]:
     allowed = {
         "kind",
@@ -219,6 +319,24 @@ def _message_has_tool_result(message: Message | None) -> bool:
     return any(getattr(block, "type", None) == "tool_result" for block in message.content)
 
 
+def _append_length_capped_continuation(
+    turn_messages: list[Message],
+    *,
+    response_text: str,
+    tool_calls: list[ToolCall],
+) -> str:
+    visible_text = strip_synthetic_tool_call_suffix(
+        response_text,
+        [tc.tool_name for tc in tool_calls if tc.synthetic_from_text],
+    )
+    if visible_text:
+        turn_messages.append(
+            Message(role="assistant", content=[ContentBlockText(text=visible_text)])
+        )
+    turn_messages.append(Message(role="user", content=_PROVIDER_OUTPUT_CONTINUE_PROMPT))
+    return visible_text
+
+
 class _ProviderAttemptKind(StrEnum):
     OK = "ok"
     REASONING_ONLY = "reasoning_only"
@@ -237,6 +355,55 @@ class _ProviderAttemptClassification:
     kind: _ProviderAttemptKind
     stop_reason: str | None = None
     user_visible_emitted: bool = False
+
+
+@dataclass(frozen=True)
+class _ProviderRetryPolicy:
+    max_provider_retries: int
+    attempt_budgets: dict[_ProviderAttemptKind, int]
+    provider_failure_budgets: dict[ProviderFailureKind, int]
+
+    @classmethod
+    def from_provider_budget(cls, max_provider_retries: int) -> _ProviderRetryPolicy:
+        return cls(
+            max_provider_retries=max_provider_retries,
+            attempt_budgets={
+                _ProviderAttemptKind.REASONING_ONLY: 1,
+                _ProviderAttemptKind.MALFORMED_EMPTY: 1,
+                _ProviderAttemptKind.STREAM_INCOMPLETE: 1,
+                _ProviderAttemptKind.LENGTH_CAPPED: 1,
+            },
+            provider_failure_budgets={ProviderFailureKind.EMPTY_RESPONSE: 1},
+        )
+
+    def used_attempts(self) -> dict[_ProviderAttemptKind, int]:
+        return {kind: 0 for kind in self.attempt_budgets}
+
+    def can_retry_attempt(
+        self,
+        kind: _ProviderAttemptKind,
+        used: dict[_ProviderAttemptKind, int],
+    ) -> bool:
+        return (
+            self.max_provider_retries > 0
+            and used.get(kind, 0) < self.attempt_budgets.get(kind, 0)
+        )
+
+    def can_retry_provider_failure(
+        self,
+        failure_kind: ProviderFailureKind,
+        *,
+        post_tool_turn: bool,
+        provider_retry_attempt: int,
+    ) -> bool:
+        if failure_kind is ProviderFailureKind.EMPTY_RESPONSE:
+            return (
+                post_tool_turn
+                and self.max_provider_retries > 0
+                and provider_retry_attempt
+                < self.provider_failure_budgets.get(failure_kind, self.max_provider_retries)
+            )
+        return provider_retry_attempt < self.max_provider_retries
 
 
 def _classify_provider_attempt(
@@ -263,15 +430,15 @@ def _classify_provider_attempt(
             stop_reason=stop_reason,
             user_visible_emitted=user_visible_emitted,
         )
-    if visible_text or tool_calls:
-        return _ProviderAttemptClassification(
-            _ProviderAttemptKind.OK,
-            stop_reason=stop_reason,
-            user_visible_emitted=user_visible_emitted,
-        )
     if (stop_reason or "").lower() == "length":
         return _ProviderAttemptClassification(
             _ProviderAttemptKind.LENGTH_CAPPED,
+            stop_reason=stop_reason,
+            user_visible_emitted=user_visible_emitted,
+        )
+    if visible_text or tool_calls:
+        return _ProviderAttemptClassification(
+            _ProviderAttemptKind.OK,
             stop_reason=stop_reason,
             user_visible_emitted=user_visible_emitted,
         )
@@ -301,6 +468,7 @@ def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
         cache_mode=chat_cfg.cache_mode,
         model_capabilities=chat_cfg.model_capabilities,
         thinking_level=None,
+        provider_request_max_chars=chat_cfg.provider_request_max_chars,
     )
 
 
@@ -344,6 +512,7 @@ class _StreamAccumulator:
     tool_name: str
     synthetic_from_text: bool = False
     json_buf: list[str] = field(default_factory=list)
+    json_chars: int = 0
 
     def finish(self) -> dict[str, Any]:
         raw = "".join(self.json_buf)
@@ -374,6 +543,8 @@ class Agent:
         session_key: str | None = None,
         turn_call_logger: TurnCallLogger | None = None,
         tool_result_summarizer_provider: LLMProvider | None = None,
+        memory_sync_manager: Any | None = None,
+        session_flush_service: Any | None = None,
     ) -> None:
         self.provider = provider
         self.config = config or AgentConfig()
@@ -390,14 +561,181 @@ class Agent:
         self._state: AgentState = AgentState.IDLE
         self._history: list[Message] = []
         self._context: ContextAssembly | None = None
-        self._memory_sync_manager: Any | None = None
+        # Typed dependency surface. Either constructor injection or legacy
+        # attribute assignment from the runtime is accepted; both reach the same
+        # internal slot.
+        self._memory_sync_manager: Any | None = memory_sync_manager
 
         # Memory flush state (sub-agent based, re-entrant per compaction cycle)
         self._flush_done_this_cycle: bool = False
         self._active_flush_task: asyncio.Task | None = None
+        self._flush_wait_timed_out_task: asyncio.Task | None = None
         self._flush_backoff_until: float = 0.0
         self._flush_backoff_seconds: float = 0.0
-        self._session_flush_service = None  # set externally by runtime/gateway
+        self._session_flush_service = session_flush_service
+        self._last_compaction_refusal_reason: str | None = None
+        self._tool_failure_loop_counts: dict[tuple[str, str], int] = {}
+
+    def _context_overflow_error(self) -> ErrorEvent:
+        reason = self._last_compaction_refusal_reason
+        if reason == "memory_flush_timeout_before_compaction":
+            return ErrorEvent(
+                message=(
+                    "Context compaction could not run because the pre-compaction "
+                    "memory flush timed out."
+                ),
+                code="compaction_refused_flush_timeout",
+            )
+        if reason == "memory_flush_degraded_before_compaction":
+            return ErrorEvent(
+                message=(
+                    "Context compaction could not run because the pre-compaction "
+                    "memory flush did not produce a verified summary."
+                ),
+                code="compaction_refused_memory_flush",
+            )
+        if reason == "empty_summary_rejected":
+            return ErrorEvent(
+                message="Context compaction produced no replacement summary.",
+                code="compaction_refused_empty_summary",
+            )
+        if reason == "compaction_failed":
+            return ErrorEvent(
+                message="Context compaction failed before the provider request could be retried.",
+                code="compaction_failed",
+            )
+        if reason == "compaction_not_smaller":
+            return ErrorEvent(
+                message="Context compaction did not reduce the provider request.",
+                code="compaction_not_smaller",
+            )
+        if reason == "provider_recent_tail_too_large":
+            return ErrorEvent(
+                message=(
+                    "The request is too large for the provider context window after "
+                    "automatic context compaction and payload reduction. OpenSquilla "
+                    "preserved the recoverable state; retry with a narrower request "
+                    "or a larger-context model."
+                ),
+                code="provider_request_too_large",
+            )
+        if reason == "provider_request_budget_exhausted":
+            return ErrorEvent(
+                message=(
+                    "The request is too large for the provider context window after "
+                    "automatic context compaction and payload reduction. OpenSquilla "
+                    "preserved the recoverable state; retry with a narrower request "
+                    "or a larger-context model."
+                ),
+                code="provider_request_too_large",
+            )
+        return ErrorEvent(
+            message="Context overflow persists after compaction",
+            code="compaction_exhausted",
+        )
+
+    def _record_provider_context_overflow_reason(
+        self,
+        provider_error: ProviderErrorEvent,
+    ) -> None:
+        if provider_error.code != "provider_request_budget_exhausted":
+            return
+        proof = self._provider_request_budget_proof(provider_error)
+        if proof is None:
+            self._last_compaction_refusal_reason = "provider_request_budget_exhausted"
+            return
+        if proof.get("recent_tail_too_large") is True:
+            self._last_compaction_refusal_reason = "provider_recent_tail_too_large"
+            return
+        if proof.get("compaction_not_smaller") is True:
+            self._last_compaction_refusal_reason = "compaction_not_smaller"
+            return
+        fallback_reason = proof.get("fallback_reason")
+        if fallback_reason == "provider_request_budget_exhausted":
+            self._last_compaction_refusal_reason = "provider_request_budget_exhausted"
+
+    @staticmethod
+    def _provider_request_budget_proof(
+        provider_error: ProviderErrorEvent,
+    ) -> dict[str, Any] | None:
+        if provider_error.code != "provider_request_budget_exhausted":
+            return None
+        try:
+            proof = json.loads(provider_error.message)
+        except (TypeError, ValueError):
+            return None
+        return proof if isinstance(proof, dict) else None
+
+    @staticmethod
+    def _positive_int(value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    def _provider_budget_compaction_window_tokens(
+        self,
+        provider_error: ProviderErrorEvent,
+    ) -> int | None:
+        proof = self._provider_request_budget_proof(provider_error)
+        if proof is None:
+            return None
+        proof_budget = self._positive_int(
+            proof.get("effective_proof_budget") or proof.get("proof_budget")
+        )
+        if proof_budget is None:
+            return None
+        estimated_chars = self._positive_int(proof.get("estimated_chars"))
+        estimated_tokens = self._positive_int(proof.get("estimated_tokens"))
+        if estimated_chars and estimated_tokens:
+            window_tokens = int(proof_budget * (estimated_tokens / estimated_chars))
+        else:
+            window_tokens = proof_budget // 4
+        if window_tokens <= 0:
+            return None
+        return min(self.config.context_window_tokens, window_tokens)
+
+    def _provider_budget_estimated_tokens(
+        self,
+        provider_error: ProviderErrorEvent,
+    ) -> int | None:
+        proof = self._provider_request_budget_proof(provider_error)
+        if proof is None:
+            return None
+        return self._positive_int(proof.get("estimated_tokens"))
+
+    def _provider_request_proof_max_chars(self) -> int:
+        return self._context_budget_governor().snapshot().provider_request_max_chars
+
+    def _context_budget_governor(self) -> ContextBudgetGovernor:
+        return ContextBudgetGovernor.from_config(self.config)
+
+    @staticmethod
+    def _context_budget_class(
+        budget_class: ToolResultBudgetClass | None,
+    ) -> ContextBudgetClass:
+        if budget_class is ToolResultBudgetClass.EXTERNAL:
+            return ContextBudgetClass.EXTERNAL
+        if budget_class is ToolResultBudgetClass.ARTIFACT:
+            return ContextBudgetClass.ARTIFACT
+        if budget_class is ToolResultBudgetClass.ERROR:
+            return ContextBudgetClass.ERROR
+        if budget_class is ToolResultBudgetClass.CONTROL:
+            return ContextBudgetClass.CONTROL
+        return ContextBudgetClass.LOCAL
+
+    def _tool_use_argument_provider_request_max_chars(self, tool_name: str) -> int:
+        budget_class = self._context_budget_class(resolve_budget_class(tool_name))
+        return self._context_budget_governor().tool_argument_chars_for(budget_class)
+
+    def _tool_result_provider_request_max_chars(
+        self,
+        budget_class: ToolResultBudgetClass | None = None,
+    ) -> int:
+        return self._context_budget_governor().tool_result_provider_chars_for(
+            self._context_budget_class(budget_class)
+        )
 
     def _tool_execution_timeout(self, tool_call: ToolCall) -> float:
         timeout = float(self.config.tool_timeout)
@@ -435,6 +773,20 @@ class Agent:
             return float(raw_interval)
         except (TypeError, ValueError):
             return 15.0
+
+    def _approval_wait_timeout(self) -> float:
+        raw_timeout = self.config.metadata.get("approval_wait_timeout_seconds", 180.0)
+        try:
+            return max(0.0, float(raw_timeout))
+        except (TypeError, ValueError):
+            return 180.0
+
+    def _max_safe_tool_concurrency(self) -> int:
+        try:
+            value = int(self.config.max_safe_tool_concurrency)
+        except (TypeError, ValueError):
+            return 6
+        return max(1, value)
 
     def _write_turn_call_log(self, kind: str, **payload: Any) -> None:
         if self._turn_call_logger is not None:
@@ -493,6 +845,446 @@ class Agent:
         )
         return get_approx_tokens(text) > budget_tokens
 
+    def _compact_aggregate_tool_results_for_provider(
+        self,
+        messages: list[Message],
+    ) -> list[Message]:
+        """Compact old bulky tool results in the provider request view only.
+
+        Per-result compression happens at execution time. This pass handles the
+        aggregate case where many already-compressed or under-threshold results
+        accumulate across iterations. It never mutates persisted history and it
+        preserves recent, error, and artifact-producing results.
+        """
+
+        if self._tool_result_compression_mode() == "off":
+            return messages
+
+        tool_name_by_use_id: dict[str, str] = {}
+        tool_result_refs: list[tuple[int, int, ContentBlockToolResult]] = []
+        for message_index, message in enumerate(messages):
+            if not isinstance(message.content, list):
+                continue
+            for block_index, block in enumerate(message.content):
+                if isinstance(block, ContentBlockToolUse):
+                    tool_name_by_use_id[block.id] = block.name
+                elif isinstance(block, ContentBlockToolResult):
+                    tool_result_refs.append((message_index, block_index, block))
+
+        messages = self._compact_absolute_tool_results_for_provider(
+            messages,
+            tool_result_refs,
+            tool_name_by_use_id,
+        )
+        tool_result_refs = []
+        for message_index, message in enumerate(messages):
+            if not isinstance(message.content, list):
+                continue
+            for block_index, block in enumerate(message.content):
+                if isinstance(block, ContentBlockToolResult):
+                    tool_result_refs.append((message_index, block_index, block))
+
+        if len(tool_result_refs) <= 2:
+            return messages
+
+        recent_ids = {
+            id(block)
+            for _message_index, _block_index, block in tool_result_refs[-2:]
+        }
+        budget_tokens = int(
+            self.config.context_window_tokens * self.config.tool_result_compression_max_share
+        )
+        eligible_refs: list[tuple[int, int, ContentBlockToolResult, str, int]] = []
+        total_tool_result_tokens = 0
+        for message_index, block_index, block in tool_result_refs:
+            content = block.content if isinstance(block.content, str) else str(block.content)
+            tokens = _tool_result_budget_tokens(content)
+            total_tool_result_tokens += tokens
+            if (
+                id(block) in recent_ids
+                or block.is_error
+                or _tool_result_content_has_artifact(content)
+            ):
+                continue
+            eligible_refs.append((message_index, block_index, block, content, tokens))
+
+        if total_tool_result_tokens <= budget_tokens or not eligible_refs:
+            return messages
+
+        replacements: dict[tuple[int, int], ContentBlockToolResult] = {}
+        stored_handles: list[str] = []
+
+        for message_index, block_index, block, content, original_tokens in eligible_refs:
+            if total_tool_result_tokens <= budget_tokens:
+                break
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            stored = self._store_tool_result_snapshot(
+                content,
+                tool_use_id=block.tool_use_id,
+                tool_name=tool_name_by_use_id.get(block.tool_use_id, "tool"),
+            )
+            if stored is not None:
+                stored_handles.append(stored.handle)
+            head = content[:240]
+            tail = content[-240:] if len(content) > 240 else ""
+            omitted = max(0, len(content) - len(head) - len(tail))
+            handle_line = (
+                f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
+            )
+            compacted = (
+                "[aggregate_tool_result_compacted]\n"
+                f"tool_use_id: {block.tool_use_id}\n"
+                f"original_chars: {len(content)}\n"
+                f"original_tokens_estimate: {_tool_result_budget_tokens(content)}\n"
+                f"sha256: {digest}\n"
+                f"{handle_line}"
+                f"omitted_chars: {omitted}\n"
+                "reason: older non-error tool result compacted for provider context budget.\n"
+                f"head:\n{head}"
+            )
+            if tail and tail != head:
+                compacted += f"\n...\ntail:\n{tail}"
+            replacements[(message_index, block_index)] = ContentBlockToolResult(
+                tool_use_id=block.tool_use_id,
+                content=compacted,
+                is_error=block.is_error,
+            )
+            replacement_tokens = _tool_result_budget_tokens(compacted)
+            total_tool_result_tokens -= max(0, original_tokens - replacement_tokens)
+
+        if not replacements:
+            return messages
+
+        compacted_messages: list[Message] = []
+        for message_index, message in enumerate(messages):
+            if not isinstance(message.content, list):
+                compacted_messages.append(message)
+                continue
+            next_content: list[Any] = []
+            message_changed = False
+            for block_index, block in enumerate(message.content):
+                replacement = replacements.get((message_index, block_index))
+                if replacement is None:
+                    next_content.append(block)
+                    continue
+                next_content.append(replacement)
+                message_changed = True
+            if not message_changed:
+                compacted_messages.append(message)
+                continue
+            compacted_messages.append(
+                Message(
+                    role=message.role,
+                    content=next_content,
+                    reasoning_content=getattr(message, "reasoning_content", None),
+                )
+            )
+
+        before_tokens = sum(
+            _tool_result_budget_tokens(
+                block.content if isinstance(block.content, str) else str(block.content)
+            )
+            for _message_index, _block_index, block in tool_result_refs
+        )
+        after_tokens = 0
+        for message in compacted_messages:
+            if not isinstance(message.content, list):
+                continue
+            for block in message.content:
+                if isinstance(block, ContentBlockToolResult):
+                    content = (
+                        block.content if isinstance(block.content, str) else str(block.content)
+                    )
+                    after_tokens += _tool_result_budget_tokens(content)
+
+        self.config.metadata["tool_aggregate_compression_applied"] = True
+        self.config.metadata["tool_aggregate_compression_calls"] = (
+            self.config.metadata.get("tool_aggregate_compression_calls", 0) + 1
+        )
+        self.config.metadata["tool_aggregate_compression_tokens_before"] = before_tokens
+        self.config.metadata["tool_aggregate_compression_tokens_after"] = after_tokens
+        self.config.metadata["tool_aggregate_compression_tokens_saved"] = max(
+            0, before_tokens - after_tokens
+        )
+        self.config.metadata["tool_compression_applied"] = True
+        self.config.metadata["tool_compression_calls"] = (
+            self.config.metadata.get("tool_compression_calls", 0) + len(replacements)
+        )
+        self.config.metadata["tool_compression_tokens_before"] = (
+            self.config.metadata.get("tool_compression_tokens_before", 0) + before_tokens
+        )
+        self.config.metadata["tool_compression_tokens_after"] = (
+            self.config.metadata.get("tool_compression_tokens_after", 0) + after_tokens
+        )
+        self.config.metadata["tool_compression_tokens_saved"] = (
+            self.config.metadata.get("tool_compression_tokens_saved", 0)
+            + max(0, before_tokens - after_tokens)
+        )
+        self._write_turn_call_log(
+            "tool_aggregate_compression",
+            original_tool_results=len(tool_result_refs),
+            compacted_tool_results=len(replacements),
+            tool_result_handles=stored_handles,
+            tokens_before=before_tokens,
+            tokens_after=after_tokens,
+        )
+        return compacted_messages
+
+    def _compact_absolute_tool_results_for_provider(
+        self,
+        messages: list[Message],
+        tool_result_refs: list[tuple[int, int, ContentBlockToolResult]],
+        tool_name_by_use_id: dict[str, str],
+    ) -> list[Message]:
+        cap = self._tool_result_provider_request_max_chars(ToolResultBudgetClass.LOCAL)
+        if cap <= 0 or not tool_result_refs:
+            return messages
+
+        def _content(block: ContentBlockToolResult) -> str:
+            return block.content if isinstance(block.content, str) else str(block.content)
+
+        total_chars = sum(len(_content(block)) for _m, _b, block in tool_result_refs)
+        external_cap = self._tool_result_provider_request_max_chars(
+            ToolResultBudgetClass.EXTERNAL
+        )
+        external_chars = sum(
+            len(_content(block))
+            for _m, _b, block in tool_result_refs
+            if resolve_budget_class(tool_name_by_use_id.get(block.tool_use_id, ""))
+            is ToolResultBudgetClass.EXTERNAL
+        )
+        if total_chars <= cap and external_chars <= external_cap:
+            return messages
+
+        def _over_budget() -> bool:
+            return total_chars > cap or external_chars > external_cap
+
+        keep_recent = max(0, int(getattr(self.config, "tool_result_external_keep_recent", 2)))
+        external_refs = [
+            (message_index, block_index, block)
+            for message_index, block_index, block in tool_result_refs
+            if resolve_budget_class(tool_name_by_use_id.get(block.tool_use_id, ""))
+            is ToolResultBudgetClass.EXTERNAL
+        ]
+        recent_external_ids = {id(block) for _m, _b, block in external_refs[-keep_recent:]}
+        replacements: dict[tuple[int, int], ContentBlockToolResult] = {}
+
+        for message_index, block_index, block in tool_result_refs:
+            if not _over_budget():
+                break
+            content = _content(block)
+            tool_name = tool_name_by_use_id.get(block.tool_use_id, "")
+            budget_class = resolve_budget_class(tool_name)
+            replacement_content: str | None = None
+            if budget_class is ToolResultBudgetClass.CONTROL:
+                replacement_content = compact_tool_result_content(
+                    tool_name=tool_name,
+                    content=content,
+                    max_preview_chars=160,
+                    budget_class=budget_class,
+                    is_error=block.is_error,
+                )
+            elif (
+                budget_class is ToolResultBudgetClass.EXTERNAL
+                and id(block) not in recent_external_ids
+            ):
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                replacement_content = (
+                    "[external_tool_result_compacted]\n"
+                    f"tool: {tool_name or 'unknown'}\n"
+                    f"id: {block.tool_use_id}\n"
+                    f"chars: {len(content)}\n"
+                    f"sha256: {digest[:16]}"
+                )
+
+            if replacement_content is None or len(replacement_content) >= len(content):
+                continue
+            replacements[(message_index, block_index)] = ContentBlockToolResult(
+                tool_use_id=block.tool_use_id,
+                content=replacement_content,
+                is_error=block.is_error,
+            )
+            saved_chars = len(content) - len(replacement_content)
+            total_chars -= saved_chars
+            if budget_class is ToolResultBudgetClass.EXTERNAL:
+                external_chars -= saved_chars
+
+        if not replacements:
+            return messages
+
+        compacted_messages: list[Message] = []
+        for message_index, message in enumerate(messages):
+            if not isinstance(message.content, list):
+                compacted_messages.append(message)
+                continue
+            next_content: list[Any] = []
+            message_changed = False
+            for block_index, content_block in enumerate(message.content):
+                replacement = replacements.get((message_index, block_index))
+                if replacement is None:
+                    next_content.append(content_block)
+                    continue
+                next_content.append(replacement)
+                message_changed = True
+            if not message_changed:
+                compacted_messages.append(message)
+                continue
+            compacted_messages.append(
+                Message(
+                    role=message.role,
+                    content=next_content,
+                    reasoning_content=getattr(message, "reasoning_content", None),
+                )
+            )
+
+        self.config.metadata["tool_absolute_compression_applied"] = True
+        self.config.metadata["tool_absolute_compression_calls"] = (
+            self.config.metadata.get("tool_absolute_compression_calls", 0) + 1
+        )
+        return compacted_messages
+
+    def _sanitize_projected_tool_use_arguments_for_provider(
+        self,
+        messages: list[Message],
+    ) -> list[Message]:
+        cap = self._tool_use_argument_provider_request_max_chars("")
+        replacements: dict[tuple[int, int], ContentBlockToolUse] = {}
+
+        for message_index, message in enumerate(messages):
+            if not isinstance(message.content, list):
+                continue
+            for block_index, block in enumerate(message.content):
+                if not isinstance(block, ContentBlockToolUse):
+                    continue
+                if self._has_provider_context_argument_marker(block.input):
+                    replacements[(message_index, block_index)] = ContentBlockToolUse(
+                        id=block.id,
+                        name=block.name,
+                        input=self._provider_compacted_arguments_placeholder(
+                            block.name,
+                            block.input,
+                        ),
+                    )
+                    continue
+
+                legacy_projected_input = dict(block.input)
+                legacy_projection_scrubbed = False
+                for key, value in block.input.items():
+                    if not isinstance(value, str) or not value.startswith(
+                        _TOOL_ARGUMENT_PROJECTION_PREFIX
+                    ):
+                        continue
+                    legacy_projected_input[key] = self._provider_projection_placeholder(
+                        block.name,
+                        key,
+                    )
+                    legacy_projection_scrubbed = True
+                if legacy_projection_scrubbed:
+                    replacements[(message_index, block_index)] = ContentBlockToolUse(
+                        id=block.id,
+                        name=block.name,
+                        input=legacy_projected_input,
+                    )
+
+        if not replacements:
+            return messages
+
+        sanitized_messages: list[Message] = []
+        for message_index, message in enumerate(messages):
+            if not isinstance(message.content, list):
+                sanitized_messages.append(message)
+                continue
+            next_content: list[Any] = []
+            changed = False
+            for block_index, block in enumerate(message.content):
+                replacement = replacements.get((message_index, block_index))
+                if replacement is None:
+                    next_content.append(block)
+                    continue
+                next_content.append(replacement)
+                changed = True
+            if not changed:
+                sanitized_messages.append(message)
+                continue
+            if not next_content:
+                continue
+            sanitized_messages.append(
+                Message(
+                    role=message.role,
+                    content=next_content,
+                    reasoning_content=getattr(message, "reasoning_content", None),
+                )
+            )
+
+        self.config.metadata["tool_argument_provider_view_summaries_applied"] = True
+        metadata_key = "tool_argument_provider_view_summaries"
+        self.config.metadata[metadata_key] = (
+            self.config.metadata.get(metadata_key, 0) + len(replacements)
+        )
+        self._write_turn_call_log(
+            "tool_argument_provider_view_summary",
+            sanitized_tool_uses=len(replacements),
+            max_chars=cap,
+        )
+        return sanitized_messages
+
+    def _store_tool_result_snapshot(
+        self,
+        content: str,
+        *,
+        tool_use_id: str,
+        tool_name: str,
+    ) -> ToolResultRecord | None:
+        if not self.config.tool_result_store_dir:
+            return None
+        session_id = self.config.tool_result_store_session_id or self._session_key
+        session_key = self.config.tool_result_store_session_key or self._session_key
+        agent_id = self.config.tool_result_store_agent_id
+        if not agent_id and session_key:
+            from opensquilla.session.keys import parse_agent_id
+
+            agent_id = parse_agent_id(session_key)
+        if not session_id or not session_key or not agent_id:
+            self.config.metadata["tool_result_store_skips"] = (
+                self.config.metadata.get("tool_result_store_skips", 0) + 1
+            )
+            return None
+        try:
+            record = ToolResultStore(self.config.tool_result_store_dir).write(
+                content,
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+                session_id=session_id,
+                session_key=session_key,
+                agent_id=agent_id,
+                max_bytes=self.config.tool_result_store_max_bytes,
+                disk_budget_bytes=self.config.tool_result_store_disk_budget_bytes,
+                retention_seconds=self.config.tool_result_store_retention_seconds,
+            )
+        except ToolResultStoreBudgetError as exc:
+            self.config.metadata["tool_result_store_skips"] = (
+                self.config.metadata.get("tool_result_store_skips", 0) + 1
+            )
+            logger.info(
+                "tool_result_store.skipped",
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+                reason=str(exc),
+            )
+            return None
+        except Exception as exc:  # pragma: no cover - storage must not break turns
+            logger.warning(
+                "tool_result_store.write_failed",
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+                error=str(exc),
+            )
+            return None
+        self.config.metadata["tool_result_store_writes"] = (
+            self.config.metadata.get("tool_result_store_writes", 0) + 1
+        )
+        return record
+
     @staticmethod
     def _trim_summary_input(text: str, max_chars: int) -> str:
         if max_chars <= 0 or len(text) <= max_chars:
@@ -537,7 +1329,10 @@ class Agent:
                     model = event.model
         except Exception as exc:  # noqa: BLE001 - compression is best-effort
             model_label = model or self.config.tool_result_compression_summary_model or "default"
-            message = str(exc)
+            _, message = sanitize_agent_error(
+                str(exc),
+                fallback_error_message=str(exc) or "tool result summary failed",
+            )
             logger.warning(
                 "tool_result_summary_failed",
                 tool=result.tool_name,
@@ -581,6 +1376,11 @@ class Agent:
                 content=guarded_content,
                 is_error=result.is_error,
                 artifacts=list(result.artifacts),
+                execution_status=(
+                    mark_execution_status_truncated(result.execution_status)
+                    if result.execution_status is not None
+                    else None
+                ),
             )
             self.config.metadata["tool_json_guard_applied"] = True
             self.config.metadata["tool_json_guard_calls"] = (
@@ -593,7 +1393,17 @@ class Agent:
 
         compressed_content: str | None = None
         applied_mode = mode
-        if mode == "summarize":
+        budget_class = resolve_budget_class(result.tool_name)
+        if budget_class is ToolResultBudgetClass.CONTROL:
+            compressed_content = compact_tool_result_content(
+                tool_name=result.tool_name,
+                content=result.content,
+                max_preview_chars=self.config.tool_result_compression_summary_input_max_chars,
+                budget_class=budget_class,
+                is_error=result.is_error,
+            )
+            applied_mode = "control_truncate"
+        if mode == "summarize" and compressed_content is None:
             compressed_content = await self._summarize_tool_result(result)
             if compressed_content is None:
                 applied_mode = "truncate"
@@ -603,6 +1413,20 @@ class Agent:
                 result.content,
                 self.config.context_window_tokens,
                 max_share=self.config.tool_result_compression_max_share,
+            )
+        stored = self._store_tool_result_snapshot(
+            result.content,
+            tool_use_id=result.tool_use_id,
+            tool_name=result.tool_name,
+        )
+        stored_handle = stored.handle if stored is not None else None
+        if stored is not None:
+            compressed_content = (
+                "[tool_result_projection]\n"
+                f"tool_result_handle: {stored.handle}\n"
+                f"sha256: {stored.sha256}\n"
+                f"original_chars: {stored.chars}\n"
+                f"{compressed_content}"
             )
 
         tokens_before = get_approx_tokens(result.content)
@@ -627,6 +1451,7 @@ class Agent:
             tool_use_id=result.tool_use_id,
             name=result.tool_name,
             mode=applied_mode,
+            tool_result_handle=stored_handle,
             original_chars=len(result.content),
             compressed_chars=len(compressed_content),
         )
@@ -636,6 +1461,11 @@ class Agent:
             content=compressed_content,
             is_error=result.is_error,
             artifacts=list(result.artifacts),
+            execution_status=(
+                mark_execution_status_truncated(result.execution_status)
+                if result.execution_status is not None
+                else None
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -714,10 +1544,6 @@ class Agent:
         # Some reasoning tool-call providers require the prior assistant
         # tool-call message to carry its reasoning_content while reasoning is
         # enabled, so keep that narrow field only for tool-call history.
-        loaded_history = list(self._history)
-        self._write_context_stage("session:loaded", loaded_history)
-        sanitized_history, sanitize_result = sanitize_session_messages(loaded_history)
-        sanitized_history = repair_tool_pairing(sanitized_history)
         caps_reasoning_format = (
             getattr(self.config.model_capabilities, "reasoning_format", "")
             if self.config.model_capabilities is not None
@@ -731,6 +1557,14 @@ class Agent:
                 and _is_deepseek_model_id(self.config.model_id)
             )
         )
+        loaded_history = list(self._history)
+        self._write_context_stage("session:loaded", loaded_history)
+        sanitized_history, sanitize_result = sanitize_session_messages(loaded_history)
+        sanitized_history, historical_projection_result = project_historical_tool_payloads(
+            sanitized_history,
+            preserve_reasoning_content=preserve_reasoning_content,
+        )
+        sanitized_history = repair_tool_pairing(sanitized_history)
         sanitized_history = drop_reasoning(
             sanitized_history,
             preserve_tool_call_reasoning=thinking_enabled,
@@ -741,6 +1575,7 @@ class Agent:
             "session:sanitized",
             sanitized_history,
             sanitize=sanitize_result,
+            historical_projection=historical_projection_result.__dict__,
         )
         history = limit_turns(sanitized_history, self.config.max_history_turns)
         history = repair_tool_pairing(history)
@@ -752,7 +1587,10 @@ class Agent:
 
         # Build initial message list
         turn_messages: list[Message] = list(history)
-        request_context_insert_index = len(turn_messages)
+        # Keep large request-scoped context at a stable provider prefix. If
+        # history is allowed to move ahead of it after the first turn,
+        # prefix-based provider caches can no longer reuse that block.
+        request_context_insert_index = 0
         # Insert this turn's skills context BEFORE the user content so it
         # joins turn_messages permanently (persists into self._history at
         # turn end). Re-inserting a fresh skills_ctx into request_messages
@@ -801,6 +1639,7 @@ class Agent:
             thinking_level=(
                 self.config.thinking if isinstance(self.config.thinking, ThinkingLevel) else None
             ),
+            provider_request_max_chars=self._provider_request_proof_max_chars(),
         )
         _thinking_fallback_done = False
 
@@ -822,13 +1661,16 @@ class Agent:
         window_output_tokens = 0
         final_text_parts: list[str] = []
         final_reasoning_parts: list[str] = []
+        artifact_delivery_final_response_pending = False
+        artifact_delivery_final_response_artifacts: list[dict[str, Any]] = []
         _fallback = FallbackPolicy(
             max_retries=self.config.max_provider_retries,
             base_backoff_ms=self.config.retry_base_backoff_ms,
             max_backoff_ms=self.config.retry_max_backoff_ms,
         )
 
-        # Deadline-based timeouts: optional total turn budget + per-iteration budget
+        # Timeout budgets: optional total turn budget, idle LLM stream budget,
+        # and per-tool execution budget.
         _loop = asyncio.get_running_loop()
         _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
         tools_supported = True
@@ -858,7 +1700,6 @@ class Agent:
                     raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
 
                 iterations += 1
-                _iter_deadline = _loop.time() + self.config.iteration_timeout
 
                 # ------ THINKING → STREAMING ------
                 yield self._transition(AgentState.STREAMING)
@@ -867,6 +1708,7 @@ class Agent:
                 assistant_text_parts: list[str] = []
                 tool_calls: list[ToolCall] = []
                 pending_tools: dict[str, _StreamAccumulator] = {}
+                tool_argument_heartbeat_chars: dict[str, int] = {}
                 iter_input_tokens = 0
                 iter_output_tokens = 0
                 iter_reasoning_tokens = 0
@@ -876,15 +1718,17 @@ class Agent:
 
                 _retry_attempt = 0
                 _call_attempt = 0
-                _reasoning_only_retry_done = False
-                _malformed_empty_retry_done = False
-                _stream_incomplete_retry_done = False
+                _retry_policy = _ProviderRetryPolicy.from_provider_budget(
+                    _fallback.max_retries
+                )
+                _attempt_retries_used = _retry_policy.used_attempts()
                 _invalid_response_fallback_done = False
                 while _retry_attempt <= _fallback.max_retries:
                     provider_error = None
                     assistant_text_parts = []
                     tool_calls = []
                     pending_tools = {}
+                    tool_argument_heartbeat_chars = {}
                     iter_input_tokens = 0
                     iter_output_tokens = 0
                     iter_reasoning_tokens = 0
@@ -895,12 +1739,34 @@ class Agent:
                     provider_error_for_log: ProviderErrorEvent | None = None
                     call_id = f"{iterations}.{_call_attempt}"
                     call_started_at = time.monotonic()
+                    provider_tools_for_call = (
+                        None
+                        if artifact_delivery_final_response_pending
+                        else provider_tool_definitions
+                    )
+                    tools_supported_for_call = (
+                        tools_supported and not artifact_delivery_final_response_pending
+                    )
+                    ignored_post_delivery_tool_use = False
                     request_source_messages = self._with_request_context_messages(
                         turn_messages,
                         request_context_message,
                         request_context_insert_index,
                         runtime_context_message,
                         runtime_context_insert_index,
+                    )
+                    request_source_messages = (
+                        self._strip_provider_context_marker_replay_for_provider(
+                            request_source_messages
+                        )
+                    )
+                    request_source_messages = self._compact_aggregate_tool_results_for_provider(
+                        request_source_messages
+                    )
+                    request_source_messages = (
+                        self._sanitize_projected_tool_use_arguments_for_provider(
+                            request_source_messages
+                        )
                     )
                     request_messages, request_sanitize_result = sanitize_session_messages(
                         request_source_messages
@@ -920,14 +1786,14 @@ class Agent:
                         iteration=iterations,
                         attempt=_call_attempt,
                         messages=request_messages,
-                        tools=provider_tool_definitions,
+                        tools=provider_tools_for_call,
                         config=chat_cfg,
                     )
                     cache_prompt_snapshot = None
                     if self._session_key:
                         cache_prompt_snapshot = record_prompt_state(
                             messages=request_messages,
-                            tools=provider_tool_definitions,
+                            tools=provider_tools_for_call,
                             config=chat_cfg,
                             model=self.config.model_id or "",
                         )
@@ -937,13 +1803,12 @@ class Agent:
                     try:
                         raw_stream = self.provider.chat(
                             request_messages,
-                            tools=provider_tool_definitions,
+                            tools=provider_tools_for_call,
                             config=chat_cfg,
                         )
                         async for raw_ev in self._stream_provider_events_with_deadline(
                             raw_stream,
                             loop=_loop,
-                            iter_deadline=_iter_deadline,
                             total_deadline=_total_deadline,
                         ):
                             if isinstance(raw_ev, ProviderTextDelta):
@@ -953,13 +1818,16 @@ class Agent:
                                 yield TextDeltaEvent(text=raw_ev.text)
 
                             elif isinstance(raw_ev, ProviderToolUseStart):
-                                if not tools_supported:
+                                if not tools_supported_for_call:
+                                    if artifact_delivery_final_response_pending:
+                                        ignored_post_delivery_tool_use = True
                                     continue
                                 pending_tools[raw_ev.tool_use_id] = _StreamAccumulator(
                                     tool_use_id=raw_ev.tool_use_id,
                                     tool_name=raw_ev.tool_name,
                                     synthetic_from_text=raw_ev.synthetic_from_text,
                                 )
+                                tool_argument_heartbeat_chars[raw_ev.tool_use_id] = 0
                                 attempt_user_visible_emitted = True
                                 yield ToolUseStartEvent(
                                     tool_use_id=raw_ev.tool_use_id,
@@ -968,16 +1836,43 @@ class Agent:
                                 )
 
                             elif raw_ev.kind == "tool_use_delta":
-                                if not tools_supported:
+                                if not tools_supported_for_call:
                                     continue
                                 acc = pending_tools.get(raw_ev.tool_use_id)  # type: ignore[union-attr]
                                 if acc:
-                                    acc.json_buf.append(raw_ev.json_fragment)  # type: ignore[union-attr]
+                                    json_fragment = raw_ev.json_fragment  # type: ignore[union-attr]
+                                    acc.json_buf.append(json_fragment)
+                                    acc.json_chars += len(json_fragment)
+                                    last_heartbeat_chars = tool_argument_heartbeat_chars.get(
+                                        raw_ev.tool_use_id, 0
+                                    )
+                                    if (
+                                        acc.json_chars - last_heartbeat_chars
+                                        >= _TOOL_ARGUMENT_HEARTBEAT_CHARS
+                                    ):
+                                        tool_argument_heartbeat_chars[
+                                            raw_ev.tool_use_id
+                                        ] = acc.json_chars
+                                        yield RunHeartbeatEvent(
+                                            phase="llm_tool_arguments",
+                                            elapsed_ms=int(
+                                                (time.monotonic() - call_started_at) * 1000
+                                            ),
+                                            idle_ms=0,
+                                            message=(
+                                                f"Receiving {acc.tool_name} arguments"
+                                            ),
+                                        )
 
                             elif isinstance(raw_ev, ToolUseEndEvent):
-                                if not tools_supported:
+                                if not tools_supported_for_call:
+                                    if artifact_delivery_final_response_pending:
+                                        ignored_post_delivery_tool_use = True
                                     continue
                                 acc = pending_tools.pop(raw_ev.tool_use_id, None)
+                                tool_argument_heartbeat_chars.pop(
+                                    raw_ev.tool_use_id, None
+                                )
                                 if acc and acc.json_buf:
                                     arguments = acc.finish()
                                 else:
@@ -1017,6 +1912,13 @@ class Agent:
                                 # they must not be appended to conversation history or the
                                 # live context-window gauge below.
                                 if self._usage_tracker and self._session_key:
+                                    # Forward the provider's real per-call billed_cost so
+                                    # the per-model breakdown can show actual numbers
+                                    # instead of the cache-blind pricing-table estimate.
+                                    # See engine/usage.py:ModelUsage.billed_cost and
+                                    # gateway/rpc_usage.py:_reconcile_breakdown_to_row
+                                    # (the pro-rate fallback now skips when items
+                                    # already carry real billed totals).
                                     self._usage_tracker.add(
                                         self._session_key,
                                         input_tokens=raw_ev.input_tokens,
@@ -1024,6 +1926,7 @@ class Agent:
                                         model_id=raw_ev.model or self.config.model_id or "",
                                         cache_read_tokens=raw_ev.cached_tokens,
                                         cache_write_tokens=raw_ev.cache_write_tokens,
+                                        billed_cost=raw_ev.billed_cost,
                                     )
 
                             elif isinstance(raw_ev, ProviderErrorEvent):
@@ -1103,6 +2006,17 @@ class Agent:
 
                     # -- after async for (retry loop level) --
                     response_text = "".join(assistant_text_parts)
+                    if (
+                        artifact_delivery_final_response_pending
+                        and ignored_post_delivery_tool_use
+                        and not response_text.strip()
+                    ):
+                        response_text = self._artifact_delivery_final_response_text(
+                            artifact_delivery_final_response_artifacts
+                        )
+                        assistant_text_parts.append(response_text)
+                        attempt_user_visible_emitted = True
+                        yield TextDeltaEvent(text=response_text)
                     last_request_msg = request_messages[-1] if request_messages else None
                     post_tool_turn = _message_has_tool_result(last_request_msg)
                     stop_reason = (
@@ -1142,10 +2056,12 @@ class Agent:
                         if (
                             attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
                             and thinking_enabled
-                            and not _reasoning_only_retry_done
-                            and _fallback.max_retries > 0
+                            and _retry_policy.can_retry_attempt(
+                                _ProviderAttemptKind.REASONING_ONLY,
+                                _attempt_retries_used,
+                            )
                         ):
-                            _reasoning_only_retry_done = True
+                            _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
                             _thinking_fallback_done = True
                             thinking_enabled = False
                             thinking_budget = 0
@@ -1162,10 +2078,12 @@ class Agent:
 
                         if (
                             attempt_classification.kind == _ProviderAttemptKind.MALFORMED_EMPTY
-                            and not _malformed_empty_retry_done
-                            and _fallback.max_retries > 0
+                            and _retry_policy.can_retry_attempt(
+                                _ProviderAttemptKind.MALFORMED_EMPTY,
+                                _attempt_retries_used,
+                            )
                         ):
-                            _malformed_empty_retry_done = True
+                            _attempt_retries_used[_ProviderAttemptKind.MALFORMED_EMPTY] += 1
                             delay = backoff_sleep(
                                 0,
                                 _fallback.base_backoff_ms,
@@ -1184,10 +2102,12 @@ class Agent:
                             attempt_classification.kind
                             == _ProviderAttemptKind.STREAM_INCOMPLETE
                             and not attempt_classification.user_visible_emitted
-                            and not _stream_incomplete_retry_done
-                            and _fallback.max_retries > 0
+                            and _retry_policy.can_retry_attempt(
+                                _ProviderAttemptKind.STREAM_INCOMPLETE,
+                                _attempt_retries_used,
+                            )
                         ):
-                            _stream_incomplete_retry_done = True
+                            _attempt_retries_used[_ProviderAttemptKind.STREAM_INCOMPLETE] += 1
                             delay = backoff_sleep(
                                 0,
                                 _fallback.base_backoff_ms,
@@ -1201,6 +2121,43 @@ class Agent:
                                 ),
                             )
                             await asyncio.sleep(delay)
+                            _call_attempt += 1
+                            continue
+
+                        if (
+                            attempt_classification.kind == _ProviderAttemptKind.LENGTH_CAPPED
+                            and _retry_policy.can_retry_attempt(
+                                _ProviderAttemptKind.LENGTH_CAPPED,
+                                _attempt_retries_used,
+                            )
+                        ):
+                            _attempt_retries_used[_ProviderAttemptKind.LENGTH_CAPPED] += 1
+                            visible_text = _append_length_capped_continuation(
+                                turn_messages,
+                                response_text=response_text,
+                                tool_calls=tool_calls,
+                            )
+                            if visible_text:
+                                final_text_parts.append(visible_text)
+                            window_input_tokens += iter_input_tokens
+                            window_output_tokens += iter_output_tokens
+                            logger.warning(
+                                "provider.output_truncated_continue",
+                                session_key=self._session_key,
+                                model=last_actual_model or self.config.model_id or "",
+                                provider=type(self.provider).__name__,
+                                iteration=iterations,
+                                call_attempt=_call_attempt,
+                                tool_calls=len(tool_calls),
+                                visible_chars=len(visible_text),
+                            )
+                            yield WarningEvent(
+                                code="provider_output_continue",
+                                message=(
+                                    "The provider reached its output limit; continuing "
+                                    "the response automatically."
+                                ),
+                            )
                             _call_attempt += 1
                             continue
 
@@ -1249,7 +2206,7 @@ class Agent:
                                 ),
                             )
                             terminal_error = ErrorEvent(
-                                message="Provider stopped before producing visible content",
+                                message=_PROVIDER_OUTPUT_TRUNCATED_REPLY,
                                 code="provider_output_truncated",
                             )
                             yield terminal_error
@@ -1325,30 +2282,86 @@ class Agent:
                         kind = _fallback.classify_error(
                             provider_error.message,
                         )
+                        if (
+                            failure_kind == ProviderFailureKind.EMPTY_RESPONSE
+                            and _retry_policy.can_retry_provider_failure(
+                                failure_kind,
+                                post_tool_turn=post_tool_turn,
+                                provider_retry_attempt=_retry_attempt,
+                            )
+                        ):
+                            delay = backoff_sleep(
+                                _retry_attempt,
+                                _fallback.base_backoff_ms,
+                                _fallback.max_backoff_ms,
+                                _fake=True,
+                            )
+                            _log.warning(
+                                "provider.empty_response_retry",
+                                attempt=_retry_attempt + 1,
+                                delay_s=round(delay, 2),
+                                post_tool_turn=True,
+                            )
+                            yield WarningEvent(
+                                code="provider_empty_retry",
+                                message=(
+                                    "The provider returned an empty response after tool "
+                                    "execution; retrying once."
+                                ),
+                            )
+                            await asyncio.sleep(delay)
+                            _retry_attempt += 1
+                            _call_attempt += 1
+                            continue
                         if failure_kind == ProviderFailureKind.CONTEXT_OVERFLOW:
+                            self._record_provider_context_overflow_reason(provider_error)
+                            provider_compaction_window_tokens = (
+                                self._provider_budget_compaction_window_tokens(provider_error)
+                            )
+                            provider_estimated_tokens = (
+                                self._provider_budget_estimated_tokens(provider_error)
+                            )
+                            provider_compaction_refusal_reason = (
+                                self._last_compaction_refusal_reason
+                            )
+                            overflow_total_tokens = provider_estimated_tokens
+                            if overflow_total_tokens is None:
+                                overflow_total_tokens = (
+                                    provider_compaction_window_tokens
+                                    or self.config.context_window_tokens
+                                ) + 1
                             if overflow_retries >= self.config.max_overflow_retries:
                                 yield self._transition(AgentState.ERROR)
-                                terminal_error = ErrorEvent(
-                                    message="Context overflow persists after compaction",
-                                    code="compaction_exhausted",
-                                )
+                                terminal_error = self._context_overflow_error()
                                 yield terminal_error
                                 break
                             overflow_retries += 1
+                            yield WarningEvent(
+                                code="context_auto_compaction_start",
+                                message=(
+                                    "Provider context limit reached; compacting older "
+                                    "context before retrying."
+                                ),
+                            )
                             overflow_outcome = await self._check_context_overflow(
                                 turn_messages,
-                                self.config.context_window_tokens + 1,
+                                overflow_total_tokens,
                                 request_context_insert_index=request_context_insert_index,
                                 runtime_context_insert_index=runtime_context_insert_index,
+                                compaction_window_tokens=provider_compaction_window_tokens,
                             )
                             if overflow_outcome is None:
                                 yield self._transition(AgentState.ERROR)
-                                terminal_error = ErrorEvent(
-                                    message="Context overflow persists after compaction",
-                                    code="compaction_exhausted",
-                                )
+                                terminal_error = self._context_overflow_error()
                                 yield terminal_error
                                 break
+                            if (
+                                provider_compaction_refusal_reason
+                                and self._last_compaction_refusal_reason is None
+                            ):
+                                self._last_compaction_refusal_reason = (
+                                    provider_compaction_refusal_reason
+                                )
                             next_request_context_insert_index = (
                                 overflow_outcome.request_context_insert_index
                                 if overflow_outcome.request_context_insert_index is not None
@@ -1371,23 +2384,29 @@ class Agent:
                                 next_request_messages,
                             ):
                                 yield self._transition(AgentState.ERROR)
-                                terminal_error = ErrorEvent(
-                                    message="Context overflow persists after compaction",
-                                    code="compaction_exhausted",
-                                )
+                                if (
+                                    self._last_compaction_refusal_reason
+                                    != "provider_recent_tail_too_large"
+                                ):
+                                    self._last_compaction_refusal_reason = (
+                                        "compaction_not_smaller"
+                                    )
+                                terminal_error = self._context_overflow_error()
                                 yield terminal_error
                                 break
                             turn_messages = overflow_outcome.messages
                             request_context_insert_index = next_request_context_insert_index
                             runtime_context_insert_index = next_runtime_context_insert_index
+                            yield WarningEvent(
+                                code="context_auto_compaction_retry",
+                                message="Context compacted; retrying the provider request.",
+                            )
                             yield CompactionEvent(
                                 summary=overflow_outcome.summary,
                                 kept_entries=overflow_outcome.kept_entries,
                                 kept_count=len(overflow_outcome.messages),
                                 removed_count=overflow_outcome.removed_count,
                             )
-                            if self._session_key:
-                                notify_compaction(self._session_key)
                             window_input_tokens = 0
                             window_output_tokens = 0
                             _call_attempt += 1
@@ -1468,7 +2487,7 @@ class Agent:
                         break
                     if final_classification.kind == _ProviderAttemptKind.LENGTH_CAPPED:
                         terminal_error = ErrorEvent(
-                            message="Provider stopped before producing visible content",
+                            message=_PROVIDER_OUTPUT_TRUNCATED_REPLY,
                             code="provider_output_truncated",
                         )
                         yield terminal_error
@@ -1486,19 +2505,6 @@ class Agent:
                 window_input_tokens += iter_input_tokens
                 window_output_tokens += iter_output_tokens
 
-                # Per-iteration deadline check after LLM streaming
-                if _loop.time() > _iter_deadline:
-                    yield self._transition(AgentState.ERROR)
-                    terminal_error = ErrorEvent(
-                        message=(
-                            f"Iteration {iterations} exceeded iteration_timeout"
-                            f" ({self.config.iteration_timeout}s) during LLM streaming"
-                        ),
-                        code="iteration_timeout",
-                    )
-                    yield terminal_error
-                    break
-
                 # Check overflow against the current post-compaction window,
                 # not lifetime usage for the whole turn.
                 overflow_outcome = await self._check_context_overflow(
@@ -1510,10 +2516,7 @@ class Agent:
                 if overflow_outcome is None:
                     if overflow_retries >= self.config.max_overflow_retries:
                         yield self._transition(AgentState.ERROR)
-                        terminal_error = ErrorEvent(
-                            message="Context overflow persists after compaction",
-                            code="compaction_exhausted",
-                        )
+                        terminal_error = self._context_overflow_error()
                         yield terminal_error
                         break
                     overflow_retries += 1
@@ -1540,8 +2543,6 @@ class Agent:
                         kept_count=len(overflow_outcome.messages),
                         removed_count=overflow_outcome.removed_count,
                     )
-                    if self._session_key:
-                        notify_compaction(self._session_key)
                     window_input_tokens = 0
                     window_output_tokens = 0
                     overflow_retries = 0  # reset on success
@@ -1569,6 +2570,9 @@ class Agent:
                             if isinstance(self.config.thinking, ThinkingLevel)
                             else None
                         ),
+                        provider_request_max_chars=(
+                            self._provider_request_proof_max_chars()
+                        ),
                     )
 
                 assembled_text = "".join(assistant_text_parts)
@@ -1578,6 +2582,22 @@ class Agent:
                 )
                 if visible_text:
                     final_text_parts.append(visible_text)
+
+                preflight_tool_results: dict[str, ToolResult] = {}
+                terminal_projection_preflight_error = False
+                resolved_tool_calls: list[ToolCall] = []
+                for tc in tool_calls:
+                    resolved = self._rehydrate_projected_tool_arguments(tc)
+                    if isinstance(resolved, ToolResult):
+                        preflight_tool_results[tc.tool_use_id] = resolved
+                        if self._is_provider_context_projection_reuse_result(resolved):
+                            terminal_projection_preflight_error = True
+                        resolved_tool_calls.append(
+                            self._sanitize_projected_tool_call_arguments(tc)
+                        )
+                        continue
+                    resolved_tool_calls.append(resolved)
+                tool_calls = resolved_tool_calls
 
                 # Build assistant message for history
                 assistant_content: list[Any] = []
@@ -1631,28 +2651,18 @@ class Agent:
                 if not tool_calls:
                     break
 
-                # Per-iteration deadline check before tool execution
-                if _loop.time() > _iter_deadline:
-                    yield self._transition(AgentState.ERROR)
-                    terminal_error = ErrorEvent(
-                        message=(
-                            f"Iteration {iterations} exceeded iteration_timeout"
-                            f" ({self.config.iteration_timeout}s) before tool execution"
-                        ),
-                        code="iteration_timeout",
-                    )
-                    yield terminal_error
-                    break
+                tool_deadline = _loop.time() + self.config.iteration_timeout
 
                 # ------ STREAMING → TOOL_CALLING ------
                 yield self._transition(AgentState.TOOL_CALLING)
 
-                # Execute tools and collect results.
-                # Safe tools (named in _SAFE_TOOL_NAMES) run concurrently via
-                # asyncio.gather; mutex tools run serially. Results are emitted
-                # in the original tool_calls arrival order regardless of
-                # completion order.
-                from opensquilla.engine.runtime import _SAFE_TOOL_NAMES  # noqa: PLC0415
+                # Execute tools and collect results. Concurrent/keyed tools run
+                # in bounded batches; mutex tools run serially. Results are
+                # emitted in the original tool_calls arrival order regardless
+                # of completion order.
+                from opensquilla.engine.runtime import (  # noqa: PLC0415
+                    _get_tool_concurrency_policy,
+                )
 
                 tool_result_blocks: list[ContentBlockToolResult] = []
                 executed_results: list[ToolResult] = []
@@ -1660,6 +2670,12 @@ class Agent:
 
                 # Map tool_use_id -> ToolResult built up below.
                 results_by_id: dict[str, ToolResult] = {}
+
+                def _cap_timeout_by_deadlines(timeout: float) -> float:
+                    remaining = min(timeout, max(0.0, tool_deadline - _loop.time()))
+                    if _total_deadline is not None:
+                        remaining = min(remaining, max(0.0, _total_deadline - _loop.time()))
+                    return max(0.001, remaining)
 
                 async def _run_one(tc: ToolCall) -> ToolResult:
                     started = time.monotonic()
@@ -1670,18 +2686,29 @@ class Agent:
                         name=tc.tool_name,
                         arguments=tc.arguments,
                     )
-                    tool_timeout = self._tool_execution_timeout(tc)
-                    try:
-                        res = await asyncio.wait_for(
-                            self._execute_tool(tc), timeout=tool_timeout
-                        )
-                    except TimeoutError:
-                        res = ToolResult(
-                            tool_use_id=tc.tool_use_id,
-                            tool_name=tc.tool_name,
-                            content=(f"Tool '{tc.tool_name}' timed out after {tool_timeout}s"),
-                            is_error=True,
-                        )
+                    tool_timeout = _cap_timeout_by_deadlines(self._tool_execution_timeout(tc))
+                    preflight_result = preflight_tool_results.get(tc.tool_use_id)
+                    if preflight_result is not None:
+                        res = preflight_result
+                    else:
+                        try:
+                            res = await asyncio.wait_for(
+                                self._execute_tool(tc), timeout=tool_timeout
+                            )
+                        except TimeoutError:
+                            res = ToolResult(
+                                tool_use_id=tc.tool_use_id,
+                                tool_name=tc.tool_name,
+                                content=(
+                                    f"Tool '{tc.tool_name}' timed out after {tool_timeout}s"
+                                ),
+                                is_error=True,
+                                execution_status=runtime_execution_status(
+                                    "timeout",
+                                    reason="runtime_timeout",
+                                    timed_out=True,
+                                ),
+                            )
                     self._write_turn_call_log(
                         "tool_response",
                         iteration=iterations,
@@ -1706,18 +2733,60 @@ class Agent:
                     last_event_at = started
                     try:
                         while pending:
-                            if interval <= 0:
-                                done, pending = await asyncio.wait(
-                                    pending,
-                                    return_when=asyncio.FIRST_COMPLETED,
+                            remaining = max(0.0, tool_deadline - _loop.time())
+                            if _total_deadline is not None:
+                                remaining = min(
+                                    remaining,
+                                    max(0.0, _total_deadline - _loop.time()),
                                 )
-                            else:
-                                done, pending = await asyncio.wait(
-                                    pending,
-                                    timeout=interval,
-                                    return_when=asyncio.FIRST_COMPLETED,
-                                )
+                            if remaining <= 0:
+                                for task, tc in list(task_to_tool_call.items()):
+                                    if task in pending:
+                                        task.cancel()
+                                        results_by_id[tc.tool_use_id] = ToolResult(
+                                            tool_use_id=tc.tool_use_id,
+                                            tool_name=tc.tool_name,
+                                            content=(
+                                                f"Tool '{tc.tool_name}' timed out after "
+                                                f"{self.config.iteration_timeout}s"
+                                            ),
+                                            is_error=True,
+                                            execution_status=runtime_execution_status(
+                                                "timeout",
+                                                reason="runtime_timeout",
+                                                timed_out=True,
+                                            ),
+                                        )
+                                return
+                            wait_timeout = remaining if interval <= 0 else min(interval, remaining)
+                            done, pending = await asyncio.wait(
+                                pending,
+                                timeout=max(0.001, wait_timeout),
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
                             if not done:
+                                if _loop.time() >= tool_deadline or (
+                                    _total_deadline is not None
+                                    and _loop.time() >= _total_deadline
+                                ):
+                                    for task, tc in list(task_to_tool_call.items()):
+                                        if task in pending:
+                                            task.cancel()
+                                            results_by_id[tc.tool_use_id] = ToolResult(
+                                                tool_use_id=tc.tool_use_id,
+                                                tool_name=tc.tool_name,
+                                                content=(
+                                                    f"Tool '{tc.tool_name}' timed out after "
+                                                    f"{self.config.iteration_timeout}s"
+                                                ),
+                                                is_error=True,
+                                                execution_status=runtime_execution_status(
+                                                    "timeout",
+                                                    reason="runtime_timeout",
+                                                    timed_out=True,
+                                                ),
+                                            )
+                                    return
                                 now = time.monotonic()
                                 yield RunHeartbeatEvent(
                                     phase="tool",
@@ -1738,6 +2807,10 @@ class Agent:
                                         tool_name=tc.tool_name,
                                         content=f"Tool '{tc.tool_name}' was cancelled",
                                         is_error=True,
+                                        execution_status=runtime_execution_status(
+                                            "cancelled",
+                                            reason="cancelled",
+                                        ),
                                     )
                                 except Exception as exc:  # noqa: BLE001
                                     outcome = ToolResult(
@@ -1745,6 +2818,10 @@ class Agent:
                                         tool_name=tc.tool_name,
                                         content=f"Tool '{tc.tool_name}' raised: {exc}",
                                         is_error=True,
+                                        execution_status=runtime_execution_status(
+                                            "error",
+                                            reason="runtime_error",
+                                        ),
                                     )
                                 results_by_id[tc.tool_use_id] = outcome
                     finally:
@@ -1755,37 +2832,80 @@ class Agent:
                             with contextlib.suppress(asyncio.CancelledError):
                                 await task
 
-                # Dispatch preserving original order: accumulate consecutive safe
-                # tools into a batch and flush with asyncio.gather before each
-                # mutex tool, then run the mutex tool serially.  This ensures
-                # that a safe tool appearing after a mutex tool cannot start
+                # Dispatch preserving original order: accumulate consecutive
+                # concurrent/keyed tools into a batch and flush before each
+                # mutex tool, then run the mutex tool serially. This ensures
+                # that a parallel tool appearing after a mutex tool cannot start
                 # until that mutex tool has completed.
-                safe_batch: list[ToolCall] = []
+                parallel_batch: list[ToolCall] = []
 
-                async def _flush_safe_batch(
+                async def _flush_parallel_batch(
                     batch: list[ToolCall],
                 ) -> AsyncIterator[RunHeartbeatEvent]:
                     if not batch:
                         return
+                    semaphore = asyncio.Semaphore(self._max_safe_tool_concurrency())
+                    keyed_locks: dict[Any, asyncio.Lock] = {}
+                    limiters: dict[Any, asyncio.Semaphore] = {}
+
+                    async def _run_limited(tc: ToolCall) -> ToolResult:
+                        policy = _get_tool_concurrency_policy(
+                            tc.tool_name,
+                            tc.arguments,
+                            parent_session_key=self._session_key,
+                        )
+                        key_lock = (
+                            keyed_locks.setdefault(policy.key, asyncio.Lock())
+                            if policy.key is not None
+                            else None
+                        )
+                        limiter = None
+                        if policy.max_inflight is not None:
+                            limit_key = policy.limit_key or tc.tool_name
+                            limiter = limiters.setdefault(
+                                limit_key,
+                                asyncio.Semaphore(max(1, int(policy.max_inflight))),
+                            )
+
+                        async def _run_after_policy_locks() -> ToolResult:
+                            async with semaphore:
+                                return await _run_one(tc)
+
+                        async def _run_after_key_lock() -> ToolResult:
+                            if limiter is None:
+                                return await _run_after_policy_locks()
+                            async with limiter:
+                                return await _run_after_policy_locks()
+
+                        if key_lock is None:
+                            return await _run_after_key_lock()
+                        async with key_lock:
+                            return await _run_after_key_lock()
+
                     task_to_tool_call = {
-                        asyncio.create_task(_run_one(tc)): tc for tc in batch
+                        asyncio.create_task(_run_limited(tc)): tc for tc in batch
                     }
                     async for event in _collect_tool_tasks(task_to_tool_call):
                         yield event
 
                 for tc in tool_calls:
-                    if tc.tool_name in _SAFE_TOOL_NAMES:
-                        safe_batch.append(tc)
+                    policy = _get_tool_concurrency_policy(
+                        tc.tool_name,
+                        tc.arguments,
+                        parent_session_key=self._session_key,
+                    )
+                    if policy.mode != "mutex":
+                        parallel_batch.append(tc)
                     else:
-                        async for event in _flush_safe_batch(safe_batch):
+                        async for event in _flush_parallel_batch(parallel_batch):
                             yield event
-                        safe_batch = []
+                        parallel_batch = []
                         async for event in _collect_tool_tasks(
                             {asyncio.create_task(_run_one(tc)): tc}
                         ):
                             yield event
 
-                async for event in _flush_safe_batch(safe_batch):
+                async for event in _flush_parallel_batch(parallel_batch):
                     yield event
 
                 # Emit results in original tool_calls order.
@@ -1793,7 +2913,6 @@ class Agent:
                     result = await self._compress_tool_result(
                         results_by_id[tc.tool_use_id]
                     )
-                    executed_results.append(result)
                     for artifact in result.artifacts:
                         yield ArtifactEvent(**_artifact_event_kwargs(artifact))
                     yield ToolResultEvent(
@@ -1802,7 +2921,38 @@ class Agent:
                         result=result.content,
                         is_error=result.is_error,
                         arguments=tc.arguments,
+                        execution_status=result.execution_status,
                     )
+                    pending_approval = _pending_approval_payload(result.content)
+                    if (
+                        pending_approval is not None
+                        and not tc.arguments.get("approval_id")
+                    ):
+                        await _wait_for_pending_approval_resolution(
+                            pending_approval,
+                            timeout=_cap_timeout_by_deadlines(self._approval_wait_timeout()),
+                        )
+                        retry_arguments = dict(tc.arguments)
+                        retry_arguments["approval_id"] = pending_approval["approval_id"]
+                        retry_call = ToolCall(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                            arguments=retry_arguments,
+                            synthetic_from_text=tc.synthetic_from_text,
+                            origin_trace=tc.origin_trace,
+                        )
+                        result = await self._compress_tool_result(await _run_one(retry_call))
+                        for artifact in result.artifacts:
+                            yield ArtifactEvent(**_artifact_event_kwargs(artifact))
+                        yield ToolResultEvent(
+                            tool_use_id=result.tool_use_id,
+                            tool_name=result.tool_name,
+                            result=result.content,
+                            is_error=result.is_error,
+                            arguments=retry_arguments,
+                            execution_status=result.execution_status,
+                        )
+                    executed_results.append(result)
                     while self._pending_warnings:
                         yield self._pending_warnings.pop(0)
                     if self._is_turn_yield_result(result):
@@ -1812,8 +2962,16 @@ class Agent:
                             tool_use_id=result.tool_use_id,
                             content=result.content,
                             is_error=result.is_error,
+                            execution_status=result.execution_status,
                         )
                     )
+
+                terminal_artifacts = self._terminal_artifact_delivery_artifacts(
+                    executed_results
+                )
+                if terminal_artifacts:
+                    artifact_delivery_final_response_pending = True
+                    artifact_delivery_final_response_artifacts = terminal_artifacts
 
                 if any(_is_threshold_denial(result) for result in executed_results):
                     yield self._transition(AgentState.ERROR)
@@ -1828,7 +2986,7 @@ class Agent:
                     break
 
                 # Per-iteration deadline check after tool execution
-                if _loop.time() > _iter_deadline:
+                if _loop.time() > tool_deadline:
                     yield self._transition(AgentState.ERROR)
                     terminal_error = ErrorEvent(
                         message=(
@@ -1844,6 +3002,12 @@ class Agent:
                 turn_messages.append(
                     Message(role="user", content=tool_result_blocks)  # type: ignore[arg-type]
                 )
+                if terminal_projection_preflight_error:
+                    self._write_turn_call_log(
+                        "tool_argument_projection_rehydrate_recovery",
+                        iteration=iterations,
+                        tool_use_ids=sorted(preflight_tool_results),
+                    )
                 if turn_yielded:
                     break
 
@@ -1903,6 +3067,11 @@ class Agent:
         if terminal_error is None or has_usage:
             if terminal_error is None:
                 yield self._transition(AgentState.DONE)
+            session_totals = (
+                self._usage_tracker.session_snapshot(self._session_key)
+                if self._usage_tracker and self._session_key
+                else None
+            )
             yield DoneEvent(
                 text="".join(final_text_parts),
                 input_tokens=total_input_tokens,
@@ -1920,6 +3089,7 @@ class Agent:
                 reasoning_content=(
                     "\n".join(final_reasoning_parts) if final_reasoning_parts else None
                 ),
+                session_totals=session_totals,
             )
         # Reset for next turn
         self._state = AgentState.IDLE
@@ -1933,17 +3103,11 @@ class Agent:
         stream: AsyncIterator[Any],
         *,
         loop: asyncio.AbstractEventLoop,
-        iter_deadline: float,
         total_deadline: float | None,
     ) -> AsyncIterator[Any]:
         stream_iter = stream.__aiter__()
         while True:
-            remaining_iter = iter_deadline - loop.time()
-            if remaining_iter <= 0:
-                await self._close_provider_stream(stream_iter)
-                raise _IterationStreamTimeoutError
-
-            wait_budget = remaining_iter
+            wait_budget = max(0.001, self.config.iteration_timeout)
             if total_deadline is not None:
                 remaining_total = total_deadline - loop.time()
                 if remaining_total <= 0:
@@ -1957,7 +3121,6 @@ class Agent:
                 next_event.cancel()
                 with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
                     await next_event
-                await self._close_provider_stream(stream_iter)
                 if total_deadline is not None and loop.time() >= total_deadline:
                     raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
                 raise _IterationStreamTimeoutError
@@ -2046,8 +3209,39 @@ class Agent:
             if request_idx <= runtime_idx:
                 runtime_idx += 1
         runtime_idx = max(0, min(runtime_idx, len(result)))
-        result.insert(runtime_idx, runtime_context_message)
+        if runtime_idx < len(result) and result[runtime_idx].role == "user":
+            result[runtime_idx] = Agent._append_runtime_context_to_user_message(
+                result[runtime_idx],
+                runtime_context_message,
+            )
+        else:
+            result.insert(runtime_idx, runtime_context_message)
         return result
+
+    @staticmethod
+    def _append_runtime_context_to_user_message(
+        message: Message,
+        runtime_context_message: Message,
+    ) -> Message:
+        runtime_content = runtime_context_message.content
+        if not isinstance(runtime_content, str):
+            return runtime_context_message
+        if isinstance(message.content, str):
+            return Message(
+                role=message.role,
+                content=f"{message.content}\n\n{runtime_content}",
+                reasoning_content=message.reasoning_content,
+            )
+        if isinstance(message.content, list):
+            return Message(
+                role=message.role,
+                content=[
+                    *message.content,
+                    ContentBlockText(text=f"\n\n{runtime_content}"),
+                ],
+                reasoning_content=message.reasoning_content,
+            )
+        return runtime_context_message
 
     @staticmethod
     def _cache_breakpoints_without_runtime_context(
@@ -2086,6 +3280,43 @@ class Agent:
             return False
         return payload.get("status") == "yielded"
 
+    @staticmethod
+    def _terminal_artifact_delivery_artifacts(
+        results: list[ToolResult],
+    ) -> list[dict[str, Any]]:
+        artifacts: list[dict[str, Any]] = []
+        for result in results:
+            if result.tool_name != "publish_artifact" or result.is_error:
+                continue
+            if result.artifacts:
+                artifacts.extend(result.artifacts)
+                continue
+            try:
+                payload = json.loads(result.content)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("status") not in {"published", "already_published"}:
+                continue
+            artifact = payload.get("artifact")
+            artifacts.append(artifact if isinstance(artifact, dict) else {})
+        return artifacts
+
+    @staticmethod
+    def _artifact_delivery_final_response_text(
+        artifacts: list[dict[str, Any]],
+    ) -> str:
+        names = [
+            str(item.get("name") or item.get("filename") or "").strip()
+            for item in artifacts
+            if isinstance(item, dict)
+        ]
+        named = [name for name in names if name]
+        if named:
+            return "The generated file is ready: " + ", ".join(named) + "."
+        return "The generated file is ready."
+
     def _build_compaction_config(self) -> CompactionConfig:
         return build_compaction_config_from_provider(
             self.provider,
@@ -2099,13 +3330,16 @@ class Agent:
         *,
         request_context_insert_index: int | None = None,
         runtime_context_insert_index: int | None = None,
+        compaction_window_tokens: int | None = None,
     ) -> CompactionOutcome | None:
         """Check if total tokens exceed the overflow threshold.
 
         Uses sub-agent flush instead of prompt injection.
         The flush is re-entrant: it can trigger on every approach to threshold.
         """
-        threshold = self.config.context_overflow_threshold * self.config.context_window_tokens
+        self._last_compaction_refusal_reason = None
+        window_tokens = compaction_window_tokens or self.config.context_window_tokens
+        threshold = self.config.context_overflow_threshold * window_tokens
         if total_tokens <= threshold:
             return CompactionOutcome(
                 messages=messages,
@@ -2113,23 +3347,28 @@ class Agent:
                 runtime_context_insert_index=runtime_context_insert_index,
             )
 
-        # --- Pre-compaction flush via direct Agent (best-effort, concurrent) ---
+        # --- Pre-compaction flush; inline compaction can continue on degraded flush. ---
         flush_task: asyncio.Task | None = None
         self._consume_completed_flush_task()
 
-        async def _await_flush_task() -> None:
+        async def _await_flush_task() -> Any | None:
             # Give flush a grace period to complete instead of cancelling immediately.
-            # Adds up to flush_timeout_seconds (default 5s) of latency, but without
+            # Adds up to flush_timeout_seconds (default 15s) of latency, but without
             # this the flush is effectively dead code (always cancelled before finishing).
             if flush_task is not None and not flush_task.done():
+                if flush_task is self._flush_wait_timed_out_task:
+                    return None
                 try:
-                    await asyncio.wait_for(
+                    receipt = await asyncio.wait_for(
                         asyncio.shield(flush_task),
                         timeout=self.config.flush_timeout_seconds,
                     )
                     logger.info("memory_flush.completed_after_compaction")
+                    self._flush_wait_timed_out_task = None
                     self._mark_flush_task_completed(flush_task)
+                    return receipt
                 except TimeoutError:
+                    self._flush_wait_timed_out_task = flush_task
                     next_retry_seconds = self._record_flush_timeout_backoff()
                     logger.warning(
                         "memory_flush.timed_out",
@@ -2139,6 +3378,19 @@ class Agent:
                 except Exception as exc:
                     logger.warning("memory_flush.await_failed", error=str(exc))
                     self._mark_flush_task_completed(flush_task)
+                    return None
+            if flush_task is not None and flush_task.done():
+                try:
+                    receipt = flush_task.result()
+                    self._flush_wait_timed_out_task = None
+                    self._mark_flush_task_completed(flush_task)
+                    return receipt
+                except Exception as exc:
+                    logger.warning("memory_flush.await_failed", error=str(exc))
+                    self._flush_wait_timed_out_task = None
+                    self._mark_flush_task_completed(flush_task)
+                    return None
+            return None
 
         if not self._flush_done_this_cycle and self.config.flush_enabled:
             try:
@@ -2150,6 +3402,7 @@ class Agent:
                 now = time.monotonic()
                 if self._active_flush_task is not None and not self._active_flush_task.done():
                     logger.debug("memory_flush.skipped", reason="already_running")
+                    flush_task = self._active_flush_task
                 elif now < self._flush_backoff_until:
                     logger.warning(
                         "memory_flush.skipped",
@@ -2184,6 +3437,32 @@ class Agent:
             except Exception:
                 logger.debug("memory_flush.skipped", reason="flush module unavailable")
 
+        if self.config.flush_enabled:
+            if (
+                flush_task is not None
+                and not flush_task.done()
+                and time.monotonic() < self._flush_backoff_until
+            ):
+                logger.warning(
+                    "memory_flush.skipped",
+                    reason="backoff",
+                    retry_after_seconds=round(self._flush_backoff_until - time.monotonic(), 3),
+                )
+                self._flush_done_this_cycle = False
+            receipt = await _await_flush_task()
+            if not flush_receipt_allows_destructive_compaction(receipt):
+                reason = "memory_flush_degraded_before_compaction"
+                if flush_task is not None and self._flush_wait_timed_out_task is flush_task:
+                    reason = "memory_flush_timeout_before_compaction"
+                logger.warning(
+                    "memory_flush.degraded_before_compaction",
+                    reason=reason,
+                    mode=getattr(receipt, "mode", None),
+                    integrity_status=getattr(receipt, "integrity_status", None),
+                    indexed_chunk_count=getattr(receipt, "indexed_chunk_count", None),
+                )
+                self._flush_done_this_cycle = False
+
         # --- Compaction ---
         entries = [
             {
@@ -2198,13 +3477,35 @@ class Agent:
         request = CompactionRequest(
             session_id="agent-turn",
             entries=entries,
-            context_window_tokens=self.config.context_window_tokens,
+            context_window_tokens=window_tokens,
             config=self._build_compaction_config(),
         )
 
+        if self._session_key:
+            notify_compaction(
+                self._session_key,
+                source="automatic",
+                phase="agent_inline_overflow",
+                status="started",
+                tokens_before=total_tokens,
+                context_window_tokens=window_tokens,
+            )
+
         try:
             result = await compact_context(request)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            self._last_compaction_refusal_reason = "compaction_failed"
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase="agent_inline_overflow",
+                    status="failed",
+                    message=str(exc),
+                    reason=self._last_compaction_refusal_reason,
+                    tokens_before=total_tokens,
+                    context_window_tokens=window_tokens,
+                )
             return None  # signal failure
 
         # Removing history without a replacement summary is equivalent to
@@ -2216,12 +3517,35 @@ class Agent:
                 removed_count=result.removed_count,
                 kept_count=len(result.kept_entries),
             )
+            self._last_compaction_refusal_reason = "empty_summary_rejected"
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase="agent_inline_overflow",
+                    status="failed",
+                    reason=self._last_compaction_refusal_reason,
+                    tokens_before=total_tokens,
+                    context_window_tokens=window_tokens,
+                    removed_count=result.removed_count,
+                    kept_count=len(result.kept_entries),
+                )
             return None
 
         has_structured_content = any(not isinstance(m.content, str) for m in messages)
         if result.removed_count == 0 and not result.summary and has_structured_content:
             await _await_flush_task()
             self._flush_done_this_cycle = False
+            if self._session_key:
+                notify_compaction(
+                    self._session_key,
+                    source="automatic",
+                    phase="agent_inline_overflow",
+                    status="skipped",
+                    reason="structured_content_noop",
+                    tokens_before=total_tokens,
+                    context_window_tokens=window_tokens,
+                )
             return CompactionOutcome(messages=messages)
 
         # Rebuild message list from compacted entries
@@ -2276,17 +3600,34 @@ class Agent:
         self._mark_flush_task_completed(task)
 
     def _mark_flush_task_completed(self, task: asyncio.Task) -> None:
+        if self._flush_wait_timed_out_task is task:
+            self._flush_wait_timed_out_task = None
         if self._active_flush_task is not task:
             return
         try:
-            task.result()
+            receipt = task.result()
         except asyncio.CancelledError:
             logger.debug("memory_flush.cancelled")
         except Exception as exc:  # noqa: BLE001
             logger.warning("memory_flush.background_failed", error=str(exc))
         else:
-            self._flush_backoff_seconds = 0.0
-            self._flush_backoff_until = 0.0
+            mode = getattr(receipt, "mode", None)
+            if not flush_receipt_allows_destructive_compaction(receipt):
+                next_retry_seconds = self._ensure_flush_degraded_backoff()
+                logger.warning(
+                    "memory_flush.degraded",
+                    mode=mode,
+                    integrity_status=getattr(receipt, "integrity_status", None),
+                    output_coverage_status=getattr(
+                        receipt, "output_coverage_status", None
+                    ),
+                    obligation_status=getattr(receipt, "obligation_status", None),
+                    raw_reason=getattr(receipt, "raw_reason", None),
+                    next_retry_seconds=next_retry_seconds,
+                )
+            else:
+                self._flush_backoff_seconds = 0.0
+                self._flush_backoff_until = 0.0
         self._active_flush_task = None
 
     def _record_flush_timeout_backoff(self) -> float:
@@ -2303,6 +3644,12 @@ class Agent:
         self._flush_backoff_seconds = next_retry_seconds
         self._flush_backoff_until = time.monotonic() + next_retry_seconds
         return next_retry_seconds
+
+    def _ensure_flush_degraded_backoff(self) -> float:
+        remaining = self._flush_backoff_until - time.monotonic()
+        if remaining > 0:
+            return remaining
+        return self._record_flush_timeout_backoff()
 
     @staticmethod
     def _adjust_compacted_insert_index(
@@ -2337,13 +3684,13 @@ class Agent:
         self,
         plan: Any,
         messages: list[Message],
-    ) -> None:
-        """Fire-and-forget memory flush; delegates to SessionFlushService.
+    ) -> Any | None:
+        """Run memory flush before compaction; delegates to SessionFlushService.
 
-        When a ``SessionFlushService`` is injected (post-PR2a), this method
-        just forwards the call and drops the receipt. When no service is
-        injected (standalone Agent instances in unit tests or legacy paths),
-        falls back to an inline raw-dump so we don't silently drop data.
+        When a ``SessionFlushService`` is injected, this method forwards the
+        call and returns its receipt. When no service is injected (standalone
+        Agent instances in unit tests or legacy paths), it falls back to an
+        inline raw-dump so we don't silently drop data.
         """
         service = getattr(self, "_session_flush_service", None)
         if service is not None:
@@ -2351,10 +3698,11 @@ class Agent:
                 from opensquilla.session.keys import parse_agent_id
 
                 sk = getattr(self, "_session_key", None) or "agent:main:legacy"
-                await service.execute(
+                return await service.execute(
                     messages,
                     session_key=sk,
                     agent_id=parse_agent_id(sk),
+                    timeout=self.config.flush_background_timeout_seconds,
                     message_window=0,
                     segment_mode="auto",
                 )
@@ -2363,7 +3711,7 @@ class Agent:
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.warning("memory_flush.service_failed", error=str(exc))
-            return
+            return None
 
         # Legacy fallback — only hit when no service is injected.
         from opensquilla.memory.flush import dump_transcript_excerpt
@@ -2384,25 +3732,327 @@ class Agent:
                         },
                     )
                 )
+        return None
+
+    @staticmethod
+    def _has_provider_context_replay_marker(arguments: dict[str, Any]) -> bool:
+        if Agent._has_provider_context_argument_marker(arguments):
+            return True
+        return any(
+            isinstance(value, str)
+            and value.startswith(_INVALID_PROVIDER_CONTEXT_PROJECTION_PREFIX)
+            for value in arguments.values()
+        )
+
+    @staticmethod
+    def _is_provider_context_projection_reuse_result(result: ToolResult) -> bool:
+        status: Mapping[str, Any] = result.execution_status or {}
+        return bool(
+            result.is_error
+            and isinstance(status, dict)
+            and status.get("reason") == _PROVIDER_CONTEXT_PROJECTION_REUSED_REASON
+        )
+
+    def _strip_provider_context_marker_replay_for_provider(
+        self,
+        messages: list[Message],
+    ) -> list[Message]:
+        blocked_tool_ids: set[str] = set()
+        for message in messages:
+            if not isinstance(message.content, list):
+                continue
+            for block in message.content:
+                if (
+                    isinstance(block, ContentBlockToolUse)
+                    and isinstance(block.id, str)
+                    and self._has_provider_context_replay_marker(block.input)
+                ):
+                    blocked_tool_ids.add(block.id)
+
+        if not blocked_tool_ids:
+            return messages
+
+        stripped_messages: list[Message] = []
+        stripped_blocks = 0
+        for message in messages:
+            if not isinstance(message.content, list):
+                stripped_messages.append(message)
+                continue
+            next_content: list[Any] = []
+            changed = False
+            for block in message.content:
+                if (
+                    isinstance(block, ContentBlockToolUse)
+                    and block.id in blocked_tool_ids
+                ):
+                    stripped_blocks += 1
+                    changed = True
+                    continue
+                if (
+                    isinstance(block, ContentBlockToolResult)
+                    and block.tool_use_id in blocked_tool_ids
+                ):
+                    stripped_blocks += 1
+                    changed = True
+                    continue
+                next_content.append(block)
+            if not changed:
+                stripped_messages.append(message)
+                continue
+            if not next_content:
+                continue
+            stripped_messages.append(
+                Message(
+                    role=message.role,
+                    content=next_content,
+                    reasoning_content=getattr(message, "reasoning_content", None),
+                )
+            )
+
+        self.config.metadata["tool_argument_projection_replay_stripped"] = (
+            self.config.metadata.get("tool_argument_projection_replay_stripped", 0)
+            + stripped_blocks
+        )
+        self._write_turn_call_log(
+            "tool_argument_projection_replay_stripped",
+            tool_use_ids=sorted(blocked_tool_ids),
+            stripped_blocks=stripped_blocks,
+        )
+        return stripped_messages
+
+    @staticmethod
+    def _parse_tool_argument_projection(value: str) -> dict[str, str] | None:
+        if not value.startswith(_TOOL_ARGUMENT_PROJECTION_PREFIX):
+            return None
+        metadata: dict[str, str] = {}
+        for line in value.splitlines()[1:]:
+            if line in {"head:", "tail:"}:
+                break
+            key, separator, raw_value = line.partition(":")
+            if not separator:
+                continue
+            metadata[key.strip()] = raw_value.strip()
+        return metadata
+
+    @staticmethod
+    def _provider_projection_placeholder(tool_name: str, field: str) -> str:
+        return (
+            f"[invalid_provider_context_projection:{tool_name}.{field}] "
+            "provider-only compacted tool argument omitted; regenerate the real "
+            "argument instead of copying provider context."
+        )
+
+    @staticmethod
+    def _has_provider_context_argument_marker(arguments: dict[str, Any]) -> bool:
+        return (
+            arguments.get(_INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY) is True
+            or any(arguments.get(marker) is True for marker in _COMPACTED_TOOL_ARGUMENT_MARKERS)
+        )
+
+    @staticmethod
+    def _provider_compacted_arguments_placeholder(
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            _INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY: True,
+            "tool": tool_name,
+            "reason": "provider_context_omitted",
+        }
+
+    def _sanitize_projected_tool_call_arguments(self, tc: ToolCall) -> ToolCall:
+        if self._has_provider_context_argument_marker(tc.arguments):
+            return ToolCall(
+                tool_use_id=tc.tool_use_id,
+                tool_name=tc.tool_name,
+                arguments=self._provider_compacted_arguments_placeholder(
+                    tc.tool_name,
+                    tc.arguments,
+                ),
+                synthetic_from_text=tc.synthetic_from_text,
+                origin_trace=tc.origin_trace,
+            )
+        sanitized = dict(tc.arguments)
+        changed = False
+        for argument_name, value in tc.arguments.items():
+            if not isinstance(value, str) or not value.startswith(
+                _TOOL_ARGUMENT_PROJECTION_PREFIX
+            ):
+                continue
+            sanitized[argument_name] = self._provider_projection_placeholder(
+                tc.tool_name,
+                argument_name,
+            )
+            changed = True
+        if not changed:
+            return tc
+        return ToolCall(
+            tool_use_id=tc.tool_use_id,
+            tool_name=tc.tool_name,
+            arguments=sanitized,
+            synthetic_from_text=tc.synthetic_from_text,
+            origin_trace=tc.origin_trace,
+        )
+
+    def _projection_rehydrate_error(
+        self,
+        tc: ToolCall,
+        *,
+        field: str,
+        reason: str,
+    ) -> ToolResult:
+        self.config.metadata["tool_argument_projection_rehydrate_failures"] = (
+            self.config.metadata.get(
+                "tool_argument_projection_rehydrate_failures",
+                0,
+            )
+            + 1
+        )
+        self._write_turn_call_log(
+            "tool_argument_projection_rehydrate_failed",
+            tool_use_id=tc.tool_use_id,
+            tool_name=tc.tool_name,
+            field=field,
+            reason=reason,
+        )
+        return ToolResult(
+            tool_use_id=tc.tool_use_id,
+            tool_name=tc.tool_name,
+            content=(
+                f"The {tc.tool_name}.{field} input was not available in executable "
+                "form. The tool was not run; regenerate the complete argument and "
+                "retry the tool call."
+            ),
+            is_error=True,
+            execution_status=runtime_execution_status(
+                "error",
+                reason=_PROVIDER_CONTEXT_PROJECTION_REUSED_REASON,
+            ),
+        )
+
+    def _provider_compacted_arguments_error(
+        self,
+        tc: ToolCall,
+        *,
+        reason: str,
+    ) -> ToolResult:
+        self.config.metadata["tool_argument_projection_rehydrate_failures"] = (
+            self.config.metadata.get(
+                "tool_argument_projection_rehydrate_failures",
+                0,
+            )
+            + 1
+        )
+        self._write_turn_call_log(
+            "tool_argument_projection_rehydrate_failed",
+            tool_use_id=tc.tool_use_id,
+            tool_name=tc.tool_name,
+            reason=reason,
+        )
+        return ToolResult(
+            tool_use_id=tc.tool_use_id,
+            tool_name=tc.tool_name,
+            content=(
+                f"The {tc.tool_name} arguments were not available in executable "
+                "form. The tool was not run; regenerate the complete arguments and "
+                "retry the tool call."
+            ),
+            is_error=True,
+            execution_status=runtime_execution_status(
+                "error",
+                reason=_PROVIDER_CONTEXT_PROJECTION_REUSED_REASON,
+            ),
+        )
+
+    def _rehydrate_projected_tool_arguments(
+        self,
+        tc: ToolCall,
+    ) -> ToolCall | ToolResult:
+        if self._has_provider_context_argument_marker(tc.arguments):
+            return self._provider_compacted_arguments_error(
+                tc,
+                reason="provider_compacted_arguments_reused",
+            )
+        for argument_name, value in tc.arguments.items():
+            if not isinstance(value, str) or not value.startswith(
+                (_TOOL_ARGUMENT_PROJECTION_PREFIX, _HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX)
+            ):
+                continue
+            return self._projection_rehydrate_error(
+                tc,
+                field=argument_name,
+                reason="provider_projection_reused",
+            )
+        return tc
 
     async def _execute_tool(self, tc: ToolCall) -> ToolResult:
         """Dispatch a tool call to the registered handler."""
-        if self.tool_handler is None:
+        args_hash = hashlib.sha256(
+            json.dumps(tc.arguments, ensure_ascii=False, sort_keys=True, default=str).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        failure_signature = (tc.tool_name, args_hash)
+        block_threshold = max(
+            0,
+            int(getattr(self.config, "tool_failure_loop_block_threshold", 0) or 0),
+        )
+        if (
+            block_threshold > 0
+            and self._tool_failure_loop_counts.get(failure_signature, 0)
+            >= block_threshold - 1
+        ):
             return ToolResult(
+                tool_use_id=tc.tool_use_id,
+                tool_name=tc.tool_name,
+                content=(
+                    f"The exact same {tc.tool_name} call has already failed repeatedly. "
+                    "Do not retry this exact call unchanged. Use a different approach, "
+                    "change the arguments, or explain the blocker to the user."
+                ),
+                is_error=True,
+                execution_status=runtime_execution_status(
+                    "error",
+                    reason="tool_failure_loop_exhausted",
+                ),
+            )
+        if self.tool_handler is None:
+            result = ToolResult(
                 tool_use_id=tc.tool_use_id,
                 tool_name=tc.tool_name,
                 content=f"No tool handler registered for tool '{tc.tool_name}'",
                 is_error=True,
+                execution_status=runtime_execution_status(
+                    "error",
+                    reason="runtime_error",
+                ),
             )
-        try:
-            return await self.tool_handler(tc)
-        except Exception as exc:  # noqa: BLE001
-            return ToolResult(
-                tool_use_id=tc.tool_use_id,
-                tool_name=tc.tool_name,
-                content=f"Tool '{tc.tool_name}' raised: {exc}",
-                is_error=True,
+        else:
+            try:
+                resolved = self._rehydrate_projected_tool_arguments(tc)
+                if isinstance(resolved, ToolResult):
+                    result = resolved
+                else:
+                    tc = resolved
+                    result = await self.tool_handler(tc)
+            except Exception as exc:  # noqa: BLE001
+                result = ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name=tc.tool_name,
+                    content=f"Tool '{tc.tool_name}' raised: {exc}",
+                    is_error=True,
+                    execution_status=runtime_execution_status(
+                        "error",
+                        reason="runtime_error",
+                    ),
+                )
+        if result.is_error:
+            self._tool_failure_loop_counts[failure_signature] = (
+                self._tool_failure_loop_counts.get(failure_signature, 0) + 1
             )
+        else:
+            self._tool_failure_loop_counts.pop(failure_signature, None)
+        return result
 
     # ------------------------------------------------------------------
     # Subagent factory
@@ -2419,6 +4069,7 @@ class Agent:
         )
 
         parent_session_key = self._session_key or "unknown"
+        subagent_label = spec.label or "subagent"
 
         # Schema-time filtering: subagents cannot see dangerous tools
         filtered_defs = [td for td in self.tool_definitions if td.name not in SUBAGENT_TOOL_DENY]
@@ -2434,6 +4085,9 @@ class Agent:
             channel_id=f"subagent:{parent_session_key}",
             sender_id=parent_session_key,
             denied_tools=set(SUBAGENT_TOOL_DENY),
+            tool_run_budget_key=(
+                f"subagent:{parent_session_key}:{subagent_label}:{depth}:{uuid.uuid4().hex}"
+            ),
         )
 
         async def _subagent_tool_handler(tc: ToolCall) -> ToolResult:
@@ -2443,6 +4097,10 @@ class Agent:
                     tool_name=tc.tool_name,
                     content=f"No tool handler registered for tool '{tc.tool_name}'",
                     is_error=True,
+                    execution_status=runtime_execution_status(
+                        "error",
+                        reason="runtime_error",
+                    ),
                 )
             token = current_tool_context.set(subagent_ctx)
             try:
@@ -2456,6 +4114,15 @@ class Agent:
             max_tokens=self.config.max_tokens,
             context_window_tokens=self.config.context_window_tokens,
             workspace_dir=spec.workspace_dir or self.config.workspace_dir,
+            flush_enabled=self.config.flush_enabled,
+            flush_timeout_seconds=self.config.flush_timeout_seconds,
+            flush_background_timeout_seconds=self.config.flush_background_timeout_seconds,
+            flush_backoff_initial_seconds=self.config.flush_backoff_initial_seconds,
+            flush_backoff_max_seconds=self.config.flush_backoff_max_seconds,
+            flush_archive_max_bytes=self.config.flush_archive_max_bytes,
+            flush_compaction_requires_safe_receipt=(
+                self.config.flush_compaction_requires_safe_receipt
+            ),
             tool_result_compression_enabled=self.config.tool_result_compression_enabled,
             tool_result_compression_mode=self.config.tool_result_compression_mode,
             tool_result_compression_max_share=self.config.tool_result_compression_max_share,
@@ -2470,6 +4137,32 @@ class Agent:
             ),
             tool_result_compression_summary_input_max_chars=(
                 self.config.tool_result_compression_summary_input_max_chars
+            ),
+            tool_result_provider_request_max_chars=(
+                self.config.tool_result_provider_request_max_chars
+            ),
+            provider_request_proof_max_chars=self.config.provider_request_proof_max_chars,
+            tool_use_argument_provider_request_max_chars=(
+                self.config.tool_use_argument_provider_request_max_chars
+            ),
+            tool_use_argument_projection_enabled=(
+                self.config.tool_use_argument_projection_enabled
+            ),
+            tool_failure_loop_block_threshold=(
+                self.config.tool_failure_loop_block_threshold
+            ),
+            max_safe_tool_concurrency=self.config.max_safe_tool_concurrency,
+            tool_result_external_keep_recent=self.config.tool_result_external_keep_recent,
+            tool_result_store_dir=self.config.tool_result_store_dir,
+            tool_result_store_session_id=self.config.tool_result_store_session_id,
+            tool_result_store_session_key=self.config.tool_result_store_session_key,
+            tool_result_store_agent_id=self.config.tool_result_store_agent_id,
+            tool_result_store_max_bytes=self.config.tool_result_store_max_bytes,
+            tool_result_store_disk_budget_bytes=(
+                self.config.tool_result_store_disk_budget_bytes
+            ),
+            tool_result_store_retention_seconds=(
+                self.config.tool_result_store_retention_seconds
             ),
         )
         return Agent(

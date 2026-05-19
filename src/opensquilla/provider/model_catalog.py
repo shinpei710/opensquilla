@@ -6,6 +6,7 @@ import httpx
 import structlog
 
 from opensquilla.env import trust_env as _trust_env
+from opensquilla.secrets import clean_header_secret
 
 from .openrouter_attribution import openrouter_app_headers
 from .registry import UnknownProviderError, get_provider_spec
@@ -200,7 +201,9 @@ class ModelCatalog:
         URL constructed as: ``f"{base_url}/v1/models"``
         """
         url = f"{base_url}/v1/models"
-        headers = {"Authorization": f"Bearer {api_key}"}
+        headers = {
+            "Authorization": f"Bearer {clean_header_secret(api_key, label='OpenRouter API key')}"
+        }
         headers.update(openrouter_app_headers(base_url))
         async with httpx.AsyncClient(
             timeout=10.0, trust_env=_trust_env(), proxy=proxy or None
@@ -231,15 +234,18 @@ class ModelCatalog:
         else:
             effective = DEFAULT_MAX_TOKENS
 
-        # Clamp to context window
+        # Clamp to context window. Some provider catalogs report a model's
+        # max_completion_tokens as almost the entire context window; using that
+        # value as max_tokens leaves no room for ordinary prompt/tool/image input
+        # and causes preventable context-limit failures.
         if context_window > 0:
             effective = min(effective, context_window)
             if (
                 not using_user_override
                 and context_window > DEFAULT_MAX_TOKENS
-                and effective >= context_window
+                and effective >= context_window - DEFAULT_MAX_TOKENS
             ):
-                effective = DEFAULT_MAX_TOKENS
+                effective = min(effective, DEFAULT_MAX_TOKENS)
 
         return effective
 

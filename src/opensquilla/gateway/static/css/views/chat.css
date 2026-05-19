@@ -10,6 +10,10 @@
   position: relative;
 }
 
+.content:has(> .chat) {
+  padding-bottom: 0;
+}
+
 .chat--dragover {
   outline: 2px dashed var(--accent);
   outline-offset: -4px;
@@ -762,6 +766,7 @@
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
   color: var(--text-muted);
+  min-width: 11ch;
 }
 
 /* ─── Tool Cards (collapsed tool calls) ────────────────────────────────── */
@@ -875,6 +880,10 @@
   border-left: 3px solid var(--danger);
 }
 
+.chat-tools-collapse--unknown {
+  border-left: 3px solid var(--warn);
+}
+
 .chat-tool-result--warn {
   border-color: var(--warn);
   background: rgba(232, 168, 76, 0.06);
@@ -885,6 +894,43 @@
   color: var(--text-muted);
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.chat-memory-sources {
+  display: grid;
+  gap: var(--sp-1);
+  margin-top: var(--sp-2);
+}
+
+.chat-memory-source {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  min-width: 0;
+  color: var(--text-muted);
+}
+
+.chat-memory-source-badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.chat-memory-source-badge--sessions {
+  border-color: var(--accent);
+}
+
+.chat-memory-source-citation {
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chat-tool-view-btn {
@@ -1597,11 +1643,6 @@
   white-space: nowrap;
 }
 
-/* .chat sets --composer-h via ResizeObserver; thread uses it for bottom clearance */
-.chat-thread {
-  padding-bottom: max(var(--composer-h, 90px), var(--sp-4));
-}
-
 /* ─── Chat Toolbar (feature toggle pills) ──────────────────────────────── */
 
 .chat-toolbar {
@@ -1638,16 +1679,9 @@
 @media (max-width: 480px) {
   #chat-btn-export { display: none !important; }
 
-  /* On narrow phones the input was getting squeezed to ~80px. Tighten gaps,
-     shrink icon-button targets to the touch minimum (40px instead of 44px)
-     so the input gets back enough width to read its own placeholder. */
-  .chat-input-bar {
-    gap: 4px;
-    padding-left: var(--sp-3);
-    padding-right: var(--sp-3);
-    /* Sit above iOS Safari's bottom toolbar / home-indicator. */
-    padding-bottom: calc(var(--sp-2) + env(safe-area-inset-bottom, 0px));
-  }
+  /* On narrow phones the input was getting squeezed to ~80px. Tighten icon
+     targets to the touch minimum (40px instead of 44px) so the input gets
+     back enough width to read its own placeholder. */
   .chat-input-bar .btn--icon {
     min-width: 40px;
     min-height: 40px;
@@ -1833,10 +1867,20 @@
   display: flex;
   align-items: center;
   gap: var(--sp-2);
-  padding: var(--sp-2) var(--sp-4);
+  padding: var(--sp-2) var(--sp-4) var(--sp-1);
   border-top: 1px solid var(--border);
   background: var(--bg);
   flex-shrink: 0;
+}
+
+@media (max-width: 480px) {
+  .chat-input-bar {
+    gap: 4px;
+    padding-left: var(--sp-3);
+    padding-right: var(--sp-3);
+    /* Sit above iOS Safari's bottom toolbar / home-indicator. */
+    padding-bottom: calc(var(--sp-2) + env(safe-area-inset-bottom, 0px));
+  }
 }
 
 .chat-input-wrap {

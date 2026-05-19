@@ -5,6 +5,8 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+from opensquilla.gateway.config import GatewayConfig
+
 # Real secret-shape detectors. Each pattern matches a shipped vendor key
 # format so an accidentally-committed credential is caught at CI time
 # before the public tree is published.
@@ -36,6 +38,19 @@ PUBLIC_RELEASE_MARKER_NAMES = (
     "LOCAL_AGENT_NOTES.md",
 )
 
+# These tests intentionally contain fake local paths to exercise path-policy
+# behavior. They are public fixtures, not leaked developer-machine paths.
+PATH_POLICY_FIXTURE_FILES = {
+    "tests/test_artifacts.py",
+    "tests/test_provider_image_generation.py",
+    "tests/test_tools/test_apply_patch_gates.py",
+    "tests/test_tools/test_filesystem_read_workspace.py",
+    "tests/test_tools/test_git_workdir_policy.py",
+    "tests/test_tools/test_path_policy.py",
+    "tests/test_tools/test_shell_sensitive.py",
+    "tests/test_tools/test_web_http_request.py",
+}
+
 
 def _tracked_text_files() -> list[Path]:
     raw = subprocess.check_output(["git", "ls-files"], text=True)
@@ -63,6 +78,8 @@ def test_tracked_public_files_do_not_contain_real_secret_shapes_or_local_paths()
     for path in _tracked_text_files():
         # Skip this file so the regexes themselves do not trigger the test.
         if path.as_posix() == self_path:
+            continue
+        if path.as_posix() in PATH_POLICY_FIXTURE_FILES:
             continue
         text = _read_text(path)
         for name, pattern in SECRET_PATTERNS.items():
@@ -136,6 +153,49 @@ def test_public_docs_do_not_use_key_shaped_placeholders() -> None:
             violations.append(path.as_posix())
 
     assert violations == []
+
+
+def test_release_sop_documents_github_only_validation_boundary() -> None:
+    text = Path("RELEASES.md").read_text(encoding="utf-8")
+
+    required_phrases = [
+        "GitHub-only release checks",
+        "OpenSquilla-windows-x64-portable.zip",
+        "opensquilla-latest-py3-none-any.whl",
+        "SHA256SUMS",
+        "stable release URLs resolve",
+        "post-publish latest URL checks",
+        "curl --fail --head --location",
+        "wheelhouse zips, macOS portable zips, and Linux portable zips are intentionally",
+        "Mark-of-the-Web",
+        "SmartScreen",
+        "Smart App Control",
+    ]
+
+    for phrase in required_phrases:
+        assert phrase in text
+
+    assert ".sha256" not in text
+
+
+def test_readme_documents_quick_and_manual_terminal_install_commands() -> None:
+    text = Path("README.md").read_text(encoding="utf-8")
+
+    assert 'uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com' in text
+    assert "curl -LsSf https://astral.sh/uv/install.sh | sh" in text
+    assert '. "$HOME/.local/bin/env"' in text
+    assert 'powershell -c "irm https://astral.sh/uv/install.ps1 | iex"' in text
+    assert "$env:Path" in text
+    assert "bash scripts/install_source.sh" in text
+    assert "./scripts/install_source.ps1" in text
+
+
+def test_readme_uses_gateway_default_port() -> None:
+    text = Path("README.md").read_text(encoding="utf-8")
+    expected_port = GatewayConfig.model_fields["port"].default
+
+    assert f"127.0.0.1:{expected_port}" in text
+    assert "18790" not in text
 
 
 def test_tracked_sources_do_not_keep_agent_revision_markers() -> None:

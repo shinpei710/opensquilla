@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal
 
 import httpx
@@ -21,6 +22,15 @@ from opensquilla.channels._attachment_io import (
     preferred_attachment_mime,
 )
 from opensquilla.channels._util import ChannelAccessPolicy, EventDedupeCache
+from opensquilla.channels.contract import (
+    ChannelCapabilities,
+    ChannelCapabilityProfile,
+    ChannelPlatformCapability,
+    ChannelPlatformCapabilityStatus,
+    ChannelPlatformCategories,
+    ChannelPlatformManifest,
+    ChannelSendResult,
+)
 from opensquilla.channels.types import Attachment, ChannelHealth, IncomingMessage, OutgoingMessage
 from opensquilla.env import trust_env as _trust_env
 
@@ -114,6 +124,52 @@ class TelegramChannel:
     @property
     def transport_name(self) -> str:
         return self.config.transport_name
+
+    @property
+    def capability_profile(self) -> ChannelCapabilityProfile:
+        return ChannelCapabilityProfile(
+            channel_type="telegram",
+            group_chat=True,
+            mentions=True,
+            native_file_upload=True,
+            media=True,
+            reply=True,
+            thread_reply=True,
+            edit=True,
+            delete=True,
+            transports=(self.config.transport_name,),
+        )
+
+    @property
+    def platform_capability_manifest(self) -> ChannelPlatformManifest:
+        return ChannelPlatformManifest.from_channel_profile(
+            self.capability_profile,
+            has_send_file=True,
+            has_inbound_attachment_resolver=True,
+        ).with_capabilities(
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.FILES,
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=("sendDocument", "getFile"),
+                mutates=True,
+                notes=("Telegram sends generated files with sendDocument.",),
+            ),
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.ATTACHMENTS,
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=("getFile",),
+                notes=("Inbound Telegram files are resolved through getFile.",),
+            ),
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.THREADS,
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                notes=("Forum topic thread IDs are preserved when Telegram provides them.",),
+            ),
+        )
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self.capability_profile.capability_tags()
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -484,6 +540,40 @@ class TelegramChannel:
         payload = self._build_send_payload(message)
         result = await self._api("sendMessage", payload)
         return result if isinstance(result, dict) else {"result": result}
+
+    async def send_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        content: str = "",
+    ) -> ChannelSendResult:
+        if not self.config.token:
+            raise ValueError("telegram.send_file requires token")
+        path = Path(file_path)
+        payload = {"chat_id": str(chat_id)}
+        if content:
+            payload["caption"] = content
+        client = self._get_client()
+        with path.open("rb") as f:
+            response = await client.post(
+                f"/bot{self.config.token}/sendDocument",
+                data=payload,
+                files={"document": (path.name, f)},
+            )
+        response.raise_for_status()
+        data = response.json()
+        if data.get("ok") is not True:
+            raise TelegramApiError(data.get("description", "Telegram sendDocument failed"))
+        raw_result = data.get("result")
+        result: dict[str, Any] = raw_result if isinstance(raw_result, dict) else {}
+        raw_document = result.get("document")
+        document: dict[str, Any] = raw_document if isinstance(raw_document, dict) else {}
+        return ChannelSendResult.sent(
+            capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+            target_id=str(chat_id),
+            provider_message_id=str(result.get("message_id", "")),
+            provider_file_id=str(document.get("file_id", "")),
+        )
 
     def _build_send_payload(self, message: OutgoingMessage) -> dict[str, Any]:
         chat_id = (

@@ -13,6 +13,7 @@ import structlog
 
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.openrouter_attribution import openrouter_app_headers
+from opensquilla.secrets import clean_header_secret
 
 log = structlog.get_logger(__name__)
 
@@ -39,7 +40,7 @@ class PricingCache:
         base_url: str = "https://openrouter.ai/api/v1",
         ttl_seconds: int = _CACHE_TTL,
     ) -> None:
-        self._api_key = api_key
+        self._api_key = clean_header_secret(api_key, label="OpenRouter API key")
         self._base_url = base_url.rstrip("/")
         self._ttl = ttl_seconds
         self._cache: dict[str, ModelPrice] = {}

@@ -1,26 +1,43 @@
 #!/usr/bin/env bash
-# install.sh — user-local OpenSquilla installer (no sudo).
+# install.sh - OpenSquilla release installer for Linux and macOS.
 #
-# Installer contract:
-#   - installs into a user-owned prefix (never /usr/local, /opt, or admin paths)
-#   - prefers uv tool install; falls back to pip --user; errors clearly if neither exists
-#   - defaults to the "recommended" runtime profile (memory + bundled v4 router)
-#     and allows `OPENSQUILLA_INSTALL_PROFILE=core` to opt back down
-#   - prints a post-install banner documenting the default bind
-#     (127.0.0.1:18790) and the explicit opt-in required to expose the gateway
-#     on the network (--listen 0.0.0.0 or OPENSQUILLA_LISTEN=0.0.0.0)
-#   - adds an extra WARNING when the operator requested network exposure at
-#     install time via OPENSQUILLA_LISTEN=0.0.0.0
-#
-# Dry-run: export OPENSQUILLA_INSTALL_DRY_RUN=1 to print the install plan + banner
-# without touching the system.
+# This script is safe to pipe from the public install URL. It installs uv if
+# needed, installs a release wheel with uv tool, then prints the explicit next
+# steps. It does not run onboarding or start the gateway.
 
 set -euo pipefail
 
+default_version="v0.2.0rc1"
+repo_slug="${OPENSQUILLA_REPOSITORY:-opensquilla/opensquilla}"
+python_version="${OPENSQUILLA_PYTHON_VERSION:-3.12}"
+original_path="${PATH:-}"
+
+cli_version=""
 cli_profile=""
 cli_extras=""
+
+usage() {
+    cat <<HELP
+Usage: bash install.sh [--version v0.2.0rc1|latest] [--profile recommended|core] [--extras name[,name]]
+
+Environment equivalents:
+  OPENSQUILLA_VERSION=v0.2.0rc1
+  OPENSQUILLA_INSTALL_PROFILE=recommended|core
+  OPENSQUILLA_INSTALL_EXTRAS=matrix
+  OPENSQUILLA_INSTALL_DRY_RUN=1
+HELP
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --version)
+            cli_version="${2:?install.sh: --version requires a value}"
+            shift 2
+            ;;
+        --version=*)
+            cli_version="${1#*=}"
+            shift
+            ;;
         --profile)
             cli_profile="${2:?install.sh: --profile requires a value}"
             shift 2
@@ -38,70 +55,56 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
-            cat <<HELP
-Usage: bash install.sh [--profile recommended|core] [--extras name[,name]]
-
-Environment equivalents:
-  OPENSQUILLA_INSTALL_PROFILE=recommended|core
-  OPENSQUILLA_INSTALL_EXTRAS=feishu,telegram
-  OPENSQUILLA_INSTALL_DRY_RUN=1
-HELP
+            usage
             exit 0
             ;;
         *)
             echo "install.sh: unknown argument '$1'." >&2
-            echo "install.sh: run 'bash install.sh --help' for usage." >&2
+            usage >&2
             exit 1
             ;;
     esac
 done
 
-# --- prefix resolution ------------------------------------------------------
-
-if [[ -n "${OPENSQUILLA_PREFIX:-}" ]]; then
-    prefix="${OPENSQUILLA_PREFIX}"
-elif [[ -n "${XDG_DATA_HOME:-}" ]]; then
-    prefix="${XDG_DATA_HOME}/opensquilla"
-else
-    prefix="${HOME}/.local"
-fi
-
-dry_run="${OPENSQUILLA_INSTALL_DRY_RUN:-0}"
+release_selector="${cli_version:-${OPENSQUILLA_VERSION:-${default_version}}}"
 profile="${cli_profile:-${OPENSQUILLA_INSTALL_PROFILE:-recommended}}"
+dry_run="${OPENSQUILLA_INSTALL_DRY_RUN:-0}"
 
-valid_extras=" feishu telegram dingtalk wecom qq msteams matrix matrix-e2e document-extras "
+is_release_version() {
+    [[ "$1" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]]
+}
+
+valid_extras=" feishu telegram dingtalk wecom qq matrix matrix-e2e document-extras "
 extras_csv="${OPENSQUILLA_INSTALL_EXTRAS:-}"
 if [[ -n "${cli_extras}" ]]; then
     extras_csv="${extras_csv}${extras_csv:+,}${cli_extras}"
 fi
 extras_csv="${extras_csv// /,}"
+
 raw_extras=()
 if [[ -n "${extras_csv}" ]]; then
     IFS=',' read -r -a raw_extras <<< "${extras_csv}"
 fi
+
 install_extras=()
-if (( ${#raw_extras[@]} > 0 )); then
-    for extra in "${raw_extras[@]}"; do
-        [[ -n "${extra}" ]] || continue
-        if [[ "${valid_extras}" != *" ${extra} "* ]]; then
-            echo "install.sh: unsupported extra '${extra}'." >&2
-            echo "install.sh: supported extras:${valid_extras}" >&2
-            exit 1
-        fi
-        duplicate=0
-        if (( ${#install_extras[@]} > 0 )); then
-            for existing in "${install_extras[@]}"; do
-                if [[ "${existing}" == "${extra}" ]]; then
-                    duplicate=1
-                    break
-                fi
-            done
-        fi
-        if [[ "${duplicate}" -eq 0 ]]; then
-            install_extras+=("${extra}")
+for extra in "${raw_extras[@]}"; do
+    [[ -n "${extra}" ]] || continue
+    if [[ "${valid_extras}" != *" ${extra} "* ]]; then
+        echo "install.sh: unsupported extra '${extra}'." >&2
+        echo "install.sh: supported extras:${valid_extras}" >&2
+        exit 1
+    fi
+    duplicate=0
+    for existing in "${install_extras[@]}"; do
+        if [[ "${existing}" == "${extra}" ]]; then
+            duplicate=1
+            break
         fi
     done
-fi
+    if [[ "${duplicate}" -eq 0 ]]; then
+        install_extras+=("${extra}")
+    fi
+done
 
 case "${profile}" in
     core|minimal)
@@ -117,130 +120,119 @@ case "${profile}" in
         exit 1
         ;;
 esac
+
 if (( ${#install_extras[@]} > 0 )); then
     target_extras+=("${install_extras[@]}")
 fi
+
 if (( ${#target_extras[@]} > 0 )); then
-    joined_extras="$(IFS=,; echo "${target_extras[*]}")"
-    install_target=".[${joined_extras}]"
+    package_name="opensquilla[$(IFS=,; echo "${target_extras[*]}")]"
 else
-    install_target="."
+    package_name="opensquilla"
 fi
 
-check_squilla_router_assets() {
-    local mode="${1:-strict}"
-    if [[ "${profile}" != "recommended" ]]; then
-        return 0
-    fi
+if [[ "${release_selector}" != "latest" && "${release_selector}" != "stable" ]] && ! is_release_version "${release_selector}"; then
+    echo "install.sh: unsupported OPENSQUILLA_VERSION='${release_selector}'." >&2
+    echo "install.sh: the release installer only supports latest, stable, or release versions like v0.2.0rc1." >&2
+    echo "install.sh: use git clone plus scripts/install_source.sh for main, dev, branch, or source installs." >&2
+    exit 1
+fi
 
-    local model_root="src/opensquilla/squilla_router/models"
-    local pointer_line="version https://git-lfs.github.com/spec/v1"
-    local required=(
-        "${model_root}/v4.2_phase3_inference/lgbm_main.bin"
-        "${model_root}/v4.2_phase3_inference/router.runtime.yaml"
-        "${model_root}/v4.2_phase3_inference/mlp/model.onnx"
-        "${model_root}/v4.2_phase3_inference/features/tfidf.pkl"
-        "${model_root}/v4.2_phase3_inference/bge_onnx/model.onnx"
-    )
-    local missing=()
-    local pointers=()
-    local path=""
-    for path in "${required[@]}"; do
-        if [[ ! -f "${path}" ]]; then
-            missing+=("${path}")
-            continue
-        fi
-        if LC_ALL=C grep -q -m 1 -F -x "${pointer_line}" "${path}" 2>/dev/null; then
-            pointers+=("${path}")
-        fi
-    done
-    if (( ${#missing[@]} > 0 || ${#pointers[@]} > 0 )); then
-        if [[ "${mode}" == "warn" ]]; then
-            echo "install.sh: dry-run note — real recommended install would fail until bundled squilla-router v4 assets are available in this checkout." >&2
-        else
-            echo "install.sh: bundled squilla-router v4 assets are unavailable in this checkout." >&2
-        fi
-        if (( ${#missing[@]} > 0 )); then
-            echo "install.sh: missing assets: ${missing[*]}" >&2
-        fi
-        if (( ${#pointers[@]} > 0 )); then
-            echo "install.sh: Git LFS pointer files detected: ${pointers[*]}" >&2
-        fi
-        echo 'install.sh: run `git lfs install` once, then:' >&2
-        echo 'install.sh:   git lfs pull --include="src/opensquilla/squilla_router/models/**"' >&2
-        echo 'install.sh: or retry with OPENSQUILLA_INSTALL_PROFILE=core for the minimal runtime.' >&2
-        if [[ "${mode}" == "warn" ]]; then
-            return 0
-        fi
+case "${release_selector}" in
+    latest|stable)
+        wheel_url="https://github.com/${repo_slug}/releases/latest/download/opensquilla-latest-py3-none-any.whl"
+        display_version="${release_selector}"
+        ;;
+    v*)
+        release_version="${release_selector#v}"
+        wheel_url="https://github.com/${repo_slug}/releases/download/${release_selector}/opensquilla-${release_version}-py3-none-any.whl"
+        display_version="${release_selector}"
+        ;;
+    *)
+        release_version="${release_selector}"
+        release_tag="v${release_version}"
+        wheel_url="https://github.com/${repo_slug}/releases/download/${release_tag}/opensquilla-${release_version}-py3-none-any.whl"
+        display_version="${release_tag}"
+        ;;
+esac
+
+install_spec="${package_name} @ ${wheel_url}"
+
+install_uv() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- https://astral.sh/uv/install.sh | sh
+    else
+        echo "install.sh: curl or wget is required to install uv." >&2
         exit 1
     fi
 }
 
-# --- installer selection ----------------------------------------------------
-
-installer=""
-install_args=()
-if command -v uv >/dev/null 2>&1; then
-    installer="uv"
-    install_args=(uv tool install --force --reinstall-package opensquilla "${install_target}")
-elif command -v python3 >/dev/null 2>&1; then
-    installer="pip"
-    install_args=(python3 -m pip install --user "${install_target}")
-else
-    echo "install.sh: neither 'uv' nor 'python3' is available on PATH." >&2
-    echo "install.sh: install uv (https://docs.astral.sh/uv/) or Python 3.12+ and retry." >&2
-    exit 1
-fi
-install_cmd="${install_args[*]}"
-
-# --- banner -----------------------------------------------------------------
-
-print_banner() {
-    cat <<BANNER
-----------------------------------------------------------------------------
-OpenSquilla installed via ${installer} -> ${prefix} (profile: ${profile})
-Extras: $(if (( ${#install_extras[@]} > 0 )); then IFS=,; echo "${install_extras[*]}"; else echo "none"; fi)
-
-Default gateway bind: 127.0.0.1:18790 (loopback only)
-Network exposure is opt-in only. To expose the gateway on the network you
-must use one of:
-  - CLI flag:  opensquilla gateway run --listen 0.0.0.0
-  - Env var:   OPENSQUILLA_LISTEN=0.0.0.0 opensquilla gateway run
-
-Reminder: only expose 0.0.0.0 behind a trusted reverse proxy or VPN. The
-gateway's first-class auth assumes loopback-scope by default.
-----------------------------------------------------------------------------
-BANNER
-}
-
-print_listen_warning() {
-    cat <<WARNING
-WARNING: you have selected network-exposed default - ensure you
-   understand the blast radius. The gateway will bind to 0.0.0.0 and be
-   reachable from every interface on this host.
-WARNING
-}
-
-if [[ "${dry_run}" = "1" ]]; then
-    echo "install.sh: dry-run — would run: ${install_cmd}"
-    echo "install.sh: dry-run — prefix: ${prefix}"
-    check_squilla_router_assets warn
-    print_banner
-    if [[ "${OPENSQUILLA_LISTEN:-}" = "0.0.0.0" ]]; then
-        print_listen_warning
+resolve_uv() {
+    if command -v uv >/dev/null 2>&1; then
+        command -v uv
+        return 0
     fi
+    if [[ -f "${HOME}/.local/bin/env" ]]; then
+        # shellcheck disable=SC1091
+        . "${HOME}/.local/bin/env"
+    fi
+    export PATH="${HOME}/.local/bin:${HOME}/.cargo/bin:${PATH:-}"
+    if command -v uv >/dev/null 2>&1; then
+        command -v uv
+        return 0
+    fi
+    return 1
+}
+
+if [[ "${dry_run}" == "1" ]]; then
+    echo "install.sh: dry-run - would install OpenSquilla ${display_version}"
+    echo "install.sh: dry-run - would run: uv tool install --python ${python_version} --force --reinstall-package opensquilla \"${install_spec}\""
     exit 0
 fi
 
-# --- execute ---------------------------------------------------------------
+uv_bin="$(resolve_uv || true)"
+if [[ -z "${uv_bin}" ]]; then
+    echo "install.sh: uv not found; installing uv first."
+    install_uv
+    uv_bin="$(resolve_uv || true)"
+fi
 
-check_squilla_router_assets
+if [[ -z "${uv_bin}" ]]; then
+    echo "install.sh: uv was not found after installation." >&2
+    echo "install.sh: restart your terminal or run '. \"\$HOME/.local/bin/env\"', then retry." >&2
+    exit 1
+fi
 
-echo "install.sh: installing via ${installer} into prefix ${prefix}"
-echo "install.sh: running: ${install_cmd}"
-"${install_args[@]}"
+echo "install.sh: installing OpenSquilla ${display_version} (${profile})"
+"${uv_bin}" tool install --python "${python_version}" --force --reinstall-package opensquilla "${install_spec}"
 
-print_banner
-if [[ "${OPENSQUILLA_LISTEN:-}" = "0.0.0.0" ]]; then
-    print_listen_warning
+tool_bin_dir="$("${uv_bin}" tool dir --bin 2>/dev/null || true)"
+
+cat <<DONE
+----------------------------------------------------------------------------
+OpenSquilla installed from ${display_version}.
+
+Next steps:
+  opensquilla onboard
+  opensquilla gateway run
+
+Default gateway bind: 127.0.0.1:18791 (loopback only).
+Do not expose the gateway on 0.0.0.0 unless it is behind a trusted reverse
+proxy or VPN.
+----------------------------------------------------------------------------
+DONE
+
+if [[ -n "${tool_bin_dir}" && ":${original_path}:" != *":${tool_bin_dir}:"* ]]; then
+    cat <<PATHNOTE
+
+PATH note:
+  Your current shell may not find 'opensquilla' until PATH is refreshed.
+  Run one of these, then retry the next steps:
+
+    . "\$HOME/.local/bin/env"
+    # or open a new terminal
+
+PATHNOTE
 fi

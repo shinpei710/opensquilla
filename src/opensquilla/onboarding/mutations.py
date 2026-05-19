@@ -30,6 +30,7 @@ from opensquilla.onboarding.redaction import (
     redact_search_payload,
 )
 from opensquilla.onboarding.search_specs import get_search_provider_setup_spec
+from opensquilla.secrets import clean_header_secret
 
 SearchFallbackPolicy = Literal["off", "network"]
 RouterMode = Literal["recommended", "openrouter-mix", "disabled"]
@@ -186,7 +187,7 @@ def upsert_llm_provider(
     # provider that already has one stored, treat that as "leave key
     # unchanged" — matches the WebUI's "leave blank to keep current"
     # password-field affordance.
-    effective_api_key = api_key
+    effective_api_key = clean_header_secret(api_key, label="LLM API key")
     if api_key and api_key_env.strip():
         raise ValueError("configure either api_key or api_key_env, not both")
     effective_api_key_env = "" if api_key else api_key_env.strip()
@@ -330,7 +331,7 @@ def upsert_search_provider(
         raise ValueError("fallback_policy must be 'off' or 'network'")
     fallback_policy_value = cast(SearchFallbackPolicy, fallback_policy)
 
-    effective_api_key = api_key
+    effective_api_key = clean_header_secret(api_key, label="Search API key")
     effective_api_key_env = "" if api_key else api_key_env.strip()
     if (
         not effective_api_key
@@ -429,7 +430,10 @@ def upsert_image_generation_provider(
     current_provider_cfg = _image_generation_provider_config(config, provider_id)
     if api_key and api_key_env.strip():
         raise ValueError("configure either api_key or api_key_env, not both")
-    effective_api_key = api_key or getattr(current_provider_cfg, "api_key", "")
+    effective_api_key = clean_header_secret(
+        api_key or getattr(current_provider_cfg, "api_key", ""),
+        label="Image API key",
+    )
     env_key = (
         ""
         if api_key

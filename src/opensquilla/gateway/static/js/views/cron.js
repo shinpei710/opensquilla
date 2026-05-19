@@ -12,6 +12,7 @@ const CronView = (() => {
   let _editingJob = null; // null = new, object = existing
   let _viewMode = 'cards'; // 'cards' | 'table'
   let _previewTimer = null;
+  let _reloadTimer = null;
 
   // Sort state
   let _sortCol = 'next_run';
@@ -86,6 +87,8 @@ const CronView = (() => {
             <label class="cron-field__label" for="cp-type">Schedule type</label>
             <select class="cron-field__input" id="cp-type">
               <option value="cron">Cron expression</option>
+              <option value="every">Fixed interval</option>
+              <option value="at">One-time ISO time</option>
             </select>
           </div>
 
@@ -112,17 +115,24 @@ const CronView = (() => {
           </div>
 
           <div class="cron-field" id="cp-at-row" hidden>
-            <label class="cron-field__label" for="cp-at">Time (HH:MM)</label>
-            <input class="cron-field__input" id="cp-at" type="text" placeholder="09:00">
+            <label class="cron-field__label" for="cp-at">ISO time</label>
+            <input class="cron-field__input cron-field__input--mono" id="cp-at" type="text" placeholder="2026-05-18T09:00:00+08:00">
+          </div>
+
+          <div class="cron-field" id="cp-tz-row">
+            <label class="cron-field__label" for="cp-tz">Timezone (IANA)</label>
+            <input class="cron-field__input cron-field__input--mono" id="cp-tz" type="text" placeholder="America/Los_Angeles" autocomplete="off" spellcheck="false">
+            <div class="cron-field__hint">Leave empty to evaluate the cron expression in UTC. Example: <code>Asia/Shanghai</code>, <code>Europe/London</code>.</div>
           </div>
 
           <div class="cron-field">
             <label class="cron-field__label" for="cp-payload-kind">Job mode</label>
             <select class="cron-field__input" id="cp-payload-kind">
-              <option value="system_event">Reminder / System Event (Main)</option>
+              <option value="reminder">Static Reminder (no model)</option>
               <option value="agent_turn">Background Agent Task (choose session)</option>
+              <option value="system_event">System Event (Main)</option>
             </select>
-            <div class="cron-field__hint" id="cp-job-mode-hint">Reminders post to Main. Agent tasks run in current, isolated, or named sessions.</div>
+            <div class="cron-field__hint" id="cp-job-mode-hint">Static reminders deliver text directly. Agent tasks run the model in current, isolated, or named sessions.</div>
           </div>
 
           <div class="cron-field">
@@ -151,6 +161,92 @@ const CronView = (() => {
             <label class="cron-field__label" for="cp-message" id="cp-message-label">Message / Prompt</label>
             <textarea class="cron-field__input cron-field__input--textarea" id="cp-message" rows="4" placeholder="Run daily report…"></textarea>
           </div>
+
+          <details class="cron-advanced" id="cp-advanced">
+            <summary class="cron-advanced__summary">Advanced delivery &amp; wake</summary>
+            <div class="cron-advanced__body">
+              <div class="cron-field">
+                <label class="cron-field__label" for="cp-wake-mode">Wake mode</label>
+                <select class="cron-field__input" id="cp-wake-mode">
+                  <option value="now">Now (fire immediately on schedule)</option>
+                  <option value="next-heartbeat">Next heartbeat (defer to main loop)</option>
+                </select>
+                <div class="cron-field__hint">Use <code>next-heartbeat</code> for main-session jobs that should ride the existing turn queue.</div>
+              </div>
+
+              <div class="cron-field">
+                <label class="cron-field__label" for="cp-delivery-mode">Delivery mode</label>
+                <select class="cron-field__input" id="cp-delivery-mode">
+                  <option value="">Default (inferred from session)</option>
+                  <option value="none">None (run silently)</option>
+                  <option value="announce">Announce to channel</option>
+                  <option value="webhook">Post to webhook</option>
+                </select>
+              </div>
+
+              <div class="cron-field" id="cp-delivery-channel-row" hidden>
+                <label class="cron-field__label" for="cp-delivery-channel">Channel</label>
+                <input class="cron-field__input" id="cp-delivery-channel" type="text" placeholder="slack" autocomplete="off">
+              </div>
+              <div class="cron-field" id="cp-delivery-to-row" hidden>
+                <label class="cron-field__label" for="cp-delivery-to">Recipient</label>
+                <input class="cron-field__input" id="cp-delivery-to" type="text" placeholder="C-team-alerts" autocomplete="off">
+              </div>
+              <div class="cron-field" id="cp-delivery-account-row" hidden>
+                <label class="cron-field__label" for="cp-delivery-account">Account id</label>
+                <input class="cron-field__input" id="cp-delivery-account" type="text" placeholder="" autocomplete="off">
+              </div>
+
+              <div class="cron-field" id="cp-delivery-webhook-url-row" hidden>
+                <label class="cron-field__label" for="cp-delivery-webhook-url">Webhook URL</label>
+                <input class="cron-field__input cron-field__input--mono" id="cp-delivery-webhook-url" type="url" placeholder="https://hooks.example/cron" autocomplete="off">
+              </div>
+              <div class="cron-field" id="cp-delivery-webhook-token-row" hidden>
+                <label class="cron-field__label" for="cp-delivery-webhook-token">Webhook bearer token</label>
+                <input class="cron-field__input" id="cp-delivery-webhook-token" type="password" placeholder="optional bearer token" autocomplete="off">
+              </div>
+
+              <label class="cron-toggle" id="cp-delivery-best-effort-row" hidden>
+                <input type="checkbox" id="cp-delivery-best-effort">
+                <span class="cron-toggle__track"><span class="cron-toggle__thumb"></span></span>
+                <span class="cron-toggle__label">Best-effort delivery (do not fail the job when delivery fails)</span>
+              </label>
+
+              <details class="cron-advanced cron-advanced--nested" id="cp-fd-fold">
+                <summary class="cron-advanced__summary">Failure destination</summary>
+                <div class="cron-advanced__body">
+                  <div class="cron-field">
+                    <label class="cron-field__label" for="cp-fd-mode">Route failures to</label>
+                    <select class="cron-field__input" id="cp-fd-mode">
+                      <option value="">Disabled (no separate failure alert)</option>
+                      <option value="channel">A channel</option>
+                      <option value="webhook">A webhook</option>
+                    </select>
+                  </div>
+                  <div class="cron-field" id="cp-fd-channel-row" hidden>
+                    <label class="cron-field__label" for="cp-fd-channel">Channel</label>
+                    <input class="cron-field__input" id="cp-fd-channel" type="text" placeholder="slack" autocomplete="off">
+                  </div>
+                  <div class="cron-field" id="cp-fd-to-row" hidden>
+                    <label class="cron-field__label" for="cp-fd-to">Recipient</label>
+                    <input class="cron-field__input" id="cp-fd-to" type="text" placeholder="C-ops-alerts" autocomplete="off">
+                  </div>
+                  <div class="cron-field" id="cp-fd-account-row" hidden>
+                    <label class="cron-field__label" for="cp-fd-account">Account id</label>
+                    <input class="cron-field__input" id="cp-fd-account" type="text" placeholder="" autocomplete="off">
+                  </div>
+                  <div class="cron-field" id="cp-fd-webhook-url-row" hidden>
+                    <label class="cron-field__label" for="cp-fd-webhook-url">Webhook URL</label>
+                    <input class="cron-field__input cron-field__input--mono" id="cp-fd-webhook-url" type="url" placeholder="https://hooks.example/alert" autocomplete="off">
+                  </div>
+                  <div class="cron-field" id="cp-fd-webhook-token-row" hidden>
+                    <label class="cron-field__label" for="cp-fd-webhook-token">Webhook bearer token</label>
+                    <input class="cron-field__input" id="cp-fd-webhook-token" type="password" placeholder="optional bearer token" autocomplete="off">
+                  </div>
+                </div>
+              </details>
+            </div>
+          </details>
 
           <label class="cron-toggle">
             <input type="checkbox" id="cp-enabled" checked>
@@ -184,6 +280,8 @@ const CronView = (() => {
         inp.focus();
       });
     });
+    _el.querySelector('#cp-delivery-mode').addEventListener('change', _onDeliveryModeChange);
+    _el.querySelector('#cp-fd-mode').addEventListener('change', _onFailureDestModeChange);
     _el.querySelector('#cron-search').addEventListener('input', (e) => {
       _searchText = e.target.value.toLowerCase();
       _renderTable();
@@ -211,7 +309,7 @@ const CronView = (() => {
       .catch(() => { /* subscription is best-effort */ });
 
     _unsubs.push(_rpc.on('cron.run.finished', () => {
-        _loadData();
+        _scheduleCronReload();
     }));
   }
 
@@ -225,6 +323,7 @@ const CronView = (() => {
     _intervals.forEach(id => clearInterval(id));
     _intervals = [];
     if (_previewTimer) { clearTimeout(_previewTimer); _previewTimer = null; }
+    if (_reloadTimer) { clearTimeout(_reloadTimer); _reloadTimer = null; }
     _jobs = [];
     _selectedId = null;
     _panelOpen = false;
@@ -245,6 +344,36 @@ const CronView = (() => {
     }).catch(err => UI.toast('Failed to load cron jobs: ' + err.message, 'err'));
   }
 
+  function _scheduleCronReload() {
+    _loadData();
+    if (_reloadTimer) clearTimeout(_reloadTimer);
+    _reloadTimer = setTimeout(_loadData, 750);
+  }
+
+  function _isUpcomingRun(j, now = Date.now()) {
+    if (!j || !j.enabled || !j.next_run) return false;
+    if (j.status === 'running') return false;
+    const ts = new Date(j.next_run);
+    return !isNaN(ts) && ts.getTime() > now;
+  }
+
+  function _nextRunText(j) {
+    if (!j || !j.enabled) return '—';
+    if (j.status === 'running') return 'running';
+    if (!j.next_run) return '—';
+    const ts = new Date(j.next_run);
+    if (isNaN(ts)) return '—';
+    if (ts.getTime() <= Date.now()) return 'awaiting update';
+    return _humanCountdown(ts);
+  }
+
+  function _nextRunAbs(j) {
+    if (!j || !j.enabled || j.status === 'running' || !j.next_run) return '';
+    const ts = new Date(j.next_run);
+    if (isNaN(ts) || ts.getTime() <= Date.now()) return '';
+    return _humanTime(ts);
+  }
+
   // ---- summary stats ---------------------------------------------------
 
   function _renderSummary() {
@@ -253,13 +382,12 @@ const CronView = (() => {
     const total = _jobs.length;
     const enabled = _jobs.filter(j => j.enabled).length;
     const paused = total - enabled;
-    const reminders = _jobs.filter(j => (j.payloadKind || j.payload_kind) === 'system_event').length;
-    const agentTasks = total - reminders;
+    const reminders = _jobs.filter(j => (j.payloadKind || j.payload_kind) === 'reminder').length;
+    const agentTasks = _jobs.filter(j => (j.payloadKind || j.payload_kind) === 'agent_turn').length;
 
     const next = _jobs
-      .filter(j => j.enabled && j.next_run)
+      .filter(j => _isUpcomingRun(j))
       .map(j => ({ job: j, ts: new Date(j.next_run) }))
-      .filter(o => !isNaN(o.ts))
       .sort((a, b) => a.ts - b.ts)[0];
 
     // Last 24h aggregate from in-memory job snapshots is best-effort —
@@ -304,9 +432,8 @@ const CronView = (() => {
   function _tick() {
     if (!_el) return;
     const next = _jobs
-      .filter(j => j.enabled && j.next_run)
+      .filter(j => _isUpcomingRun(j))
       .map(j => ({ job: j, ts: new Date(j.next_run) }))
-      .filter(o => !isNaN(o.ts))
       .sort((a, b) => a.ts - b.ts)[0];
 
     const cd = _el.querySelector('#cron-next-countdown');
@@ -335,9 +462,9 @@ const CronView = (() => {
     if (!root || !rail || !axis) return;
 
     const upcoming = _jobs
-      .filter(j => j.enabled && j.next_run)
+      .filter(j => _isUpcomingRun(j))
       .map(j => ({ job: j, ts: new Date(j.next_run).getTime() }))
-      .filter(o => !isNaN(o.ts) && (o.ts - Date.now()) < 12 * 3600 * 1000 && o.ts >= Date.now() - 60_000);
+      .filter(o => o.ts > Date.now() && (o.ts - Date.now()) < 12 * 3600 * 1000);
 
     if (upcoming.length === 0) {
       root.hidden = true;
@@ -388,7 +515,7 @@ const CronView = (() => {
     rail.querySelectorAll('[data-cron-marker]').forEach(node => {
       const ts = Number(node.dataset.ts);
       const left = ((ts - now) / span) * 100;
-      if (left < -1 || left > 101) {
+      if (left < 0 || left > 101) {
         node.style.display = 'none';
       } else {
         node.style.display = '';
@@ -468,16 +595,28 @@ const CronView = (() => {
     _bindRowEvents(content);
   }
 
+  function _jobKindLabel(job) {
+    const kind = job.payloadKind || job.payload_kind;
+    if (kind === 'reminder') return 'Reminder';
+    if (kind === 'system_event') return 'System event';
+    return 'Agent task';
+  }
+
+  function _jobKindClass(job) {
+    const kind = job.payloadKind || job.payload_kind;
+    return kind === 'reminder' ? 'is-reminder' : 'is-agent';
+  }
+
   function _cardHtml(j, i) {
     const enabled = !!j.enabled;
     const lastStatus = j.last_status || (j.last_run ? 'ok' : null);
     const lastRun = j.last_run ? _humanCountdownPast(new Date(j.last_run)) : '—';
-    const nextRun = j.next_run ? _humanCountdown(new Date(j.next_run)) : '—';
-    const nextAbs = j.next_run ? _humanTime(new Date(j.next_run)) : '';
+    const nextRun = _nextRunText(j);
+    const nextAbs = _nextRunAbs(j);
     const schedule = _esc(j.expression || j.schedule || '—');
     const human = _explainCron(j.expression || '') || '';
-    const kind = (j.payloadKind || j.payload_kind) === 'system_event' ? 'Reminder' : 'Agent task';
-    const kindClass = (j.payloadKind || j.payload_kind) === 'system_event' ? 'is-reminder' : 'is-agent';
+    const kind = _jobKindLabel(j);
+    const kindClass = _jobKindClass(j);
     const target = j.sessionTarget || j.session_target || '—';
     const selected = _selectedId === j.id ? ' is-selected' : '';
     const dotClass = !enabled ? 'is-off' : (lastStatus === 'error' || lastStatus === 'fail') ? 'is-error' : 'is-on';
@@ -536,10 +675,10 @@ const CronView = (() => {
       const enabled = !!j.enabled;
       const lastStatus = j.last_status;
       const lastRun = j.last_run ? _humanCountdownPast(new Date(j.last_run)) : '—';
-      const nextRun = j.next_run ? _humanCountdown(new Date(j.next_run)) : '—';
+      const nextRun = _nextRunText(j);
       const schedule = _esc(j.expression || j.schedule || '—');
-      const kind = (j.payloadKind || j.payload_kind) === 'system_event' ? 'Reminder' : 'Agent task';
-      const kindClass = (j.payloadKind || j.payload_kind) === 'system_event' ? 'is-reminder' : 'is-agent';
+      const kind = _jobKindLabel(j);
+      const kindClass = _jobKindClass(j);
       const target = j.sessionTarget || j.session_target || '—';
       const dotClass = !enabled ? 'is-off' : (lastStatus === 'error' || lastStatus === 'fail') ? 'is-error' : 'is-on';
       const sel = _selectedId === j.id ? ' is-selected' : '';
@@ -687,7 +826,7 @@ const CronView = (() => {
       <button class="btn btn--primary cron-empty__cta" data-cron-empty-create>${icons.plus()}<span>Create your first schedule</span></button>
       <div class="cron-empty__hints">
         <span class="cron-empty__hints-label">Try a preset</span>
-        <button class="cron-empty-hint" data-cron-empty-template='{"name":"Daily standup nudge","expression":"0 9 * * 1-5","payloadKind":"system_event","message":"Good morning! Time for standup."}'>
+        <button class="cron-empty-hint" data-cron-empty-template='{"name":"Daily standup nudge","expression":"0 9 * * 1-5","payloadKind":"reminder","message":"Good morning! Time for standup."}'>
           <code>0 9 * * 1-5</code>
           <span>Weekday morning reminder</span>
         </button>
@@ -795,12 +934,14 @@ const CronView = (() => {
     const tpl = template || {};
     const name = job ? (job.name || '') : (tpl.name || '');
     const message = job ? (job.message || job.prompt || '') : (tpl.message || '');
+    const scheduleKind = job ? (job.scheduleKind || job.schedule_kind || 'cron')
+      : (tpl.scheduleKind || tpl.schedule_kind || 'cron');
     const expression = job ? (job.expression || '') : (tpl.expression || '');
     const activeSessionKey = _activeChatSessionKey();
     const payloadKind = job ? (job.payloadKind || 'agent_turn')
-      : (tpl.payloadKind || (activeSessionKey ? 'agent_turn' : 'system_event'));
+      : (tpl.payloadKind || 'reminder');
     const sessionTarget = job ? (job.sessionTarget || job.session_target || 'isolated')
-      : (tpl.sessionTarget || (activeSessionKey ? 'current' : 'main'));
+      : (tpl.sessionTarget || (payloadKind === 'system_event' ? 'main' : 'isolated'));
     const targetSessionKey = job ? _jobSessionKey(job) : (tpl.targetSessionKey || activeSessionKey || '');
 
     _el.querySelector('#cp-name').value = name;
@@ -810,11 +951,20 @@ const CronView = (() => {
     _el.querySelector('#cp-payload-kind').value = payloadKind;
     _el.querySelector('#cp-session-target').value = sessionTarget;
     _el.querySelector('#cp-target-session-key').value = targetSessionKey;
-    _el.querySelector('#cp-type').value = 'cron';
+    _el.querySelector('#cp-type').value = scheduleKind;
     _el.querySelector('#cp-cron').value = expression;
-    _el.querySelector('#cp-every').value = job ? (job.every_seconds || '') : '';
-    _el.querySelector('#cp-at').value = job ? (job.at_time || '') : '';
+    _el.querySelector('#cp-every').value = scheduleKind === 'every'
+      ? (job ? (job.scheduleRaw || job.schedule_raw || '') : (tpl.every_seconds || ''))
+      : '';
+    _el.querySelector('#cp-at').value = scheduleKind === 'at'
+      ? (job ? (job.scheduleRaw || job.schedule_raw || '') : (tpl.at || ''))
+      : '';
+    _el.querySelector('#cp-tz').value = job ? (job.tz || '') : (tpl.tz || '');
+    _el.querySelector('#cp-wake-mode').value = job ? (job.wakeMode || job.wake_mode || 'now') : (tpl.wakeMode || 'now');
+    _populateDeliveryFields(job);
     _onTypeChange();
+    _onDeliveryModeChange();
+    _onFailureDestModeChange();
     _renderCronExplain(expression);
 
     panel.hidden = false;
@@ -856,10 +1006,19 @@ const CronView = (() => {
     if (payloadKind === 'system_event') {
       targetSelect.value = 'main';
       targetSelect.disabled = true;
-      targetSelect.title = 'Reminder / System Event jobs always write to the agent main session.';
-      if (modeHint) modeHint.textContent = 'Reminder events are appended to this agent main session.';
-      if (targetHint) targetHint.textContent = 'Main is locked for reminders. Use Background Agent Task for current, isolated, or named sessions.';
-      if (targetSessionHint) targetSessionHint.textContent = 'Session keys are only used by Background Agent Task jobs.';
+      targetSelect.title = 'System events always write to the agent main session.';
+      if (modeHint) modeHint.textContent = 'System events append text to the agent main session and wake the heartbeat.';
+      if (targetHint) targetHint.textContent = 'Main is locked for system events. Use Static Reminder for direct reminders.';
+      if (targetSessionHint) targetSessionHint.textContent = 'Session keys are only used by Static Reminder and Background Agent Task jobs.';
+      _el.querySelector('#cp-message-label').textContent = 'Event text';
+      _el.querySelector('#cp-target-session-row').hidden = true;
+    } else if (payloadKind === 'reminder') {
+      targetSelect.value = 'isolated';
+      targetSelect.disabled = true;
+      targetSelect.title = 'Static reminders deliver text directly without creating a scheduled model turn.';
+      if (modeHint) modeHint.textContent = 'Static reminders deliver this message directly; no model call or scheduled agent turn is created.';
+      if (targetHint) targetHint.textContent = 'Static reminders run isolated and deliver back to the originating chat when one is available.';
+      if (targetSessionHint) targetSessionHint.textContent = 'Origin session is bound automatically from the active chat when saved.';
       _el.querySelector('#cp-message-label').textContent = 'Reminder text';
       _el.querySelector('#cp-target-session-row').hidden = true;
     } else {
@@ -894,6 +1053,127 @@ const CronView = (() => {
     }
   }
 
+  function _onDeliveryModeChange() {
+    const mode = _el.querySelector('#cp-delivery-mode').value;
+    const isAnnounce = mode === 'announce';
+    const isWebhook = mode === 'webhook';
+    const showAny = isAnnounce || isWebhook;
+    _el.querySelector('#cp-delivery-channel-row').hidden = !isAnnounce;
+    _el.querySelector('#cp-delivery-to-row').hidden = !isAnnounce;
+    _el.querySelector('#cp-delivery-account-row').hidden = !isAnnounce;
+    _el.querySelector('#cp-delivery-webhook-url-row').hidden = !isWebhook;
+    _el.querySelector('#cp-delivery-webhook-token-row').hidden = !isWebhook;
+    _el.querySelector('#cp-delivery-best-effort-row').hidden = !showAny;
+  }
+
+  function _onFailureDestModeChange() {
+    const mode = _el.querySelector('#cp-fd-mode').value;
+    const isChannel = mode === 'channel';
+    const isWebhook = mode === 'webhook';
+    _el.querySelector('#cp-fd-channel-row').hidden = !isChannel;
+    _el.querySelector('#cp-fd-to-row').hidden = !isChannel;
+    _el.querySelector('#cp-fd-account-row').hidden = !isChannel;
+    _el.querySelector('#cp-fd-webhook-url-row').hidden = !isWebhook;
+    _el.querySelector('#cp-fd-webhook-token-row').hidden = !isWebhook;
+  }
+
+  function _populateDeliveryFields(job) {
+    const d = (job && job.delivery) || {};
+    const mode = (d.mode || '').toLowerCase();
+    // 'none' from the wire is a real user choice; '' / null means "inferred".
+    const uiMode =
+      mode === 'webhook' ? 'webhook'
+      : mode === 'announce' || mode === 'channel' ? 'announce'
+      : mode === 'none' ? 'none'
+      : '';
+    _el.querySelector('#cp-delivery-mode').value = uiMode;
+    _el.querySelector('#cp-delivery-channel').value = d.channelName || '';
+    _el.querySelector('#cp-delivery-to').value = d.to || d.channelId || '';
+    _el.querySelector('#cp-delivery-account').value = d.accountId || '';
+    _el.querySelector('#cp-delivery-webhook-url').value = d.webhookUrl || '';
+    _el.querySelector('#cp-delivery-webhook-token').value = '';
+    _el.querySelector('#cp-delivery-best-effort').checked = !!d.bestEffort;
+
+    const fd = d.failureDestination || {};
+    const fdMode = (fd.mode || '').toLowerCase();
+    const uiFdMode =
+      fdMode === 'webhook' ? 'webhook'
+      : fdMode === 'channel' || fdMode === 'announce' ? 'channel'
+      : '';
+    _el.querySelector('#cp-fd-mode').value = uiFdMode;
+    _el.querySelector('#cp-fd-channel').value = fd.channelName || '';
+    _el.querySelector('#cp-fd-to').value = fd.to || fd.channelId || '';
+    _el.querySelector('#cp-fd-account').value = fd.accountId || '';
+    _el.querySelector('#cp-fd-webhook-url').value = fd.webhookUrl || '';
+    _el.querySelector('#cp-fd-webhook-token').value = '';
+  }
+
+  function _buildDeliveryFromForm() {
+    const mode = _el.querySelector('#cp-delivery-mode').value;
+    const fdMode = _el.querySelector('#cp-fd-mode').value;
+    const bestEffort = _el.querySelector('#cp-delivery-best-effort').checked;
+    if (!mode && !fdMode) return null;
+
+    const fd = _buildFailureDestinationFromForm();
+
+    if (mode === 'none') {
+      const out = { mode: 'none' };
+      if (fd) out.failureDestination = fd;
+      return out;
+    }
+    if (mode === 'webhook') {
+      const url = _el.querySelector('#cp-delivery-webhook-url').value.trim();
+      if (!url) { UI.toast('Webhook URL is required for webhook delivery', 'warn'); return undefined; }
+      const out = { mode: 'webhook', webhookUrl: url };
+      const tok = _el.querySelector('#cp-delivery-webhook-token').value.trim();
+      if (tok) out.webhookToken = tok;
+      if (bestEffort) out.bestEffort = true;
+      if (fd) out.failureDestination = fd;
+      return out;
+    }
+    if (mode === 'announce') {
+      const out = { mode: 'announce' };
+      const ch = _el.querySelector('#cp-delivery-channel').value.trim();
+      const to = _el.querySelector('#cp-delivery-to').value.trim();
+      const acct = _el.querySelector('#cp-delivery-account').value.trim();
+      if (ch) out.channelName = ch.toLowerCase();
+      if (to) out.to = to;
+      if (acct) out.accountId = acct;
+      if (bestEffort) out.bestEffort = true;
+      if (fd) out.failureDestination = fd;
+      return out;
+    }
+    // mode is empty but fd is set → standalone failure-destination patch.
+    if (fd) return { failureDestination: fd };
+    return null;
+  }
+
+  function _buildFailureDestinationFromForm() {
+    const mode = _el.querySelector('#cp-fd-mode').value;
+    if (!mode) return null;
+    if (mode === 'webhook') {
+      const url = _el.querySelector('#cp-fd-webhook-url').value.trim();
+      if (!url) { UI.toast('Failure-destination webhook URL is required', 'warn'); return undefined; }
+      const out = { mode: 'webhook', webhookUrl: url };
+      const tok = _el.querySelector('#cp-fd-webhook-token').value.trim();
+      if (tok) out.webhookToken = tok;
+      return out;
+    }
+    // channel mode
+    const ch = _el.querySelector('#cp-fd-channel').value.trim();
+    const to = _el.querySelector('#cp-fd-to').value.trim();
+    const acct = _el.querySelector('#cp-fd-account').value.trim();
+    if (!ch && !to) {
+      UI.toast('Failure destination channel needs a channel or recipient', 'warn');
+      return undefined;
+    }
+    const out = { mode: 'channel' };
+    if (ch) out.channelName = ch.toLowerCase();
+    if (to) out.to = to;
+    if (acct) out.accountId = acct;
+    return out;
+  }
+
   function _saveJob() {
     const name = _el.querySelector('#cp-name').value.trim();
     if (!name) { UI.toast('Name is required', 'warn'); return; }
@@ -904,12 +1184,40 @@ const CronView = (() => {
     const agentId = _el.querySelector('#cp-agent-id').value.trim() || 'main';
     const sessionTarget = payloadKind === 'system_event'
       ? 'main'
-      : _el.querySelector('#cp-session-target').value;
+      : payloadKind === 'reminder'
+        ? 'isolated'
+        : _el.querySelector('#cp-session-target').value;
     const targetSessionKey = _el.querySelector('#cp-target-session-key').value.trim();
 
     const payload = { name, enabled, payloadKind, agentId, sessionTarget, text: message };
-    if (type !== 'cron') { UI.toast('Only cron expressions are supported currently', 'warn'); return; }
-    payload.expression = _el.querySelector('#cp-cron').value.trim();
+    if (type === 'cron') {
+      payload.schedule = { kind: 'cron', expr: _el.querySelector('#cp-cron').value.trim() };
+    } else if (type === 'every') {
+      const everySeconds = Number(_el.querySelector('#cp-every').value);
+      if (!Number.isInteger(everySeconds) || everySeconds < 1) {
+        UI.toast('Interval must be an integer number of seconds', 'warn');
+        return;
+      }
+      payload.schedule = { kind: 'every', every_seconds: everySeconds };
+    } else if (type === 'at') {
+      const at = _el.querySelector('#cp-at').value.trim();
+      if (!at) { UI.toast('ISO time is required', 'warn'); return; }
+      payload.schedule = { kind: 'at', at };
+    }
+
+    const tz = _el.querySelector('#cp-tz').value.trim();
+    if (tz) {
+      payload.tz = tz;
+      if (payload.schedule && payload.schedule.kind === 'cron') payload.schedule.tz = tz;
+    }
+
+    const wakeMode = _el.querySelector('#cp-wake-mode').value;
+    if (wakeMode && wakeMode !== 'now') payload.wakeMode = wakeMode;
+
+    const delivery = _buildDeliveryFromForm();
+    if (delivery === undefined) return; // validation toast already emitted
+    if (delivery !== null) payload.delivery = delivery;
+
     if (sessionTarget === 'current') {
       const boundSessionKey =
         targetSessionKey || _activeChatSessionKey() || _jobSessionKey(_editingJob);
@@ -917,6 +1225,9 @@ const CronView = (() => {
       payload.sessionKey = boundSessionKey;
       payload.targetSessionKey = boundSessionKey;
       payload.originSessionKey = boundSessionKey;
+    }
+    if (payloadKind === 'reminder' && _activeChatSessionKey()) {
+      payload.originSessionKey = _activeChatSessionKey();
     }
     if (sessionTarget === 'session') {
       if (!targetSessionKey) { UI.toast('Named session key is required', 'warn'); return; }

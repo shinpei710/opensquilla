@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from opensquilla.execution_status import ExecutionStatus
+
 # ---------------------------------------------------------------------------
 # Stream event dataclasses
 # ---------------------------------------------------------------------------
@@ -203,6 +205,7 @@ class ChatConfig(BaseModel):
     cache_mode: Literal["off", "auto", "on"] = "off"
     model_capabilities: ModelCapabilities | None = None
     thinking_level: Any | None = None
+    provider_request_max_chars: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +230,7 @@ class ContentBlockToolResult(BaseModel):
     tool_use_id: str
     content: str | list[Any]
     is_error: bool = False
+    execution_status: ExecutionStatus | None = None
 
 
 class ContentBlockImage(BaseModel):

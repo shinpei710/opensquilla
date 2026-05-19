@@ -17,42 +17,47 @@ import contextlib
 import inspect
 import json
 import re
-import shutil
-import tempfile
 import weakref
-from collections.abc import AsyncIterator, Callable, Iterator
-from pathlib import Path
+from collections.abc import AsyncIterator, Callable
 from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
 from opensquilla.agents.scope import resolve_agent_model
-from opensquilla.artifacts import ArtifactStore, artifact_payload
+from opensquilla.artifacts import artifact_payload
 from opensquilla.channels._util import ChannelAccessPolicy, evaluate_policy
+from opensquilla.channels.artifact_delivery import (
+    artifact_delivery_key as _artifact_delivery_key,
+)
+from opensquilla.channels.artifact_delivery import (
+    artifact_fallback_lines as _artifact_fallback_lines,
+)
+from opensquilla.channels.artifact_delivery import (
+    can_deliver_channel_files as _can_deliver_channel_files,
+)
+from opensquilla.channels.artifact_delivery import (
+    deliver_artifacts_as_channel_files as _deliver_artifacts_as_channel_files,
+)
+from opensquilla.channels.artifact_delivery import (
+    strip_artifact_markers_from_channel_text as _strip_artifact_markers_from_channel_text,
+)
+from opensquilla.channels.artifact_delivery import (
+    strip_delivered_artifact_image_references as _strip_delivered_artifact_image_references,
+)
 from opensquilla.channels.stream_policy import resolve_channel_stream_policy
 from opensquilla.channels.types import IncomingMessage, OutgoingMessage
 from opensquilla.engine.start_turn import start_turn_via_runtime
 from opensquilla.engine.types import ArtifactEvent, ErrorEvent, RunHeartbeatEvent, TextDeltaEvent
 from opensquilla.gateway.attachment_ingest import AttachmentIngestResult, ingest_attachments
+from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.paths import media_root_from_config
+from opensquilla.permissions import configured_default_elevated
 from opensquilla.session.terminal_reply import build_terminal_reply
 
 if TYPE_CHECKING:
     from opensquilla.gateway.event_bridge import EventBridge
 
 log = structlog.get_logger(__name__)
-
-_ARTIFACT_MARKER_RE = re.compile(
-    r"[ \t]*\[generated artifact omitted:[^\]\r\n]*\][ \t]*",
-    re.MULTILINE,
-)
-_MARKDOWN_IMAGE_LINE_RE = re.compile(
-    r"^\s*!\[[^\]\r\n]*\]\((?P<target>[^)\r\n]+)\)\s*$"
-)
-_LOOSE_IMAGE_LINE_RE = re.compile(
-    r"^\s*![^\r\n]*\((?P<target>[^)\r\n]+\.(?:png|jpe?g|gif|webp))\)\s*$",
-    re.IGNORECASE,
-)
 
 
 def _terminal_payload_from_exception(exc: BaseException) -> dict[str, str]:
@@ -89,6 +94,29 @@ def _emit_metric(name: str, value: int = 1, **labels: Any) -> None:
     local copy to avoid a routing→task_runtime→channel_dispatch import cycle.
     """
     log.info(name, metric=name, value=value, **labels)
+
+
+def _resolve_channel_overflow_policy(channel: Any, config: Any) -> str | None:
+    """Resolve the per-channel overflow policy override (if any).
+
+    Reads ``config.task_runtime.pending_overflow_policy_per_channel`` keyed
+    by ``channel.channel_id``. Returns ``None`` when the channel has no
+    explicit override so ``runtime.enqueue`` falls back to its constructor
+    default (typically the global ``pending_overflow_policy``).
+    """
+    if config is None:
+        return None
+    runtime_cfg = getattr(config, "task_runtime", None)
+    overrides = getattr(runtime_cfg, "pending_overflow_policy_per_channel", None)
+    if not overrides:
+        return None
+    channel_id = getattr(channel, "channel_id", None)
+    if not isinstance(channel_id, str) or not channel_id:
+        return None
+    value = overrides.get(channel_id)
+    if not isinstance(value, str) or not value:
+        return None
+    return value
 
 
 class _ChannelInFlightSet:
@@ -170,17 +198,52 @@ def _compute_channel_cap(config: Any) -> int:
 _DIRECTIVE_TAG_RE = re.compile(
     r"\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*"
 )
+_INTERNAL_COMPACTION_MARKER_RE = re.compile(
+    r"(?m)^[ \t]*\["
+    r"(?:opensquilla_compacted:[^\]\r\n]*|"
+    r"provider_request_[^\]\r\n]*compacted:[^\]\r\n]*)"
+    r"\][ \t]*(?:\r?\n)?"
+    r"|\[(?:opensquilla_compacted:[^\]\r\n]*|"
+    r"provider_request_[^\]\r\n]*compacted:[^\]\r\n]*)\]"
+)
+_INTERNAL_COMPACTION_MARKER_PREFIXES = (
+    "[opensquilla_compacted:",
+    "[provider_request_",
+)
 _DIRECTIVE_TAG_BUFFER_LIMIT = 256
 _DEFAULT_STREAM_HEARTBEAT_INTERVAL_SECONDS = 15.0
-_DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS = 180.0
+_DEFAULT_STREAM_IDLE_TIMEOUT_SECONDS = 600.0
 
 
 def _strip_inline_directive_tags(content: str) -> str:
     return _DIRECTIVE_TAG_RE.sub("", content)
 
 
+def _strip_internal_compaction_markers(content: str) -> str:
+    return _INTERNAL_COMPACTION_MARKER_RE.sub("", content)
+
+
+def _split_pending_internal_compaction_marker(content: str) -> tuple[str, str]:
+    start = content.rfind("[")
+    if start == -1:
+        return content, ""
+    suffix = content[start:]
+    if "\n" in suffix or "\r" in suffix or "]" in suffix:
+        return content, ""
+    if len(suffix) > _DIRECTIVE_TAG_BUFFER_LIMIT:
+        return content, ""
+    if any(
+        prefix.startswith(suffix) or suffix.startswith(prefix)
+        for prefix in _INTERNAL_COMPACTION_MARKER_PREFIXES
+    ):
+        return content[:start], suffix
+    return content, ""
+
+
 def _sanitize_outgoing_message(message: OutgoingMessage) -> OutgoingMessage:
-    cleaned = _strip_inline_directive_tags(message.content)
+    cleaned = _strip_internal_compaction_markers(
+        _strip_inline_directive_tags(message.content)
+    )
     if cleaned == message.content:
         return message
     return message.model_copy(update={"content": cleaned})
@@ -195,9 +258,16 @@ class _DirectiveTagStreamSanitizer:
     def clean(self, chunk: str) -> str:
         text = self._pending + chunk
         self._pending = ""
-        cleaned = _strip_inline_directive_tags(text)
+        cleaned = _strip_internal_compaction_markers(
+            _strip_inline_directive_tags(text)
+        )
         start = cleaned.rfind("[[")
         if start == -1:
+            cleaned, pending_marker = _split_pending_internal_compaction_marker(
+                cleaned
+            )
+            if pending_marker:
+                self._pending = pending_marker
             return cleaned
         suffix = cleaned[start:]
         if (
@@ -207,12 +277,16 @@ class _DirectiveTagStreamSanitizer:
         ):
             self._pending = suffix
             return cleaned[:start]
+        cleaned, pending_marker = _split_pending_internal_compaction_marker(cleaned)
+        if pending_marker:
+            self._pending = pending_marker
+            return cleaned
         return cleaned
 
     def flush(self) -> str:
         pending = self._pending
         self._pending = ""
-        return _strip_inline_directive_tags(pending)
+        return _strip_internal_compaction_markers(_strip_inline_directive_tags(pending))
 
 
 def _accepts_keyword_arg(callable_obj: Any, name: str) -> bool:
@@ -305,7 +379,7 @@ async def run_channel_dispatch(
                 key: str = session_key,
                 _ifl: _ChannelInFlightSet = cast(_ChannelInFlightSet, _in_flight),
             ) -> None:
-                await _dispatch_combined_message_after_debounce(channel, combined, turn_runner, session_manager, key, session_prefix, task_runtime, config, event_bridge, _ifl)  # noqa: E501
+                await _dispatch_combined_message_after_debounce(channel, combined, turn_runner, session_manager, key, session_prefix, task_runtime, config, event_bridge, _ifl, channel_rpc_context_factory=channel_rpc_context_factory)  # noqa: E501
 
             await debounce_coordinator.schedule(session_key, msg, window_s=debounce_window_s, on_fire=_on_debounce_fire)  # noqa: E501
             continue
@@ -390,6 +464,17 @@ async def run_channel_dispatch(
             # concurrent senders cannot interleave between the two steps.
             try:
                 async with _maybe_lock(session_lock):
+                    channel_overflow_policy = _resolve_channel_overflow_policy(
+                        channel, config
+                    )
+                    if channel_overflow_policy is not None:
+                        apply_policy = getattr(
+                            task_runtime, "apply_overflow_policy", None
+                        )
+                        if callable(apply_policy):
+                            await apply_policy(
+                                session_key, policy=channel_overflow_policy
+                            )
                     handle = await start_turn_via_runtime(
                         task_runtime,
                         route_envelope,
@@ -427,7 +512,7 @@ async def run_channel_dispatch(
             else:
                 await status_reactor.running(msg)
 
-                typing_task = _start_typing_keepalive(channel)
+                typing_task = _start_typing_keepalive(channel, msg)
 
                 async def _reply_task_body(
                     _channel: Any = channel,
@@ -495,7 +580,7 @@ async def run_channel_dispatch(
             continue
 
         # Gap 3: Start typing indicator (background task)
-        typing_task = _start_typing_keepalive(channel)
+        typing_task = _start_typing_keepalive(channel, msg)
         try:
             # Gap 4: Run agent turn with streaming (or batch fallback)
             await _run_turn_with_streaming(
@@ -629,7 +714,7 @@ async def _dispatch_channel_new_command(
 
 
 # fmt: off
-async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any, turn_runner: Any, session_manager: Any, session_key: str, session_prefix: str, task_runtime: Any, config: Any = None, event_bridge: EventBridge | None = None, _in_flight: _ChannelInFlightSet | None = None) -> None:  # noqa: E501
+async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any, turn_runner: Any, session_manager: Any, session_key: str, session_prefix: str, task_runtime: Any, config: Any = None, event_bridge: EventBridge | None = None, _in_flight: _ChannelInFlightSet | None = None, channel_rpc_context_factory: Callable[[Any], Any] | None = None) -> None:  # noqa: E501
     from opensquilla.gateway.routing import build_channel_route_envelope
 
     msg = combined.message
@@ -638,6 +723,9 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
     session_lock = _get_lock(session_key) if callable(_get_lock) else None
     async with _maybe_lock(session_lock):
         await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
+
+        if _should_skip_unmentioned(channel, msg, session_key):
+            return
 
     ingested = await _ingest_channel_message_attachments(channel=channel, msg=msg)
 
@@ -684,6 +772,11 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
     # Reservation is released in the finally block below regardless of outcome.
     try:
         async with _maybe_lock(session_lock):
+            channel_overflow_policy = _resolve_channel_overflow_policy(channel, config)
+            if channel_overflow_policy is not None:
+                apply_policy = getattr(task_runtime, "apply_overflow_policy", None)
+                if callable(apply_policy):
+                    await apply_policy(session_key, policy=channel_overflow_policy)
             handle = await start_turn_via_runtime(task_runtime, route_envelope, msg.content, attachments=ingested.attachments, mode="followup", run_kind="channel_turn", semantic_message=raw_content, stream_event_sink=stream_relay.emit if stream_relay is not None else None)  # noqa: E501
             _persisted, persisted_content = await _append_channel_user_message(
                 session_manager=session_manager,
@@ -714,7 +807,7 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         _in_flight.release(_reservation_token)
 
     await status_reactor.running(msg)
-    typing_task = _start_typing_keepalive(channel)
+    typing_task = _start_typing_keepalive(channel, msg)
     try:
         await _deliver_runtime_channel_reply(channel=channel, task_runtime=task_runtime, session_manager=session_manager, session_key=session_key, task_id=handle.task_id, route_envelope=route_envelope, inbound=msg, transcript_watermark=transcript_watermark, config=config, stream_relay=stream_relay)  # noqa: E501
     finally:
@@ -902,7 +995,11 @@ def _should_skip_unmentioned(
 # ── Gap 3: Typing indicator ──────────────────────────────────────────────
 
 
-def _start_typing_keepalive(channel: Any, interval: float = 8.0) -> asyncio.Task | None:
+def _start_typing_keepalive(
+    channel: Any,
+    inbound: IncomingMessage | None = None,
+    interval: float = 8.0,
+) -> asyncio.Task | None:
     """Start a background task that re-sends typing every ``interval`` seconds.
 
     Uses ``asyncio.create_task`` so typing continues even during long tool calls
@@ -920,7 +1017,10 @@ def _start_typing_keepalive(channel: Any, interval: float = 8.0) -> asyncio.Task
     async def _keepalive() -> None:
         while True:
             try:
-                await send_typing()
+                if inbound is not None and _accepts_keyword_arg(send_typing, "channel_id"):
+                    await send_typing(channel_id=inbound.channel_id)
+                else:
+                    await send_typing()
             except Exception:
                 pass  # typing is best-effort, never crash the loop
             await asyncio.sleep(interval)
@@ -1040,6 +1140,7 @@ async def _run_turn_with_streaming(
         is_owner=_is_channel_admin_sender(config, envelope),
         workspace_dir=str(workspace_dir),
         workspace_strict=workspace_strict,
+        default_elevated=configured_default_elevated(config),
     )
     use_streaming = resolve_channel_stream_policy(channel).relay_stream
 
@@ -1093,9 +1194,44 @@ def _streaming_reply_kwargs(channel: Any, msg: IncomingMessage) -> dict[str, Any
 
 _STREAM_DONE = object()
 
+# Coalescing window for consecutive text deltas in the relay queue. The
+# relay yields a batched chunk once either threshold is reached. Both
+# defaults are 0 so the relay preserves its historical one-chunk-per-delta
+# behaviour out of the box; tuning either via ``config.task_runtime``
+# enables coalescing for adapters that incur a per-call cost on
+# ``send_streaming`` updates.
+_STREAM_RELAY_DEFAULT_COALESCE_MS = 0.0
+_STREAM_RELAY_DEFAULT_COALESCE_CHARS = 0
+
+
+def _resolve_stream_relay_coalesce(config: Any) -> tuple[float, int]:
+    """Return ``(window_seconds, char_threshold)`` for stream relay batching.
+
+    ``None`` config or absent fields fall back to the module defaults so
+    legacy call sites (tests, embedded use) keep their historical behaviour.
+    """
+    window_ms = _STREAM_RELAY_DEFAULT_COALESCE_MS
+    char_threshold = _STREAM_RELAY_DEFAULT_COALESCE_CHARS
+    runtime_cfg = getattr(config, "task_runtime", None) if config is not None else None
+    cfg_window = getattr(runtime_cfg, "stream_relay_coalesce_ms", None)
+    if isinstance(cfg_window, int | float) and cfg_window >= 0:
+        window_ms = float(cfg_window)
+    cfg_chars = getattr(runtime_cfg, "stream_relay_coalesce_chars", None)
+    if isinstance(cfg_chars, int) and cfg_chars >= 0:
+        char_threshold = cfg_chars
+    return window_ms / 1000.0, char_threshold
+
 
 class _RuntimeChannelStreamRelay:
-    """Bridge one runtime task's stream events into a channel streaming adapter."""
+    """Bridge one runtime task's stream events into a channel streaming adapter.
+
+    The relay coalesces consecutive text deltas into larger chunks before
+    handing them to ``send_streaming`` — adapters that incur a per-call cost
+    (rate-limited message edits, network round trips) benefit from batching
+    micro-deltas.  When ``send_streaming`` fails mid-stream the relay falls
+    back to a single ``channel.send`` carrying the not-yet-delivered text so
+    the user still sees the rest of the reply.
+    """
 
     def __init__(self, channel: Any, inbound: IncomingMessage, config: Any = None) -> None:
         self._channel = channel
@@ -1108,6 +1244,14 @@ class _RuntimeChannelStreamRelay:
         self._closed = False
         self.text_emitted = False
         self.stream_error: BaseException | None = None
+        # Buffer of chunks already yielded to ``send_streaming``. If the
+        # adapter raises mid-stream the relay falls back to ``channel.send``
+        # with the chunks that never made it through.
+        self._yielded_chunks: list[str] = []
+        self._undelivered_index = 0
+        coalesce_window_s, coalesce_chars = _resolve_stream_relay_coalesce(config)
+        self._coalesce_window_s = coalesce_window_s
+        self._coalesce_chars = coalesce_chars
 
     @classmethod
     def maybe_start(
@@ -1142,6 +1286,47 @@ class _RuntimeChannelStreamRelay:
             )
             return None
 
+    async def _coalesce_next_batch(
+        self,
+        first_text: str,
+    ) -> tuple[str, object | None]:
+        """Aggregate consecutive text items until window or char threshold.
+
+        Returns ``(batched_text, sentinel_or_none)`` — when the trailing
+        sentinel is ``_STREAM_DONE`` the caller flushes and exits.
+        """
+        if self._coalesce_window_s <= 0 and self._coalesce_chars <= 0:
+            return first_text, None
+        buffer = [first_text]
+        size = len(first_text)
+        deadline = (
+            asyncio.get_event_loop().time() + self._coalesce_window_s
+            if self._coalesce_window_s > 0
+            else None
+        )
+        while True:
+            if self._coalesce_chars and size >= self._coalesce_chars:
+                return "".join(buffer), None
+            remaining = (
+                deadline - asyncio.get_event_loop().time()
+                if deadline is not None
+                else None
+            )
+            if remaining is not None and remaining <= 0:
+                return "".join(buffer), None
+            try:
+                if remaining is None:
+                    item = self._queue.get_nowait()
+                else:
+                    item = await asyncio.wait_for(self._queue.get(), timeout=remaining)
+            except (asyncio.QueueEmpty, TimeoutError):
+                return "".join(buffer), None
+            if item is _STREAM_DONE:
+                return "".join(buffer), _STREAM_DONE
+            if isinstance(item, str):
+                buffer.append(item)
+                size += len(item)
+
     async def _chunks(self) -> AsyncIterator[str]:
         sanitizer = _DirectiveTagStreamSanitizer()
         while True:
@@ -1149,12 +1334,29 @@ class _RuntimeChannelStreamRelay:
             if item is _STREAM_DONE:
                 tail = sanitizer.flush()
                 if tail:
+                    self._yielded_chunks.append(tail)
                     yield tail
+                    # Only advance the delivered watermark when the consumer
+                    # accepted the chunk (yield returned). If yield raises,
+                    # the consumer failed to process it and the chunk must
+                    # be replayed via the close() fallback path.
+                    self._undelivered_index = len(self._yielded_chunks)
                 return
-            if isinstance(item, str):
-                chunk = sanitizer.clean(item)
-                if chunk:
-                    yield chunk
+            if not isinstance(item, str):
+                continue
+            batched, sentinel = await self._coalesce_next_batch(item)
+            chunk = sanitizer.clean(batched)
+            if chunk:
+                self._yielded_chunks.append(chunk)
+                yield chunk
+                self._undelivered_index = len(self._yielded_chunks)
+            if sentinel is _STREAM_DONE:
+                tail = sanitizer.flush()
+                if tail:
+                    self._yielded_chunks.append(tail)
+                    yield tail
+                    self._undelivered_index = len(self._yielded_chunks)
+                return
 
     async def emit(self, event: Any) -> None:
         artifact = _artifact_event_payload(event)
@@ -1196,6 +1398,45 @@ class _RuntimeChannelStreamRelay:
                 await self._task
         except Exception as exc:  # noqa: BLE001 - error already becomes batch fallback.
             self.stream_error = exc
+
+        # Per-event delivery fallback: when send_streaming raised mid-stream,
+        # any chunk that was queued but never reached the consumer must
+        # still land via channel.send. Drain the relay queue for queued
+        # text items, concatenate with chunks already yielded but not
+        # delivered, and send as a single batch reply. Successful streams
+        # (stream_error is None) skip this branch.
+        if self.stream_error is not None:
+            queued_remainder: list[str] = []
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if item is _STREAM_DONE:
+                    continue
+                if isinstance(item, str):
+                    queued_remainder.append(item)
+            undelivered_yielded = "".join(
+                self._yielded_chunks[self._undelivered_index :]
+            )
+            fallback_text = undelivered_yielded + "".join(queued_remainder)
+            if fallback_text:
+                try:
+                    await self._channel.send(
+                        _build_reply_message(
+                            self._channel,
+                            fallback_text,
+                            self._inbound,
+                        )
+                    )
+                except Exception as send_exc:  # noqa: BLE001 - log only.
+                    log.warning(
+                        "channel_dispatch.stream_relay_batch_fallback_failed",
+                        channel_type=type(self._channel).__name__,
+                        error_type=type(send_exc).__name__,
+                        error=str(send_exc),
+                    )
+                self._undelivered_index = len(self._yielded_chunks)
 
         if _can_deliver_channel_files(self._channel):
             undelivered = await _deliver_artifacts_as_channel_files(
@@ -1244,156 +1485,6 @@ def _artifact_event_payload(event: Any) -> dict[str, Any] | None:
     if getattr(event, "kind", None) == "artifact":
         return artifact_payload(event)
     return None
-
-
-def _artifact_delivery_key(artifact: dict[str, Any]) -> str:
-    for field in (
-        "sha256",
-        "path",
-        "channel_download_url",
-        "signed_download_url",
-        "download_url",
-        "id",
-        "name",
-    ):
-        value = artifact.get(field)
-        if value:
-            return f"{field}:{value}"
-    return ""
-
-
-def _dedupe_artifacts_for_channel_delivery(
-    artifacts: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    unique: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for artifact in artifacts:
-        key = _artifact_delivery_key(artifact)
-        if key:
-            if key in seen:
-                continue
-            seen.add(key)
-        unique.append(artifact)
-    return unique
-
-
-def _channel_safe_artifact_url(artifact: dict[str, Any]) -> str:
-    for key in ("channel_download_url", "signed_download_url"):
-        value = artifact.get(key)
-        if isinstance(value, str):
-            candidate = value.strip()
-            if candidate.lower().startswith(("https://", "http://")):
-                return candidate
-    return ""
-
-
-def _artifact_fallback_lines(artifacts: list[dict[str, Any]]) -> list[str]:
-    lines: list[str] = []
-    for artifact in _dedupe_artifacts_for_channel_delivery(artifacts):
-        name = artifact.get("name") if isinstance(artifact.get("name"), str) else "artifact"
-        target = _channel_safe_artifact_url(artifact)
-        if target:
-            lines.append(f"Generated file: {name} -> {target}")
-        else:
-            lines.append(f"Generated file: {name} -> available in WebUI")
-    return lines
-
-
-def _artifact_media_root_from_config(config: Any) -> Path:
-    return media_root_from_config(config)
-
-
-def _strip_artifact_markers_from_channel_text(text: str) -> str:
-    if "[generated artifact omitted:" not in text:
-        return text
-    cleaned = _ARTIFACT_MARKER_RE.sub("", text.replace("\r\n", "\n"))
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-
-
-def _artifact_reference_names(artifacts: list[dict[str, Any]]) -> set[str]:
-    names: set[str] = set()
-    for artifact in artifacts:
-        name = artifact.get("name")
-        if isinstance(name, str) and name:
-            names.add(Path(name).name.lower())
-    return names
-
-
-def _image_reference_target_name(line: str) -> str:
-    match = _MARKDOWN_IMAGE_LINE_RE.match(line) or _LOOSE_IMAGE_LINE_RE.match(line)
-    if match is None:
-        return ""
-    target = match.group("target").strip().strip("'\"")
-    target = target.split("?", 1)[0].split("#", 1)[0].replace("\\", "/")
-    return target.rsplit("/", 1)[-1].lower()
-
-
-def _strip_delivered_artifact_image_references(
-    text: str,
-    artifacts: list[dict[str, Any]],
-) -> str:
-    names = _artifact_reference_names(artifacts)
-    if not names or "!" not in text:
-        return text
-    lines = []
-    for line in text.replace("\r\n", "\n").split("\n"):
-        target_name = _image_reference_target_name(line)
-        if target_name and target_name in names:
-            continue
-        lines.append(line)
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
-
-
-def _can_deliver_channel_files(channel: Any) -> bool:
-    return callable(getattr(channel, "send_file", None))
-
-
-@contextlib.contextmanager
-def _named_artifact_delivery_path(source: Path, filename: str) -> Iterator[Path]:
-    with tempfile.TemporaryDirectory(prefix="opensquilla-artifact-") as tmp_dir:
-        target = Path(tmp_dir) / Path(filename).name
-        try:
-            target.hardlink_to(source)
-        except OSError:
-            shutil.copy2(source, target)
-        yield target
-
-
-async def _deliver_artifacts_as_channel_files(
-    channel: Any,
-    msg: IncomingMessage,
-    artifacts: list[dict[str, Any]],
-    config: Any,
-) -> list[dict[str, Any]]:
-    send_file = getattr(channel, "send_file", None)
-    if not callable(send_file) or not artifacts:
-        return artifacts
-
-    store = ArtifactStore(_artifact_media_root_from_config(config))
-    undelivered: list[dict[str, Any]] = []
-    for artifact in _dedupe_artifacts_for_channel_delivery(artifacts):
-        artifact_id = artifact.get("id")
-        session_id = artifact.get("session_id")
-        if not isinstance(artifact_id, str) or not isinstance(session_id, str):
-            undelivered.append(artifact)
-            continue
-        try:
-            ref, path = store.resolve_for_download(artifact_id, session_id=session_id)
-            with _named_artifact_delivery_path(path, ref.name) as delivery_path:
-                result = send_file(msg.channel_id, str(delivery_path))
-                if inspect.isawaitable(result):
-                    await result
-        except Exception as exc:  # noqa: BLE001 - preserve text fallback on delivery failure.
-            log.warning(
-                "channel_dispatch.artifact_file_delivery_failed",
-                artifact_id=artifact_id,
-                channel_type=type(channel).__name__,
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-            undelivered.append(artifact)
-    return undelivered
 
 
 async def _read_transcript_rows(session_manager: Any, session_key: str) -> list[Any]:
@@ -1823,21 +1914,29 @@ async def _run_turn_streaming_path(
     queue: asyncio.Queue[str | None] = asyncio.Queue()
     text_emitted = False
     stream_error: str | None = None
+    stream_task_error: BaseException | None = None
+    yielded_stream_chunks: list[str] = []
+    stream_delivered_index = 0
     artifacts: list[dict[str, Any]] = []
+    stream_sanitizer = _DirectiveTagStreamSanitizer()
 
     async def _chunk_iter() -> AsyncIterator[str]:
         """Async iterator that yields text chunks from the queue."""
-        sanitizer = _DirectiveTagStreamSanitizer()
+        nonlocal stream_delivered_index
         while True:
             chunk = await queue.get()
             if chunk is None:
-                tail = sanitizer.flush()
+                tail = stream_sanitizer.flush()
                 if tail:
+                    yielded_stream_chunks.append(tail)
                     yield tail
+                    stream_delivered_index = len(yielded_stream_chunks)
                 return
-            cleaned = sanitizer.clean(chunk)
+            cleaned = stream_sanitizer.clean(chunk)
             if cleaned:
+                yielded_stream_chunks.append(cleaned)
                 yield cleaned
+                stream_delivered_index = len(yielded_stream_chunks)
 
     # Start the streaming consumer as a background task
     stream_task = asyncio.create_task(
@@ -1904,8 +2003,53 @@ async def _run_turn_streaming_path(
         # Wait for the streaming task to finish
         try:
             await asyncio.wait_for(stream_task, timeout=10.0)
-        except (TimeoutError, Exception):
+        except TimeoutError as exc:
+            stream_task_error = exc
+            log.warning(
+                "channel_dispatch.direct_streaming_failed",
+                channel_type=type(channel).__name__,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             stream_task.cancel()
+        except Exception as exc:  # noqa: BLE001 - streaming adapter fallback below
+            stream_task_error = exc
+            log.warning(
+                "channel_dispatch.direct_streaming_failed",
+                channel_type=type(channel).__name__,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            stream_task.cancel()
+
+    if stream_task_error is not None and text_emitted:
+        queued_remainder: list[str] = []
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if isinstance(item, str):
+                cleaned = stream_sanitizer.clean(item)
+                if cleaned:
+                    queued_remainder.append(cleaned)
+        tail = stream_sanitizer.flush()
+        if tail:
+            queued_remainder.append(tail)
+        undelivered_yielded = "".join(
+            yielded_stream_chunks[stream_delivered_index:]
+        )
+        fallback_text = undelivered_yielded + "".join(queued_remainder)
+        if fallback_text:
+            try:
+                await channel.send(_build_reply_message(channel, fallback_text, msg))
+            except Exception as exc:  # noqa: BLE001 - best-effort fallback
+                log.warning(
+                    "channel_dispatch.direct_streaming_batch_fallback_failed",
+                    channel_type=type(channel).__name__,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
 
     # Error recovery
     if stream_error is not None:
@@ -1950,5 +2094,5 @@ async def _emit_events(
     await event_bridge.emit(
         session_key,
         "sessions.changed",
-        {"key": session_key, "reason": reason},
+        build_sessions_changed_payload(session_key, reason),
     )

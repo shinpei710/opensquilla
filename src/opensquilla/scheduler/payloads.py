@@ -11,7 +11,7 @@ delivery path:
    predate ``session_status`` deserialize with ``None`` (backward-
    compatible default).
 
-2. **Cron payload contract (agent_turn vs system_event).**
+2. **Cron payload contract (reminder vs agent_turn vs system_event).**
    :func:`normalize_contract` and friends enforce the canonical payload
    kinds the scheduler hands to its handlers. They accept both
    generations of payload shape (``task``/``text`` aliases) and resolve
@@ -98,9 +98,10 @@ def deserialize(data: dict[str, Any]) -> DeliveryReport:
 # ---------------------------------------------------------------------------
 
 AGENT_TURN_KIND = "agent_turn"
+REMINDER_KIND = "reminder"
 SYSTEM_EVENT_KIND = "system_event"
-_VALID_PAYLOAD_KINDS = frozenset({AGENT_TURN_KIND, SYSTEM_EVENT_KIND})
-_KNOWN_HANDLER_KEYS = frozenset({"agent_run", "system_event"})
+_VALID_PAYLOAD_KINDS = frozenset({AGENT_TURN_KIND, REMINDER_KIND, SYSTEM_EVENT_KIND})
+_KNOWN_HANDLER_KEYS = frozenset({"agent_run", "static_message", "system_event"})
 
 
 def payload_kind(payload: dict[str, Any] | None, session_target: SessionTarget | str) -> str:
@@ -124,7 +125,7 @@ def payload_text(payload: dict[str, Any] | None, session_target: SessionTarget |
     """Return the primary text field regardless of payload generation version."""
     data = payload or {}
     kind = payload_kind(data, session_target)
-    if kind == SYSTEM_EVENT_KIND:
+    if kind in {REMINDER_KIND, SYSTEM_EVENT_KIND}:
         value = data.get("text") or data.get("task") or ""
     else:
         value = data.get("task") or data.get("text") or ""
@@ -156,6 +157,14 @@ def make_agent_turn_payload(task: str, agent_id: str = "main") -> dict[str, str]
     return {
         "kind": AGENT_TURN_KIND,
         "task": task,
+        "agent_id": agent_id or "main",
+    }
+
+
+def make_reminder_payload(text: str, agent_id: str = "main") -> dict[str, str]:
+    return {
+        "kind": REMINDER_KIND,
+        "text": text,
         "agent_id": agent_id or "main",
     }
 
@@ -199,6 +208,17 @@ def normalize_contract(
     if strict and not text.strip():
         raise ValueError("Cron payload text is required")
 
+    if kind == REMINDER_KIND:
+        if strict and target == SessionTarget.MAIN:
+            raise ValueError("reminder payloads cannot use sessionTarget='main'")
+        if (
+            strict
+            and target in (SessionTarget.CURRENT, SessionTarget.SESSION)
+            and not bound_session_key
+        ):
+            raise ValueError(f"{target.value} sessionTarget requires a bound session key")
+        return "static_message", make_reminder_payload(text, agent_id), target, bound_session_key
+
     if kind == SYSTEM_EVENT_KIND:
         if strict and target != SessionTarget.MAIN:
             raise ValueError("system_event payloads require sessionTarget='main'")
@@ -218,10 +238,12 @@ def normalize_contract(
 
 __all__ = [
     "AGENT_TURN_KIND",
+    "REMINDER_KIND",
     "SYSTEM_EVENT_KIND",
     "DeliveryReport",
     "deserialize",
     "make_agent_turn_payload",
+    "make_reminder_payload",
     "make_system_event_payload",
     "normalize_contract",
     "normalize_origin_session_key",

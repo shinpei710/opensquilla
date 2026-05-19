@@ -23,6 +23,13 @@ import structlog
 from pydantic import BaseModel
 
 from opensquilla.channels._util import EventDedupeCache
+from opensquilla.channels.contract import (
+    ChannelCapabilityProfile,
+    ChannelPlatformCapability,
+    ChannelPlatformCapabilityStatus,
+    ChannelPlatformCategories,
+    ChannelPlatformManifest,
+)
 from opensquilla.channels.types import (
     ChannelHealth,
     IncomingMessage,
@@ -110,6 +117,44 @@ class DingTalkChannel:
 
     def __post_init__(self) -> None:
         self._dedupe = EventDedupeCache(max_size=self.config.event_dedupe_size)
+
+    @property
+    def capability_profile(self) -> ChannelCapabilityProfile:
+        return ChannelCapabilityProfile(
+            channel_type="dingtalk",
+            group_chat=True,
+            mentions=True,
+            reply=True,
+            cards=True,
+            transports=("websocket",),
+            notes=(
+                "DingTalk stream mode supports card updates for streaming, but robot "
+                "text replies have no generic edit/delete primitive.",
+            ),
+        )
+
+    @property
+    def platform_capability_manifest(self) -> ChannelPlatformManifest:
+        return ChannelPlatformManifest.from_channel_profile(
+            self.capability_profile,
+        ).with_capabilities(
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.FILES,
+                status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
+                notes=("DingTalk file upload/download is not implemented in this adapter.",),
+            ),
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.CARDS,
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=("MarkdownCardInstance",),
+                mutates=True,
+                notes=("DingTalk streaming uses MarkdownCardInstance create/update helpers.",),
+            ),
+        )
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self.capability_profile.capability_tags()
 
     # ------------------------------------------------------------------
     # Inbound — parsing & dispatch
@@ -412,10 +457,8 @@ def _build_callback_handler_class() -> type:
 
         def process(self, callback_message: Any) -> Any:  # type: ignore[override]
             """SDK contract: ``AsyncChatbotHandler.raw_process`` submits this
-            method to a ``ThreadPoolExecutor`` (see
-            ``dingtalk_stream/chatbot.py:829-836``) and never awaits it.
-            The method MUST therefore be sync — the SDK source explicitly
-            says ``不要用 async 修饰`` ("do not decorate with async").
+            method to a ``ThreadPoolExecutor`` and never awaits it.
+            The method MUST therefore be sync.
             We hop back to the channel's event loop via
             ``call_soon_threadsafe`` to deliver the parsed message into
             the asyncio queue safely from the worker thread.

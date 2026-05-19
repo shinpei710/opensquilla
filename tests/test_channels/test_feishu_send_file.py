@@ -116,6 +116,46 @@ def test_parse_event_maps_image_and_file_messages_to_attachments() -> None:
     assert file_msg.attachments[0].metadata["feishu_resource_type"] == "file"
 
 
+def test_parse_event_maps_post_image_elements_to_attachments() -> None:
+    channel = FeishuChannel(
+        FeishuChannelConfig(app_id="app", app_secret="secret", connection_mode="webhook")
+    )
+
+    msg = channel.parse_event(
+        {
+            "header": {"event_id": "evt-post-image"},
+            "event": {
+                "sender": {"sender_id": {"open_id": "ou_user"}},
+                "message": {
+                    "message_id": "om_post",
+                    "chat_id": "oc_chat",
+                    "chat_type": "p2p",
+                    "message_type": "post",
+                    "content": json.dumps(
+                        {
+                            "content": [
+                                [
+                                    {"tag": "text", "text": "what is this"},
+                                    {"tag": "img", "image_key": "img-key"},
+                                ]
+                            ]
+                        }
+                    ),
+                },
+            },
+        }
+    )
+
+    assert msg.content == "what is this[image]"
+    assert len(msg.attachments) == 1
+    assert msg.attachments[0].name == "image.png"
+    assert msg.attachments[0].mime_type == "image/png"
+    assert msg.attachments[0].metadata["feishu_resource_key"] == "img-key"
+    assert msg.attachments[0].metadata["feishu_resource_type"] == "image"
+    assert msg.attachments[0].metadata["feishu_message_type"] == "post"
+    assert msg.attachments[0].metadata["feishu_message_id"] == "om_post"
+
+
 def test_parse_event_maps_media_audio_and_sticker_to_attachments() -> None:
     channel = FeishuChannel(
         FeishuChannelConfig(app_id="app", app_secret="secret", connection_mode="webhook")

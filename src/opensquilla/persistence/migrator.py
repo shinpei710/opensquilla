@@ -1,19 +1,30 @@
 """Schema migrator — thin wrapper over yoyo-migrations.
 
-See ADR.md line 48 for the alembic rejection rationale and
-`docs/architecture/schema-migration.md` for the per-version up/down policy
-and boot-time run order.
+Each migration module owns its versioned up/down policy; gateway boot applies
+pending migrations before code paths depend on the new schema.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 from yoyo import get_backend, read_migrations
 
 log = logging.getLogger(__name__)
+
+
+def _adapt_sqlite_datetime(value: datetime) -> str:
+    return value.isoformat(" ")
+
+
+def _ensure_sqlite_datetime_adapter() -> None:
+    """Register the Python 3.12 replacement for sqlite3's deprecated default."""
+
+    sqlite3.register_adapter(datetime, _adapt_sqlite_datetime)
 
 
 def _to_yoyo_url(db_url: str) -> str:
@@ -43,6 +54,7 @@ def apply_pending(db_url: str, migrations_dir: Path) -> list[str]:
         log.warning("migrator.missing_dir", extra={"migrations_dir": str(path)})
         return []
 
+    _ensure_sqlite_datetime_adapter()
     backend = get_backend(_to_yoyo_url(db_url))
     try:
         migrations = read_migrations(str(path))

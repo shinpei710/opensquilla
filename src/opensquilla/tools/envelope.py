@@ -87,6 +87,7 @@ _USER_MESSAGES: Final[dict[str, str]] = {
     "TimeoutException": "The tool timed out while connecting or waiting for a response.",
     "ConnectError": "The tool could not connect to the remote service.",
     "JSONDecodeError": "The tool received an invalid response payload.",
+    "ToolRunBudgetExceededError": "The tool run budget for this turn is exhausted.",
     "policy_denial": "The action was blocked by policy. See user-facing reason for details.",
 }
 

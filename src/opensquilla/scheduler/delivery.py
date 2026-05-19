@@ -3,17 +3,53 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import structlog
 
-from opensquilla.scheduler.types import CronJob, DeliveryConfig, DeliveryMode, SessionTarget
+from opensquilla.scheduler.types import (
+    CronJob,
+    DeliveryConfig,
+    DeliveryMode,
+    FailureDestination,
+    SessionTarget,
+)
 from opensquilla.session.keys import parse_agent_id
 
 log = structlog.get_logger(__name__)
+
+
+_WEBHOOK_TIMEOUT_SECONDS = 10.0
+_REPLY_DIRECTIVE_RE = re.compile(
+    r"\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*"
+)
+
+
+def strip_reply_directives(text: str | None) -> str | None:
+    if text is None:
+        return None
+    return _REPLY_DIRECTIVE_RE.sub("", text).lstrip("\n")
+
+
+def validate_webhook_url(url: str) -> None:
+    """Raise ValueError if ``url`` is not a syntactically valid http(s) URL."""
+    if not url:
+        raise ValueError("webhook URL is required")
+    try:
+        parsed = urlparse(url)
+    except ValueError as exc:
+        raise ValueError(f"invalid webhook URL: {url!r}") from exc
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"webhook URL must use http or https scheme, got {parsed.scheme!r}"
+        )
+    if not parsed.hostname:
+        raise ValueError(f"webhook URL is missing a hostname: {url!r}")
 
 
 @dataclass
@@ -42,6 +78,46 @@ class DeliveryChain:
         self._ws_emitter = ws_emitter
         self._session_forwarder = session_forwarder
 
+    @staticmethod
+    def _is_same_webchat_session_delivery(
+        job: CronJob,
+        *,
+        channel_name: str,
+        channel_id: str,
+        session_key: str,
+    ) -> bool:
+        target = (
+            job.session_target
+            if isinstance(job.session_target, SessionTarget)
+            else SessionTarget(job.session_target)
+        )
+        if target != SessionTarget.CURRENT:
+            return False
+        if job.origin_session_key and job.origin_session_key != session_key:
+            return False
+        if job.session_key and job.session_key != session_key:
+            return False
+        return channel_name == "webchat" and channel_id == f"webchat:{session_key}"
+
+    @staticmethod
+    def _is_origin_webchat_session_delivery(
+        job: CronJob,
+        *,
+        channel_name: str,
+        channel_id: str,
+        session_key: str,
+    ) -> bool:
+        target = (
+            job.session_target
+            if isinstance(job.session_target, SessionTarget)
+            else SessionTarget(job.session_target)
+        )
+        if target == SessionTarget.MAIN:
+            return False
+        if not job.origin_session_key or job.origin_session_key == session_key:
+            return False
+        return channel_name == "webchat" and channel_id == f"webchat:{job.origin_session_key}"
+
     async def deliver(
         self,
         job: CronJob,
@@ -52,7 +128,9 @@ class DeliveryChain:
         route_envelope: Any | None = None,
     ) -> DeliveryReport:
         envelope = route_envelope or build_reply_rendezvous_envelope(job, session_key)
-        ch_coro = self._deliver_channel(job, result_text, envelope)
+        result_text = strip_reply_directives(result_text) or ""
+        summary = strip_reply_directives(summary)
+        ch_coro = self._deliver_channel(job, result_text, envelope, session_key)
         ws_coro = self._notify_ws(
             job,
             success=success,
@@ -87,16 +165,26 @@ class DeliveryChain:
         except Exception:
             pass
 
-    async def _deliver_channel(self, job: CronJob, text: str, route_envelope: Any) -> str:
+    async def _deliver_channel(
+        self,
+        job: CronJob,
+        text: str,
+        route_envelope: Any,
+        session_key: str,
+    ) -> str:
+        """Deliver the run output to the primary target (success or failure).
+
+        ``failure_destination`` is dispatched separately by
+        :func:`scheduler.jobs.execute_with_timeout` so all failure paths
+        (agent_run, system_event, timeout, generic exception) reach the FD
+        uniformly — not just runs that flow through this method.
+        """
+        if job.delivery.mode == DeliveryMode.WEBHOOK:
+            return await self._deliver_webhook(job, text)
         target = route_envelope.reply_target
         if job.delivery.mode == DeliveryMode.NONE and not (
             target is not None and target.kind == "channel"
         ):
-            return "skipped"
-        if not self._channel_manager_ref:
-            return "skipped"
-        cm = self._channel_manager_ref()
-        if cm is None:
             return "skipped"
         channel_name = (
             target.channel_name
@@ -113,11 +201,82 @@ class DeliveryChain:
             if target is not None and target.kind == "channel"
             else job.delivery.thread_id
         )
+        if self._is_same_webchat_session_delivery(
+            job,
+            channel_name=channel_name or "",
+            channel_id=channel_id or "",
+            session_key=session_key,
+        ):
+            return "delivered"
+        if self._is_origin_webchat_session_delivery(
+            job,
+            channel_name=channel_name or "",
+            channel_id=channel_id or "",
+            session_key=session_key,
+        ):
+            return await self._deliver_origin_webchat_to_session(job, text, session_key)
+        if not self._channel_manager_ref:
+            return "skipped"
+        return await self._post_to_channel(
+            job_id=job.id,
+            text=text,
+            channel_name=channel_name,
+            channel_id=channel_id,
+            thread_id=thread_id,
+        )
+
+    async def _deliver_origin_webchat_to_session(
+        self,
+        job: CronJob,
+        text: str,
+        session_key: str,
+    ) -> str:
+        text = strip_reply_directives(text) or ""
+        if not self._session_forwarder:
+            return "delivery_failed"
+        if not text or not text.strip():
+            return "delivery_failed"
+        try:
+            await self._session_forwarder(
+                origin_session_key=job.origin_session_key,
+                text=text,
+                provenance={
+                    "kind": "cron",
+                    "source_session_key": session_key,
+                    "source_tool": f"cron:{job.id}",
+                },
+            )
+            return "delivered"
+        except Exception:
+            log.warning(
+                "delivery.webchat_forward_failed",
+                job_id=job.id,
+                origin_session_key=job.origin_session_key,
+                exc_info=True,
+            )
+            return "delivery_failed"
+
+    async def _post_to_channel(
+        self,
+        *,
+        job_id: str,
+        text: str,
+        channel_name: str,
+        channel_id: str,
+        thread_id: str,
+    ) -> str:
+        """Send ``text`` via the registered channel adapter for ``channel_name``."""
+        text = strip_reply_directives(text) or ""
+        if not self._channel_manager_ref:
+            return "skipped"
+        cm = self._channel_manager_ref()
+        if cm is None:
+            return "skipped"
         adapter = cm.get(channel_name)
         if adapter is None:
             log.warning(
                 "delivery.adapter_not_found",
-                job_id=job.id,
+                job_id=job_id,
                 channel=channel_name,
             )
             return "delivery_failed"
@@ -135,22 +294,105 @@ class DeliveryChain:
                     msg = OutgoingMessage(
                         content=text,
                         reply_to="cron",
-                        metadata={
-                            "channel": channel_id,
-                            "thread_ts": None,
-                        },
+                        metadata={"channel": channel_id, "thread_ts": None},
                     )
             else:
-                msg = OutgoingMessage(
-                    content=text,
-                    reply_to=channel_id or None,
-                )
+                msg = OutgoingMessage(content=text, reply_to=channel_id or None)
             await asyncio.wait_for(adapter.send(msg), timeout=30.0)
-            log.info("delivery.channel_sent", job_id=job.id, channel=channel_name)
+            log.info("delivery.channel_sent", job_id=job_id, channel=channel_name)
             return "delivered"
         except Exception:
-            log.warning("delivery.channel_failed", job_id=job.id, exc_info=True)
+            log.warning("delivery.channel_failed", job_id=job_id, exc_info=True)
             return "delivery_failed"
+
+    async def _post_to_webhook(
+        self,
+        *,
+        job_id: str,
+        job_name: str,
+        text: str,
+        url: str,
+        token: str,
+    ) -> str:
+        """POST the finished-run payload to ``url`` with optional bearer ``token``."""
+        text = strip_reply_directives(text) or ""
+        if not url:
+            log.warning("delivery.webhook_url_missing", job_id=job_id)
+            return "delivery_failed"
+        try:
+            validate_webhook_url(url)
+        except ValueError as exc:
+            log.warning("delivery.webhook_url_invalid", job_id=job_id, reason=str(exc))
+            return "delivery_failed"
+
+        import httpx
+
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        payload = {
+            "jobId": job_id,
+            "jobName": job_name,
+            "summary": text,
+            "deliveredAt": datetime.now(UTC).isoformat(),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=_WEBHOOK_TIMEOUT_SECONDS) as client:
+                response = await client.post(url, json=payload, headers=headers)
+                response.raise_for_status()
+            log.info("delivery.webhook_sent", job_id=job_id)
+            return "delivered"
+        except Exception:
+            log.warning("delivery.webhook_failed", job_id=job_id, exc_info=True)
+            return "delivery_failed"
+
+    async def _deliver_webhook(self, job: CronJob, text: str) -> str:
+        """Primary webhook delivery — POST to ``delivery.webhook_url``."""
+        return await self._post_to_webhook(
+            job_id=job.id,
+            job_name=job.name,
+            text=text,
+            url=job.delivery.webhook_url,
+            token=job.delivery.webhook_token,
+        )
+
+    async def dispatch_failure_alert(self, job: CronJob, text: str) -> str:
+        """Public entry point for dispatching a failed-run alert.
+
+        Called by :func:`scheduler.jobs.execute_with_timeout` for any handler
+        failure (agent_run raise, system_event raise, TimeoutError, generic
+        Exception) when ``job.delivery.failure_destination`` is configured.
+        Returns the same status strings as primary delivery.
+        """
+        fd = job.delivery.failure_destination
+        if fd is None:
+            return "skipped"
+        return await self._deliver_to_failure_destination(job, text, fd)
+
+    async def _deliver_to_failure_destination(
+        self,
+        job: CronJob,
+        text: str,
+        fd: FailureDestination,
+    ) -> str:
+        """Route a failed-run notification to the configured FailureDestination."""
+        if fd.mode == DeliveryMode.WEBHOOK:
+            return await self._post_to_webhook(
+                job_id=job.id,
+                job_name=job.name,
+                text=text,
+                url=fd.webhook_url,
+                token=fd.webhook_token,
+            )
+        if fd.mode == DeliveryMode.CHANNEL and fd.channel_name:
+            return await self._post_to_channel(
+                job_id=job.id,
+                text=text,
+                channel_name=fd.channel_name,
+                channel_id=fd.channel_id,
+                thread_id=fd.thread_id,
+            )
+        return "skipped"
 
     async def _notify_ws(
         self,
@@ -161,6 +403,7 @@ class DeliveryChain:
     ) -> str:
         if not self._ws_emitter:
             return "skipped"
+        summary = strip_reply_directives(summary)
         topic = job.delivery.ws_topic or f"cron:{job.id}"
         payload = {
             "jobId": job.id,
@@ -183,6 +426,7 @@ class DeliveryChain:
         text: str,
         session_key: str,
     ) -> str:
+        text = strip_reply_directives(text) or ""
         target = (
             job.session_target
             if isinstance(job.session_target, SessionTarget)

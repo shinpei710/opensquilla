@@ -9,7 +9,7 @@ import os
 import typer
 
 from opensquilla.cli.gateway_lifecycle import GatewayLifecycleManager, GatewayLifecycleResult
-from opensquilla.cli.ui import console
+from opensquilla.cli.ui import ACCENT_MARKUP, console
 from opensquilla.gateway.boot import start_gateway_server
 from opensquilla.gateway.config import GatewayConfig, is_public_bind, resolve_listen_address
 from opensquilla.paths import default_opensquilla_home
@@ -28,7 +28,7 @@ def gateway_startup_guidance(host: str, port: int) -> tuple[str, ...]:
 
 
 def run_gateway(
-    port: int = typer.Option(18790, "--port", "-p", help="Port to bind"),
+    port: int = typer.Option(18791, "--port", "-p", help="Port to bind"),
     bind: str = typer.Option("127.0.0.1", "--bind", "-b", help="Host to bind"),
     listen: str = typer.Option("", "--listen", help="Host to bind (wins over --bind)"),
     debug: bool = typer.Option(False, "--debug", help="Enable debug mode"),
@@ -45,7 +45,7 @@ def run_gateway(
     config = GatewayConfig.load(os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH"))
     config = config.model_copy(update={"host": host, "port": port, "debug": debug})
 
-    banner_host = f"[red]{host}[/red]" if is_public_bind(host) else f"[cyan]{host}[/cyan]"
+    banner_host = f"[red]{host}[/red]" if is_public_bind(host) else f"[{ACCENT_MARKUP}]{host}[/]"
     console.print(f"[bold green]Starting OpenSquilla gateway[/bold green] on {banner_host}:{port}")
     for line in gateway_startup_guidance(host, port):
         console.print(line)
@@ -130,7 +130,7 @@ def _emit_lifecycle_result(result: GatewayLifecycleResult, *, json_output: bool)
 
 
 def start_gateway(
-    port: int = typer.Option(18790, "--port", "-p", help="Port to bind"),
+    port: int = typer.Option(18791, "--port", "-p", help="Port to bind"),
     bind: str = typer.Option("127.0.0.1", "--bind", "-b", help="Host to bind"),
     listen: str = typer.Option("", "--listen", help="Host to bind (wins over --bind)"),
     health_timeout: float = typer.Option(60.0, "--timeout", help="Readiness wait timeout"),
@@ -148,7 +148,7 @@ def start_gateway(
 
 
 def status_gateway(
-    port: int = typer.Option(18790, "--port", "-p", help="Port to inspect"),
+    port: int = typer.Option(18791, "--port", "-p", help="Port to inspect"),
     bind: str = typer.Option("127.0.0.1", "--bind", "-b", help="Host to inspect"),
     listen: str = typer.Option("", "--listen", help="Host to inspect (wins over --bind)"),
     json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
@@ -160,7 +160,7 @@ def status_gateway(
 
 
 def stop_gateway(
-    port: int = typer.Option(18790, "--port", "-p", help="Port to stop"),
+    port: int = typer.Option(18791, "--port", "-p", help="Port to stop"),
     bind: str = typer.Option("127.0.0.1", "--bind", "-b", help="Host to stop"),
     listen: str = typer.Option("", "--listen", help="Host to stop (wins over --bind)"),
     shutdown_timeout: float = typer.Option(10.0, "--timeout", help="Shutdown wait timeout"),
@@ -178,7 +178,7 @@ def stop_gateway(
 
 
 def restart_gateway(
-    port: int = typer.Option(18790, "--port", "-p", help="Port to restart"),
+    port: int = typer.Option(18791, "--port", "-p", help="Port to restart"),
     bind: str = typer.Option("127.0.0.1", "--bind", "-b", help="Host to restart"),
     listen: str = typer.Option("", "--listen", help="Host to restart (wins over --bind)"),
     health_timeout: float = typer.Option(60.0, "--timeout", help="Readiness wait timeout"),

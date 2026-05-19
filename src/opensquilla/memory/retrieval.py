@@ -8,11 +8,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .source_paths import is_searchable_source_path
 from .store import LongTermMemoryStore
-from .types import MemorySearchOpts, MemorySearchResult, SearchIntent
+from .types import (
+    MemorySearchOpts,
+    MemorySearchResult,
+    MemorySource,
+    SearchIntent,
+    is_lexical_guaranteed_match,
+    is_relaxed_keyword_match,
+)
 
 # Matches YYYY-MM-DD.md or YYYY-MM-DD-<slug>.md at the basename.
-# The date must prefix the basename so release-2026-04-21.md does NOT match.
+# The date must prefix the basename; embedded dates elsewhere do not match.
 _DATED_FILENAME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})(?:-[a-z0-9][a-z0-9_-]*)?\.md")
 
 
@@ -114,6 +122,31 @@ def _mmr_rerank(
     return selected
 
 
+def _copy_result_with_score(result: MemorySearchResult, score: float) -> MemorySearchResult:
+    return MemorySearchResult(
+        chunk_id=result.chunk_id,
+        path=result.path,
+        source=result.source,
+        start_line=result.start_line,
+        end_line=result.end_line,
+        snippet=result.snippet,
+        score=score,
+        vector_score=result.vector_score,
+        text_score=result.text_score,
+        text=result.text,
+        chunk_hash=result.chunk_hash,
+        metadata=dict(result.metadata),
+        citation=result.citation,
+    )
+
+
+def _rank_score(
+    result: MemorySearchResult,
+    source_weights: dict[MemorySource, float],
+) -> float:
+    return result.score * source_weights.get(result.source, 1.0)
+
+
 class MemoryRetriever:
     """
     Unified retrieval interface that wraps LongTermMemoryStore.
@@ -133,7 +166,9 @@ class MemoryRetriever:
         mmr_lambda: float = 0.7,
         vector_weight: float = 0.7,
         text_weight: float = 0.3,
+        source_weights: dict[MemorySource, float] | None = None,
         sync_manager: Any | None = None,
+        effective_metadata: dict[str, str] | None = None,
     ) -> None:
         self._store = store
         self._temporal_decay_enabled = temporal_decay_enabled
@@ -142,7 +177,9 @@ class MemoryRetriever:
         self._mmr_lambda = mmr_lambda
         self._vector_weight = vector_weight
         self._text_weight = text_weight
+        self._source_weights = source_weights or {MemorySource.sessions: 0.92}
         self._sync_manager = sync_manager
+        self._effective_metadata = dict(effective_metadata or {})
 
     async def search(
         self,
@@ -152,15 +189,17 @@ class MemoryRetriever:
         intent: SearchIntent = SearchIntent.TOOL,
     ) -> list[MemorySearchResult]:
         if self._sync_manager is not None:
-            await self._sync_manager.sync(reason="search")
+            await self._sync_manager.sync(reason=f"search:{intent.value}")
         opts = opts or MemorySearchOpts()
+        source_filter = getattr(opts, "source", None)
 
         raw_results, _mode = await self._store.search(
             query=query,
             max_results=min(200, opts.max_results * 10),
-            min_score=0.0,  # filter after decay
+            min_score=opts.min_score,
             vector_weight=self._vector_weight,
             text_weight=self._text_weight,
+            source=source_filter,
         )
 
         if self._temporal_decay_enabled:
@@ -191,14 +230,48 @@ class MemoryRetriever:
             ]
             raw_results.sort(key=lambda r: r.score, reverse=True)
 
-        # Filter by min_score before optional diversity selection.
-        filtered = [r for r in raw_results if r.score >= opts.min_score]
+        # Filter by min_score before optional diversity selection. Store-level
+        # recall guarantees deliberately survive this second pass.
+        filtered = [
+            r
+            for r in raw_results
+            if is_searchable_source_path(r.source, str(r.path))
+            and (source_filter is None or r.source == source_filter)
+            and (
+                r.score >= opts.min_score
+                or is_relaxed_keyword_match(r)
+                or is_lexical_guaranteed_match(r)
+            )
+        ]
+        filtered.sort(key=lambda r: _rank_score(r, self._source_weights), reverse=True)
 
         if self._mmr_enabled:
-            k_selected = _mmr_rerank(filtered, lam=self._mmr_lambda, k=opts.max_results)
+            weighted = [
+                _copy_result_with_score(r, _rank_score(r, self._source_weights))
+                for r in filtered
+            ]
+            selected_weighted = _mmr_rerank(
+                weighted,
+                lam=self._mmr_lambda,
+                k=opts.max_results,
+            )
+            original_by_chunk = {r.chunk_id: r for r in filtered}
+            k_selected = [original_by_chunk[r.chunk_id] for r in selected_weighted]
         else:
             k_selected = filtered[: opts.max_results]
+        for result in k_selected:
+            result.metadata["search_intent"] = intent.value
         return k_selected
 
     async def close(self) -> None:
         return None
+
+    def effective_retrieval_metadata(self) -> dict[str, str]:
+        effective_mode = "fts_only" if self._vector_weight == 0.0 else "hybrid"
+        metadata = {
+            "retrieval_mode": effective_mode,
+            "vector_weight": str(self._vector_weight),
+            "text_weight": str(self._text_weight),
+        }
+        metadata.update(self._effective_metadata)
+        return metadata

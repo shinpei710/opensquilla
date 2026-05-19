@@ -31,6 +31,15 @@ from opensquilla.channels._util import (
     StreamThrottle,
     retry_request,
 )
+from opensquilla.channels.contract import (
+    ChannelCapabilities,
+    ChannelCapabilityProfile,
+    ChannelPlatformCapability,
+    ChannelPlatformCapabilityStatus,
+    ChannelPlatformCategories,
+    ChannelPlatformManifest,
+    ChannelSendResult,
+)
 from opensquilla.channels.types import (
     Attachment,
     ChannelHealth,
@@ -42,6 +51,9 @@ from opensquilla.env import trust_env as _trust_env
 log = structlog.get_logger(__name__)
 
 _DISCORD_MENTION_RE = re.compile(r"<@!?(\d+)>")
+_DISCORD_DM_CHANNEL_TYPES = {1}
+_DISCORD_GROUP_DM_CHANNEL_TYPES = {3}
+_DISCORD_THREAD_CHANNEL_TYPES = {10, 11, 12}
 
 # Gateway intents bitmask
 GATEWAY_INTENTS = (
@@ -135,6 +147,59 @@ class DiscordChannel:
     )
     _rate_limiter: RateLimiter = field(default_factory=RateLimiter, init=False, repr=False)
     _sent_messages: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _channel_types: dict[str, int] = field(default_factory=dict, init=False, repr=False)
+    _thread_parent_channels: dict[str, str] = field(
+        default_factory=dict, init=False, repr=False
+    )
+
+    @property
+    def capability_profile(self) -> ChannelCapabilityProfile:
+        return ChannelCapabilityProfile(
+            channel_type="discord",
+            group_chat=True,
+            mentions=True,
+            typing_indicator=True,
+            native_file_upload=True,
+            media=True,
+            reactions=True,
+            inbound_reactions=True,
+            threads=True,
+            group_dm=True,
+            edit=True,
+            delete=True,
+            transports=("websocket",),
+        )
+
+    @property
+    def platform_capability_manifest(self) -> ChannelPlatformManifest:
+        return ChannelPlatformManifest.from_channel_profile(
+            self.capability_profile,
+            has_send_file=True,
+            has_inbound_attachment_resolver=True,
+        ).with_capabilities(
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.FILES,
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=("multipart/form-data message attachments",),
+                mutates=True,
+                notes=("Discord file delivery attaches files to create-message requests.",),
+            ),
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.ATTACHMENTS,
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=("attachment.url",),
+                notes=("Inbound Discord attachments are downloaded from message attachment URLs.",),
+            ),
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.THREADS,
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                notes=("Discord thread channels are detected from channel type metadata.",),
+            ),
+        )
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self.capability_profile.capability_tags()
 
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -315,22 +380,63 @@ class DiscordChannel:
             msg_id = str(data.get("id") or "")
             if msg_id and not self._dedupe.check_and_add(f"message:{msg_id}"):
                 return
-            msg = self.parse_event(data)
+            msg = self.parse_event(self._annotate_channel_context(data))
             self.enqueue(msg)
         elif event_type == "MESSAGE_REACTION_ADD":
             reaction_key = self._reaction_dedupe_key(data)
             if reaction_key and not self._dedupe.check_and_add(reaction_key):
                 return
-            self._enqueue_reaction(data)
+            self._enqueue_reaction(self._annotate_channel_context(data))
         elif event_type == "INTERACTION_CREATE":
             interaction_id = str(data.get("id") or "")
             if interaction_id and not self._dedupe.check_and_add(
                 f"interaction:{interaction_id}"
             ):
                 return
-            self._handle_interaction(data)
+            self._handle_interaction(self._annotate_channel_context(data))
+        elif event_type in {"CHANNEL_CREATE", "CHANNEL_UPDATE", "THREAD_CREATE", "THREAD_UPDATE"}:
+            self._cache_channel_context(data)
+        elif event_type == "GUILD_CREATE":
+            for channel in data.get("channels", []):
+                if isinstance(channel, dict):
+                    self._cache_channel_context(channel)
+            for thread in data.get("threads", []):
+                if isinstance(thread, dict):
+                    self._cache_channel_context(thread)
+        elif event_type == "THREAD_LIST_SYNC":
+            for thread in data.get("threads", []):
+                if isinstance(thread, dict):
+                    self._cache_channel_context(thread)
         elif event_type == "RESUMED":
             log.info("discord.resumed")
+
+    def _cache_channel_context(self, data: dict[str, Any]) -> None:
+        channel_id = data.get("id")
+        channel_type = self._channel_type(data.get("type"))
+        if isinstance(channel_id, str) and channel_id and channel_type is not None:
+            self._channel_types[channel_id] = channel_type
+        parent_id = data.get("parent_id")
+        if (
+            isinstance(channel_id, str)
+            and channel_id
+            and isinstance(parent_id, str)
+            and parent_id
+        ):
+            self._thread_parent_channels[channel_id] = parent_id
+
+    def _annotate_channel_context(self, data: dict[str, Any]) -> dict[str, Any]:
+        channel_id = data.get("channel_id")
+        if not isinstance(channel_id, str) or not channel_id:
+            return data
+        enriched = dict(data)
+        if "channel_type" not in enriched and channel_id in self._channel_types:
+            enriched["channel_type"] = self._channel_types[channel_id]
+        if (
+            "thread_parent_channel_id" not in enriched
+            and channel_id in self._thread_parent_channels
+        ):
+            enriched["thread_parent_channel_id"] = self._thread_parent_channels[channel_id]
+        return enriched
 
     @staticmethod
     def _reaction_dedupe_key(data: dict[str, Any]) -> str:
@@ -347,6 +453,10 @@ class DiscordChannel:
         user_id = data.get("user_id", "unknown")
         channel_id = data.get("channel_id", "unknown")
         emoji = data.get("emoji", {})
+        channel_type = self._channel_type(data.get("channel_type"))
+        thread_id = self._native_thread_id(data, channel_type)
+        conversation_kind = self._conversation_kind(data, channel_type, thread_id)
+        parent_channel_id = data.get("thread_parent_channel_id")
         msg = IncomingMessage(
             sender_id=user_id,
             channel_id=channel_id,
@@ -356,6 +466,15 @@ class DiscordChannel:
                 "message_id": data.get("message_id"),
                 "emoji_name": emoji.get("name", ""),
                 "emoji_id": emoji.get("id"),
+                "guild_id": data.get("guild_id"),
+                "channel_type": channel_type,
+                "is_group": conversation_kind in {"group", "group_dm", "thread", "topic"},
+                "conversation_kind": conversation_kind,
+                "native_message_id": data.get("message_id"),
+                "native_chat_id": channel_id,
+                "native_thread_id": thread_id,
+                "native_parent_channel_id": parent_channel_id,
+                "reply_target_id": data.get("message_id"),
             },
         )
         self.enqueue(msg)
@@ -371,6 +490,10 @@ class DiscordChannel:
         options = interaction_data.get("options", [])
         option_parts = [opt.get("value", "") for opt in options if opt.get("value")]
         content = f"/{command_name} {' '.join(str(v) for v in option_parts)}".strip()
+        channel_type = self._channel_type(data.get("channel_type"))
+        thread_id = self._native_thread_id(data, channel_type)
+        conversation_kind = self._conversation_kind(data, channel_type, thread_id)
+        parent_channel_id = data.get("thread_parent_channel_id")
 
         msg = IncomingMessage(
             sender_id=user.get("id", "unknown"),
@@ -381,6 +504,15 @@ class DiscordChannel:
                 "command_name": command_name,
                 "interaction_id": data.get("id"),
                 "interaction_token": data.get("token"),
+                "guild_id": data.get("guild_id"),
+                "channel_type": channel_type,
+                "is_group": conversation_kind in {"group", "group_dm", "thread", "topic"},
+                "conversation_kind": conversation_kind,
+                "native_message_id": data.get("id"),
+                "native_chat_id": channel_id,
+                "native_thread_id": thread_id,
+                "native_parent_channel_id": parent_channel_id,
+                "reply_target_id": data.get("id"),
             },
         )
         self.enqueue(msg)
@@ -478,6 +610,16 @@ class DiscordChannel:
     def parse_event(self, data: dict[str, Any]) -> IncomingMessage:
         author = data.get("author", {})
         content = data.get("content", "")
+        channel_id = data.get("channel_id", "unknown")
+        message_id = data.get("id")
+        channel_type = self._channel_type(data.get("channel_type"))
+        thread_id = self._native_thread_id(data, channel_type)
+        referenced_message_id = data.get("message_reference", {}).get("message_id")
+        parent_channel_id = data.get("thread_parent_channel_id")
+        if not isinstance(parent_channel_id, str):
+            parent_channel_id = data.get("message_reference", {}).get("channel_id")
+        conversation_kind = self._conversation_kind(data, channel_type, thread_id)
+        is_group = conversation_kind in {"group", "group_dm", "thread", "topic"}
 
         attachments: list[Attachment] = []
         for att in data.get("attachments", []):
@@ -491,25 +633,76 @@ class DiscordChannel:
             )
 
         metadata: dict[str, Any] = {
-            "message_id": data.get("id"),
+            "message_id": message_id,
+            "channel_id": channel_id,
             "guild_id": data.get("guild_id"),
-            "thread_id": data.get("thread", {}).get("id") if "thread" in data else None,
-            "referenced_message_id": data.get("message_reference", {}).get("message_id"),
+            "channel_type": channel_type,
+            "is_group": is_group,
+            "conversation_kind": conversation_kind,
+            "thread_id": thread_id,
+            "referenced_message_id": referenced_message_id,
+            "native_message_id": message_id,
+            "native_chat_id": channel_id,
+            "native_thread_id": thread_id,
+            "native_parent_id": referenced_message_id,
+            "native_parent_channel_id": parent_channel_id,
+            "native_root_id": referenced_message_id,
+            "reply_target_id": message_id,
         }
 
         return IncomingMessage(
             sender_id=author.get("id", "unknown"),
-            channel_id=data.get("channel_id", "unknown"),
+            channel_id=channel_id,
             content=content,
             attachments=attachments,
             metadata=metadata,
         )
 
+    @staticmethod
+    def _channel_type(raw: Any) -> int | None:
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, str) and raw.isdecimal():
+            return int(raw)
+        return None
+
+    @staticmethod
+    def _native_thread_id(data: dict[str, Any], channel_type: int | None) -> str | None:
+        explicit = data.get("thread_id")
+        if isinstance(explicit, str) and explicit:
+            return explicit
+        thread = data.get("thread")
+        if isinstance(thread, dict):
+            thread_id = thread.get("id")
+            if isinstance(thread_id, str) and thread_id:
+                return thread_id
+        if channel_type in _DISCORD_THREAD_CHANNEL_TYPES:
+            channel_id = data.get("channel_id")
+            if isinstance(channel_id, str) and channel_id:
+                return channel_id
+        return None
+
+    @staticmethod
+    def _conversation_kind(
+        data: dict[str, Any],
+        channel_type: int | None,
+        thread_id: str | None,
+    ) -> str:
+        if thread_id or channel_type in _DISCORD_THREAD_CHANNEL_TYPES:
+            return "thread"
+        if channel_type in _DISCORD_GROUP_DM_CHANNEL_TYPES:
+            return "group_dm"
+        if channel_type in _DISCORD_DM_CHANNEL_TYPES:
+            return "dm"
+        if data.get("guild_id") is not None:
+            return "group"
+        return "dm"
+
     # ------------------------------------------------------------------
     # Outbound
     # ------------------------------------------------------------------
 
-    async def send(self, message: OutgoingMessage) -> None:
+    async def send(self, message: OutgoingMessage) -> ChannelSendResult:
         await self._rate_limiter.acquire()
         client = self._get_client()
         channel_id = message.reply_to or self.config.default_channel_id
@@ -534,8 +727,18 @@ class DiscordChannel:
         data = resp.json()
         self._sent_messages[data["id"]] = channel_id
         log.debug("discord.send", channel_id=channel_id, message_id=data.get("id"))
+        return ChannelSendResult.sent(
+            capability=ChannelCapabilities.GROUP_CHAT,
+            target_id=channel_id,
+            provider_message_id=str(data.get("id", "")),
+        )
 
-    async def send_file(self, channel_id: str, file_path: str, content: str = "") -> None:
+    async def send_file(
+        self,
+        channel_id: str,
+        file_path: str,
+        content: str = "",
+    ) -> ChannelSendResult:
         await self._rate_limiter.acquire()
         client = self._get_client()
         with open(file_path, "rb") as f:
@@ -545,10 +748,19 @@ class DiscordChannel:
                 data={"content": content} if content else {},
                 files={"file": (Path(file_path).name, f)},
                 headers=self._auth_headers(),
-            )
+        )
         resp.raise_for_status()
+        data = resp.json()
+        message_id = str(data.get("id", ""))
+        if message_id:
+            self._sent_messages[message_id] = channel_id
+        return ChannelSendResult.sent(
+            capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+            target_id=channel_id,
+            provider_message_id=message_id,
+        )
 
-    async def edit(self, message_id: str, content: str) -> None:
+    async def edit(self, message_id: str, content: str) -> ChannelSendResult:
         await self._rate_limiter.acquire()
         client = self._get_client()
         channel_id = self._sent_messages.get(message_id, self.config.default_channel_id)
@@ -560,8 +772,13 @@ class DiscordChannel:
         )
         resp.raise_for_status()
         log.debug("discord.edit", message_id=message_id)
+        return ChannelSendResult.sent(
+            capability=ChannelCapabilities.EDIT,
+            target_id=channel_id,
+            provider_message_id=message_id,
+        )
 
-    async def delete(self, message_id: str) -> None:
+    async def delete(self, message_id: str) -> ChannelSendResult:
         await self._rate_limiter.acquire()
         client = self._get_client()
         channel_id = self._sent_messages.get(message_id, self.config.default_channel_id)
@@ -573,6 +790,11 @@ class DiscordChannel:
         resp.raise_for_status()
         self._sent_messages.pop(message_id, None)
         log.debug("discord.delete", message_id=message_id)
+        return ChannelSendResult.sent(
+            capability=ChannelCapabilities.DELETE,
+            target_id=channel_id,
+            provider_message_id=message_id,
+        )
 
     # ------------------------------------------------------------------
     # Slash commands
@@ -616,14 +838,22 @@ class DiscordChannel:
     # Typing indicator
     # ------------------------------------------------------------------
 
-    async def send_typing(self) -> None:
+    async def send_typing(self, channel_id: str | None = None) -> ChannelSendResult:
         """Send typing indicator via Discord REST API (lasts ~10s)."""
-        if not self.config.default_channel_id:
-            return
+        target = channel_id or self.config.default_channel_id
+        if not target:
+            return ChannelSendResult.unsupported(
+                capability=ChannelCapabilities.TYPING_INDICATOR,
+                reason="no channel target",
+            )
         client = self._get_client()
         await client.post(
-            f"/channels/{self.config.default_channel_id}/typing",
+            f"/channels/{target}/typing",
             headers=self._auth_headers(),
+        )
+        return ChannelSendResult.sent(
+            capability=ChannelCapabilities.TYPING_INDICATOR,
+            target_id=target,
         )
 
     # ------------------------------------------------------------------

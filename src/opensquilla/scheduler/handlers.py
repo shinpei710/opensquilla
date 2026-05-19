@@ -13,7 +13,11 @@ from typing import Any
 import structlog
 
 from opensquilla.engine.stream_wrappers import wrap_stream
-from opensquilla.scheduler.delivery import DeliveryChain, build_reply_rendezvous_envelope
+from opensquilla.scheduler.delivery import (
+    DeliveryChain,
+    build_reply_rendezvous_envelope,
+    strip_reply_directives,
+)
 from opensquilla.scheduler.heartbeat_loop import DEFAULT_HEARTBEAT_PROMPT
 from opensquilla.scheduler.payloads import payload_agent_id, payload_text
 from opensquilla.scheduler.types import (
@@ -24,11 +28,23 @@ from opensquilla.scheduler.types import (
     SessionTarget,
 )
 from opensquilla.session.keys import build_main_key
+from opensquilla.session.terminal_reply import (
+    build_terminal_reply,
+    is_context_payload_too_large,
+    sanitize_agent_error,
+)
 from opensquilla.tools.types import ToolContext
 
 log = structlog.get_logger(__name__)
 
 WorkspaceResolver = Callable[[str], tuple[str | None, bool]]
+DefaultElevatedResolver = Callable[[], str | None]
+
+
+def _resolve_default_elevated(
+    default_elevated: str | DefaultElevatedResolver | None,
+) -> str | None:
+    return default_elevated() if callable(default_elevated) else default_elevated
 
 
 def _resolve_session_key(job: CronJob) -> str:
@@ -58,12 +74,54 @@ def _resolve_session_key(job: CronJob) -> str:
             return f"cron:{job.id}"
 
 
+def _required_delivery_error(job: CronJob, report: Any) -> str | None:
+    """Return an error when required primary delivery failed."""
+    if job.delivery.best_effort:
+        return None
+    mode = (
+        job.delivery.mode
+        if isinstance(job.delivery.mode, DeliveryMode)
+        else DeliveryMode(job.delivery.mode)
+    )
+    channel_status = getattr(report, "channel_status", "skipped")
+    session_status = getattr(report, "session_status", "skipped")
+    if channel_status == "delivery_failed":
+        return f"Cron job '{job.name}' delivery failed"
+    if (
+        mode in {DeliveryMode.CHANNEL, DeliveryMode.ORIGIN, DeliveryMode.WEBHOOK}
+        and channel_status == "skipped"
+    ):
+        return f"Cron job '{job.name}' delivery was skipped"
+    if session_status == "forward_failed":
+        return f"Cron job '{job.name}' session delivery failed"
+    return None
+
+
+def _required_heartbeat_delivery_error(
+    job: CronJob,
+    delivery_override: dict[str, str] | None,
+    hb_result: Any,
+) -> str | None:
+    """Return an error when pinned heartbeat delivery was required but failed."""
+    if job.delivery.best_effort or delivery_override is None:
+        return None
+    hb_status = getattr(hb_result, "status", "")
+    delivery_status = getattr(hb_result, "delivery_status", "")
+    reason = getattr(hb_result, "reason", "")
+    if delivery_status in {"delivery_failed", "forward_failed"}:
+        return str(reason or delivery_status)
+    if hb_status == "skipped":
+        return str(reason or delivery_status or "delivery skipped")
+    return None
+
+
 def _build_cron_tool_context(
     agent_id: str,
     job: CronJob,
     *,
     session_key: str | None = None,
     workspace_resolver: WorkspaceResolver | None = None,
+    default_elevated: str | DefaultElevatedResolver | None = None,
 ) -> ToolContext:
     from opensquilla.scheduler.routing import build_cron_route_envelope, tool_context_from_envelope
 
@@ -88,9 +146,10 @@ def _build_cron_tool_context(
         workspace_dir, workspace_strict = workspace_resolver(agent_id)
     return tool_context_from_envelope(
         envelope,
-        is_owner=False,
+        is_owner=bool(getattr(job, "creator_is_owner", False)),
         workspace_dir=workspace_dir,
         workspace_strict=workspace_strict,
+        default_elevated=_resolve_default_elevated(default_elevated),
     )
 
 
@@ -150,6 +209,7 @@ def make_agent_run_handler(
     session_manager_ref: Callable[[], Any] | None = None,
     task_runtime_ref: Callable[[], Any] | None = None,
     workspace_resolver: WorkspaceResolver | None = None,
+    default_elevated: str | DefaultElevatedResolver | None = None,
 ) -> Callable:
     """Factory: creates an agent_run_handler with explicit DI.
 
@@ -254,6 +314,8 @@ def make_agent_run_handler(
                             or getattr(record, "terminal_reason", None)
                             or "Agent error"
                         )
+                        if is_context_payload_too_large(record):
+                            error_message = build_terminal_reply(record)
                         result_text = error_message or ""
                     summary = result_text[:500] if result_text else error_message
             else:
@@ -263,6 +325,7 @@ def make_agent_run_handler(
                     job,
                     session_key=session_key,
                     workspace_resolver=workspace_resolver,
+                    default_elevated=default_elevated,
                 )
                 async for event in wrap_stream(
                     turn_runner.run(
@@ -274,12 +337,26 @@ def make_agent_run_handler(
                         run_kind="cron_turn",
                         input_provenance={"kind": "cron_job", "job_id": job.id},
                     ),
-                    idle_timeout=180.0,
+                    idle_timeout=None,
                 ):
                     event_kind = getattr(event, "kind", "")
                     if event_kind == "error":
                         success = False
                         error_message = getattr(event, "message", "Agent error") or "Agent error"
+                        if is_context_payload_too_large(
+                            {
+                                "terminal_reason": getattr(event, "code", ""),
+                                "error_class": getattr(event, "code", ""),
+                                "error_message": error_message,
+                            }
+                        ):
+                            error_message = build_terminal_reply(
+                                {
+                                    "terminal_reason": getattr(event, "code", ""),
+                                    "error_class": getattr(event, "code", ""),
+                                    "error_message": error_message,
+                                }
+                            )
                     elif (
                         event_kind not in {"done", "state_change", "tool_use_start", "tool_result"}
                         and hasattr(event, "text")
@@ -291,10 +368,21 @@ def make_agent_run_handler(
                     result_text = error_message or ""
                 summary = result_text[:500] if result_text else error_message
         except Exception as exc:
-            result_text = f"Cron job '{job.name}' failed: {exc}"
+            _, error_message = sanitize_agent_error(
+                {
+                    "status": "failed",
+                    "terminal_reason": "error",
+                    "error_class": getattr(exc, "code", None) or type(exc).__name__,
+                    "error_message": str(exc),
+                },
+                fallback_error_message=str(exc) or "Agent error",
+            )
+            result_text = f"Cron job '{job.name}' failed: {error_message}"
             summary = result_text[:500]
             success = False
-            error_message = str(exc)
+
+        result_text = strip_reply_directives(result_text) or ""
+        summary = strip_reply_directives(summary)
 
         # Delivery chain — Channel + WS + session forward in parallel
         report = await delivery_chain.deliver(
@@ -309,6 +397,9 @@ def make_agent_run_handler(
         # Signal failure to scheduler pipeline
         if not success:
             raise RuntimeError(error_message or result_text or f"Cron job '{job.name}' failed")
+        delivery_error = _required_delivery_error(job, report)
+        if delivery_error:
+            raise RuntimeError(delivery_error)
 
         return HandlerResult(
             summary=summary,
@@ -319,6 +410,45 @@ def make_agent_run_handler(
         )
 
     return agent_run_handler
+
+
+def make_static_message_handler(delivery_chain: DeliveryChain) -> Callable:
+    """Factory for reminder cron jobs that only deliver static text."""
+
+    async def static_message_handler(job: CronJob) -> HandlerResult:
+        session_key = _resolve_session_key(job)
+        text = payload_text(job.payload, job.session_target)
+        if not text.strip():
+            log.warning("static_message_handler.empty_text", job_id=job.id)
+            return HandlerResult(session_key=session_key)
+
+        await delivery_chain.notify_start(job, text)
+        log.info(
+            "static_message_handler.start",
+            job_id=job.id,
+            session_target=str(job.session_target),
+            session_key=session_key,
+        )
+        report = await delivery_chain.deliver(
+            job,
+            result_text=text,
+            success=True,
+            summary=text[:500],
+            session_key=session_key,
+            route_envelope=build_reply_rendezvous_envelope(job, session_key),
+        )
+        delivery_error = _required_delivery_error(job, report)
+        if delivery_error:
+            raise RuntimeError(delivery_error)
+        return HandlerResult(
+            summary=text[:500],
+            session_key=session_key,
+            delivery_status=(
+                f"{report.channel_status}|ws:{report.ws_status}|fwd:{report.session_status}"
+            ),
+        )
+
+    return static_message_handler
 
 
 async def _read_transcript_rows(sm: Any, session_key: str) -> list[Any]:
@@ -371,6 +501,7 @@ def make_system_event_handler(
     heartbeat_service_ref: Callable[[], Any] | None = None,
     heartbeat_loop_ref: Callable[[], Any] | None = None,
     workspace_resolver: WorkspaceResolver | None = None,
+    default_elevated: str | DefaultElevatedResolver | None = None,
     wake_now_busy_max_wait_seconds: float = 120.0,
     wake_now_busy_retry_delay_seconds: float = 0.25,
 ) -> Callable:
@@ -406,6 +537,7 @@ def make_system_event_handler(
         heartbeat_loop = heartbeat_loop_ref() if heartbeat_loop_ref else None
         reason = f"cron:{job.id}"
         wake_mode = getattr(job.wake_mode, "value", str(job.wake_mode or CronWakeMode.NOW))
+        delivery_override = _resolve_system_event_heartbeat_delivery_override(job)
 
         if wake_mode == CronWakeMode.NEXT_HEARTBEAT.value:
             await _request_heartbeat_now(
@@ -435,8 +567,9 @@ def make_system_event_handler(
             job,
             session_key=session_key,
             workspace_resolver=workspace_resolver,
+            default_elevated=default_elevated,
         )
-        heartbeat_kwargs = {
+        heartbeat_kwargs: dict[str, Any] = {
             "reason": reason,
             "agent_id": agent_id,
             "session_key": session_key,
@@ -445,17 +578,22 @@ def make_system_event_handler(
             "tool_context": tool_context,
             "timeout": job.timeout_seconds,
         }
+        if delivery_override is not None:
+            heartbeat_kwargs["delivery_override"] = delivery_override
         run_once_now = getattr(heartbeat_loop, "run_once_now", None)
         if callable(run_once_now):
             async def _run_once():
-                return await run_once_now(
-                    reason=reason,
-                    agent_id=agent_id,
-                    session_key=session_key,
-                    target="last",
-                    tool_context=tool_context,
-                    timeout=job.timeout_seconds,
-                )
+                run_once_kwargs: dict[str, Any] = {
+                    "reason": reason,
+                    "agent_id": agent_id,
+                    "session_key": session_key,
+                    "target": "last",
+                    "tool_context": tool_context,
+                    "timeout": job.timeout_seconds,
+                }
+                if delivery_override is not None:
+                    run_once_kwargs["delivery_override"] = delivery_override
+                return await run_once_now(**run_once_kwargs)
 
         else:
             async def _run_once():
@@ -475,6 +613,14 @@ def make_system_event_handler(
         hb_reason = getattr(hb_result, "reason", "")
         if hb_status == "failed":
             raise RuntimeError(hb_reason or "heartbeat failed")
+        if not busy_fallback:
+            delivery_error = _required_heartbeat_delivery_error(
+                job,
+                delivery_override,
+                hb_result,
+            )
+            if delivery_error:
+                raise RuntimeError(delivery_error)
 
         if session_event_emitter is not None:
             await session_event_emitter(

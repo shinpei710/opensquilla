@@ -65,6 +65,17 @@ If `write_file`, `edit_file`, `apply_patch`, or `execute_code` is available:
   that tool is available.
 - The code examples later in this document apply.
 
+If only `create_pptx` is available:
+
+- Use it only for a basic text-only deck from slide titles, body text, and
+  bullets.
+- Do not use it for illustrated, image-heavy, chart-heavy, template-based, or
+  visually designed decks. It does not support images, icons, charts, custom
+  layouts, or visual QA.
+- If the user asked for those visual features, explain that full visual deck
+  authoring is unavailable in this session instead of calling `create_pptx` as
+  though it satisfies the request.
+
 If none of those file-authoring tools are available:
 
 - Do not attempt to generate, save, or modify the `.pptx`.

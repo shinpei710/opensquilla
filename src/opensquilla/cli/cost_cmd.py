@@ -10,7 +10,7 @@ from rich.table import Table
 
 from opensquilla.cli.gateway_rpc import run_gateway_sync
 from opensquilla.cli.output import print_json
-from opensquilla.cli.ui import console
+from opensquilla.cli.ui import ACCENT_HEADER, console
 
 app = typer.Typer(help="Inspect usage and estimated cost.")
 
@@ -55,7 +55,7 @@ def cost(
                 }
             )
             return
-        table = Table(title="Cost by Model", show_header=True, header_style="bold cyan")
+        table = Table(title="Cost by Model", show_header=True, header_style=ACCENT_HEADER)
         table.add_column("Model")
         table.add_column("Input", justify="right")
         table.add_column("Output", justify="right")
@@ -74,7 +74,7 @@ def cost(
         print_json(payload)
         return
 
-    table = Table(title="Cost", show_header=True, header_style="bold cyan")
+    table = Table(title="Cost", show_header=True, header_style=ACCENT_HEADER)
     table.add_column("Session")
     table.add_column("Model")
     table.add_column("Input", justify="right")

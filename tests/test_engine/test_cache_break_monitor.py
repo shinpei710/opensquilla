@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from opensquilla.engine import cache_break_monitor
 from opensquilla.engine.cache_break_monitor import CacheBreakMonitor
 from opensquilla.provider import ChatConfig, Message, ToolDefinition, ToolInputSchema
 
@@ -88,3 +89,80 @@ def test_cache_break_monitor_resets_baseline_after_compaction() -> None:
     assert report.break_detected is False
     assert report.reason == "baseline_reset_after_compaction"
     assert report.baseline_reset is True
+
+
+def test_notify_compaction_notifies_registered_listeners() -> None:
+    events: list[tuple[str, dict]] = []
+
+    remove = cache_break_monitor.add_compaction_listener(
+        lambda session_key, payload: events.append((session_key, payload))
+    )
+    try:
+        cache_break_monitor.notify_compaction(
+            "agent:main:s1",
+            source="manual",
+            phase="manual",
+            tokens_before=100,
+            tokens_after=40,
+        )
+    finally:
+        remove()
+
+    assert events == [
+        (
+            "agent:main:s1",
+            {
+                "status": "completed",
+                "source": "manual",
+                "phase": "manual",
+                "tokens_before": 100,
+                "tokens_after": 40,
+            },
+        )
+    ]
+
+
+def test_notify_compaction_resets_cache_only_after_completed_status(
+    monkeypatch,
+) -> None:
+    monitor = CacheBreakMonitor(min_drop_tokens=10, min_drop_ratio=0.05)
+    monkeypatch.setattr(cache_break_monitor, "default_cache_break_monitor", monitor)
+    before = monitor.record_prompt_state(
+        messages=[Message(role="user", content="old"), Message(role="user", content="now")],
+        tools=None,
+        config=ChatConfig(system="stable system"),
+        model="model-a",
+    )
+    monitor.check_response_for_cache_break("agent:main:s1", before, 5000)
+
+    cache_break_monitor.notify_compaction("agent:main:s1", status="started")
+    after_started = monitor.record_prompt_state(
+        messages=[
+            Message(role="assistant", content="kept"),
+            Message(role="user", content="now"),
+        ],
+        tools=None,
+        config=ChatConfig(system="stable system"),
+        model="model-a",
+    )
+    started_report = monitor.check_response_for_cache_break(
+        "agent:main:s1", after_started, 0
+    )
+
+    assert started_report.reason != "baseline_reset_after_compaction"
+
+    cache_break_monitor.notify_compaction("agent:main:s1", status="completed")
+    after_completed = monitor.record_prompt_state(
+        messages=[
+            Message(role="assistant", content="new baseline"),
+            Message(role="user", content="now"),
+        ],
+        tools=None,
+        config=ChatConfig(system="stable system"),
+        model="model-a",
+    )
+    completed_report = monitor.check_response_for_cache_break(
+        "agent:main:s1", after_completed, 0
+    )
+
+    assert completed_report.reason == "baseline_reset_after_compaction"

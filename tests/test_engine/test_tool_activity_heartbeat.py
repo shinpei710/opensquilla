@@ -122,6 +122,10 @@ async def test_tool_activity_heartbeat_does_not_extend_tool_timeout() -> None:
     assert any(isinstance(event, RunHeartbeatEvent) for event in events)
     assert cancelled.is_set()
     assert result.is_error
+    assert result.execution_status is not None
+    assert result.execution_status["status"] == "timeout"
+    assert result.execution_status["reason"] == "runtime_timeout"
+    assert result.execution_status["timed_out"] is True
     assert result.result.startswith("Tool 'slow_tool' timed out after ")
 
 
@@ -141,4 +145,7 @@ async def test_tool_task_cancellation_becomes_tool_error_without_cancelling_turn
     result = next(event for event in events if isinstance(event, ToolResultEvent))
 
     assert result.is_error
+    assert result.execution_status is not None
+    assert result.execution_status["status"] == "cancelled"
+    assert result.execution_status["reason"] == "cancelled"
     assert result.result == "Tool 'slow_tool' was cancelled"

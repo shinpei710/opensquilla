@@ -15,7 +15,7 @@ from rich.table import Table
 from opensquilla.cli.gateway_rpc import run_gateway_sync
 from opensquilla.cli.output import print_json
 from opensquilla.cli.repl.session_state import messages_to_markdown
-from opensquilla.cli.ui import console, error_panel
+from opensquilla.cli.ui import ACCENT, ACCENT_HEADER, console, error_panel
 from opensquilla.cli.url_utils import normalize_gateway_url
 
 app = typer.Typer(help="Manage chat sessions.")
@@ -109,7 +109,7 @@ async def _with_client(action):
     client = GatewayClient()
     try:
         await client.connect(
-            normalize_gateway_url(os.environ.get("OPENSQUILLA_GATEWAY_URL", "ws://localhost:18790/ws"))
+            normalize_gateway_url(os.environ.get("OPENSQUILLA_GATEWAY_URL", "ws://localhost:18791/ws"))
         )
         return await action(client)
     except SystemExit as exc:
@@ -153,7 +153,7 @@ def sessions_list(
         print_json(payload)
         return
 
-    table = Table(title="Sessions", show_header=True, header_style="bold cyan")
+    table = Table(title="Sessions", show_header=True, header_style=ACCENT_HEADER)
     table.add_column("Key")
     table.add_column("Agent")
     table.add_column("Status")
@@ -191,8 +191,8 @@ def sessions_show(
     previews = result.get("preview", {}).get("previews", []) if isinstance(result, dict) else []
     preview = previews[0] if previews else {}
     key = _resolved_key(resolved, session_id)
-    table = Table(title=f"Session {key}", show_header=True, header_style="bold cyan")
-    table.add_column("Field", style="cyan")
+    table = Table(title=f"Session {key}", show_header=True, header_style=ACCENT_HEADER)
+    table.add_column("Field", style=ACCENT)
     table.add_column("Value")
     for field, value in (
         ("session_key", key),

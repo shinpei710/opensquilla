@@ -42,6 +42,38 @@ def test_direct_profile_static_fallbacks_cover_context_windows() -> None:
         assert max_tokens <= context_window
 
 
+def test_openrouter_near_context_completion_window_uses_safe_default() -> None:
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [
+            {
+                "id": "provider/vision-model",
+                "context_length": 262_144,
+                "top_provider": {"max_completion_tokens": 262_142},
+            }
+        ]
+    )
+
+    assert catalog.resolve_context_window("provider/vision-model") == 262_144
+    assert catalog.resolve_max_tokens("provider/vision-model") == 8192
+
+
+def test_openrouter_safe_default_never_raises_smaller_provider_limit() -> None:
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [
+            {
+                "id": "provider/smaller-output-model",
+                "context_length": 12_000,
+                "top_provider": {"max_completion_tokens": 4096},
+            }
+        ]
+    )
+
+    assert catalog.resolve_context_window("provider/smaller-output-model") == 12_000
+    assert catalog.resolve_max_tokens("provider/smaller-output-model") == 4096
+
+
 @pytest.mark.asyncio
 async def test_fetch_openrouter_adds_app_attribution_headers() -> None:
     captured: dict[str, object] = {}

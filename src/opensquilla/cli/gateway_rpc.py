@@ -17,7 +17,7 @@ def default_gateway_url() -> str:
     """Return the configured gateway WebSocket URL."""
 
     return normalize_gateway_url(
-        os.environ.get("OPENSQUILLA_GATEWAY_URL", "ws://localhost:18790/ws")
+        os.environ.get("OPENSQUILLA_GATEWAY_URL", "ws://localhost:18791/ws")
     )
 
 

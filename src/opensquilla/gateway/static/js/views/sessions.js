@@ -17,6 +17,10 @@ const SessionsView = (() => {
   let _searchVal = '';
   // agent_id → agent entry from agents.list, used for orphan-agent detection.
   let _agentsById = new Map();
+  // Set true only after a successful agents.list response. Orphan chip rendering
+  // is gated on this so a transient registry failure does not flood the table
+  // with false "Orphaned" badges (the map would be empty during the failure).
+  let _agentsLoaded = false;
 
   function render(el) {
     _el = el;
@@ -27,7 +31,7 @@ const SessionsView = (() => {
           <div class="sess-stage__title-block">
             <span class="sess-stage__eyebrow">Control · Sessions</span>
             <h2 class="sess-stage__title">Sessions</h2>
-            <p class="sess-stage__subtitle">Live conversations and agent runs — open one to chat, or clean up old state.</p>
+            <p class="sess-stage__subtitle">Session history, current task activity, and agent runs — open one to chat, or clean up old state.</p>
           </div>
           <div class="sess-stage__actions">
             <div class="sess-search-wrap">
@@ -74,14 +78,22 @@ const SessionsView = (() => {
 
     _el.querySelector('#sess-refresh').addEventListener('click', _loadData);
     _el.querySelector('#sess-new').addEventListener('click', _openNewSessionModal);
+    // Debounce search input so each keystroke doesn't force a full
+    // _applyFilter + _renderTable on a 200+ row dataset.
+    let _searchDebounceId = null;
     _el.querySelector('#sess-search').addEventListener('input', (e) => {
-      _searchVal = e.target.value.trim().toLowerCase();
-      _page = 0;
-      _selected.clear();
-      _applyFilter();
-      _renderTable();
-      _renderPagination();
-      _renderBulkBar();
+      const value = e.target.value.trim().toLowerCase();
+      if (_searchDebounceId !== null) clearTimeout(_searchDebounceId);
+      _searchDebounceId = setTimeout(() => {
+        _searchDebounceId = null;
+        _searchVal = value;
+        _page = 0;
+        _selected.clear();
+        _applyFilter();
+        _renderTable();
+        _renderPagination();
+        _renderBulkBar();
+      }, 180);
     });
     _el.querySelector('#sess-page-size').addEventListener('change', (e) => {
       _pageSize = Number(e.target.value);
@@ -115,15 +127,22 @@ const SessionsView = (() => {
     await _rpc.waitForConnection();
     // Fetch sessions and agents in parallel so the orphan-agent badge is
     // always rendered against fresh registry state.
+    // Explicit limit=200 keeps backend default (50) intact for CLI/channel
+    // consumers — only this WebUI surface opts into the larger page size.
     const [sessRes, agentsRes] = await Promise.allSettled([
-      _rpc.call('sessions.list'),
+      _rpc.call('sessions.list', { limit: 200 }),
       _rpc.call('agents.list'),
     ]);
     if (!_el) return;
     if (agentsRes.status === 'fulfilled') {
       const list = agentsRes.value?.agents || [];
       _agentsById = new Map(list.map(a => [a.id, a]));
+      _agentsLoaded = true;
     }
+    // Note: on agentsRes rejection we deliberately DO NOT clear _agentsLoaded
+    // or _agentsById — a transient registry hiccup keeps the last known map,
+    // avoiding spurious orphan chips. _agentsLoaded only flips back to false
+    // if the view is destroyed.
     if (sessRes.status === 'fulfilled') {
       _allSessions = sessRes.value?.sessions || [];
       _selected.clear();
@@ -141,9 +160,15 @@ const SessionsView = (() => {
     if (!_searchVal) {
       _filtered = [..._allSessions];
     } else {
+      // Search now also matches user-meaningful metadata (display_name,
+      // subject, derived_title) so a renamed session like "Bug triage" is
+      // findable by name — previously only key/model were searched.
       _filtered = _allSessions.filter(s =>
         String(s.key || '').toLowerCase().includes(_searchVal) ||
-        String(s.model || '').toLowerCase().includes(_searchVal)
+        String(s.model || '').toLowerCase().includes(_searchVal) ||
+        String(s.display_name || s.displayName || '').toLowerCase().includes(_searchVal) ||
+        String(s.subject || '').toLowerCase().includes(_searchVal) ||
+        String(s.derived_title || s.derivedTitle || '').toLowerCase().includes(_searchVal)
       );
     }
     _sortData();
@@ -153,7 +178,7 @@ const SessionsView = (() => {
     _filtered.sort((a, b) => {
       let va = a[_sortCol] ?? '';
       let vb = b[_sortCol] ?? '';
-      if (_sortCol === 'size_bytes' || _sortCol === 'message_count' || _sortCol === 'entry_count') {
+      if (_sortCol === 'message_count' || _sortCol === 'updated_at') {
         va = Number(va) || 0;
         vb = Number(vb) || 0;
       } else {
@@ -169,11 +194,17 @@ const SessionsView = (() => {
     const wrap = _el && _el.querySelector('#stat-row');
     if (!wrap) return;
     const total = _allSessions.length;
-    const running = _allSessions.filter(s => s.status === 'running').length;
-    const done = _allSessions.filter(s => s.status === 'done').length;
-    const errored = _allSessions.filter(s =>
-      s.status === 'failed' || s.status === 'killed' || s.status === 'timeout'
-    ).length;
+    const lifecycleOpen = _allSessions.filter(s => s.status === 'running').length;
+    const activeRuns = _allSessions.filter(s => {
+      const runStatus = _sessionRunStatus(s);
+      return runStatus === 'queued' || runStatus === 'running';
+    }).length;
+    const done = _allSessions.filter(s => _sessionVisualStatus(s) === 'done').length;
+    const failedOrTimedOut = _allSessions.filter(s => {
+      const status = _sessionVisualStatus(s);
+      return status === 'failed' || status === 'timeout';
+    }).length;
+    const aborted = _allSessions.filter(s => _sessionVisualStatus(s) === 'killed').length;
     const totalMessages = _allSessions.reduce((acc, s) => acc + (Number(s.message_count) || 0), 0);
     const totalSize = _allSessions.reduce((acc, s) => acc + (Number(s.size_bytes) || 0), 0);
     // Distinct agents derived from key prefix `agent:NAME:...` (best-effort).
@@ -187,25 +218,23 @@ const SessionsView = (() => {
       <div class="stat stat--hero">
         <div class="stat-label">Total sessions</div>
         <div class="stat-value">${total}</div>
-        <div class="stat-hint">${running} running · ${done} done · ${errored} errored</div>
+        <div class="stat-hint">${lifecycleOpen} open · ${done} completed · ${failedOrTimedOut} failed/timed out · ${aborted} aborted</div>
       </div>
-      <div class="stat">
-        <div class="stat-label">Active</div>
+      <div class="stat" title="Sessions with queued or running tasks">
+        <div class="stat-label">Executing</div>
         <div class="stat-value">
-          ${running}${running ? '<span class="dot ok"></span>' : ''}
+          ${activeRuns}${activeRuns ? '<span class="dot ok"></span>' : ''}
         </div>
-        <div class="stat-hint">${running ? 'live conversations' : 'none active'}</div>
+        <div class="stat-hint">${activeRuns ? 'tasks queued/running' : 'none executing'}</div>
       </div>
       <div class="stat">
         <div class="stat-label">Messages</div>
         <div class="stat-value mono">${totalMessages.toLocaleString()}</div>
-        <div class="stat-hint">across all sessions</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">Storage</div>
-        <div class="stat-value mono">${_fmtBytes(totalSize)}</div>
-        <div class="stat-hint">${agents.size} agent${agents.size === 1 ? '' : 's'}</div>
+        <div class="stat-hint">${agents.size} agent${agents.size === 1 ? '' : 's'} · across all sessions</div>
       </div>`;
+    // Storage KPI removed: backend rpc_sessions.py sets size_bytes=None on every
+    // row, so the aggregate was always 0 B and the card displayed dead data.
+    // Agent count merged into the Messages hint to preserve that signal.
   }
 
   function _renderTable() {
@@ -235,16 +264,19 @@ const SessionsView = (() => {
       return;
     }
 
+    // Note: backend RPC payload (rpc_sessions.py:623-624) still emits BOTH
+    // message_count and entry_count keys for CLI compatibility — cli/sessions_cmd.py
+    // and cli/chat_cmd.py read both via `or` fallback. The frontend only renders
+    // one column to avoid showing identical numbers twice.
     const cols = [
       { key: 'select', label: '' },
       { key: 'key', label: 'Session key' },
       { key: 'status', label: 'Status' },
       { key: 'message_count', label: 'Msgs' },
-      { key: 'entry_count', label: 'Entries' },
       { key: 'updated_at', label: 'Modified' },
       { key: '_actions', label: '' },
     ];
-    const sortable = ['key', 'updated_at', 'message_count', 'entry_count'];
+    const sortable = ['key', 'updated_at', 'message_count'];
 
     const allOnPage = slice.length > 0 && slice.every(s => _selected.has(s.key));
 
@@ -265,10 +297,12 @@ const SessionsView = (() => {
 
     slice.forEach(row => {
       const checked = _selected.has(row.key) ? 'checked' : '';
-      const status = (row.status || 'unknown').toLowerCase();
+      const visualStatus = _sessionVisualStatus(row);
+      const status = visualStatus;
       const statusCls = UI.sessionStatusClass(status);
       const statusChip = UI.sessionStatusChip(status);
       const statusTip = UI.sessionStatusLabel(status);
+      const runBadge = _runStatusBadge(row);
       const modified = row.updated_at ? UI.relTime(row.updated_at) : '—';
       const isSel = _selected.has(row.key);
       const agentId = row.agent_id || row.agentId || _agentIdFromKey(row.key);
@@ -276,13 +310,14 @@ const SessionsView = (() => {
       html += `<tr class="${isSel ? 'is-selected' : ''}">
         <td class="sess-table__cell--check"><label class="sess-check"><input type="checkbox" class="sess-row-check" data-key="${_esc(row.key)}" ${checked} /><span></span></label></td>
         <td class="sess-table__cell--key">
-          <span class="dot ${statusCls}" title="${_esc(statusTip)}"></span>
-          <button type="button" class="sess-key-link" data-open-key="${_esc(row.key)}" title="Open chat">${_esc(row.key)}</button>
-          ${agentMeta}
+          <div class="sess-table__key-content">
+            <span class="dot ${statusCls}" title="${_esc(statusTip)}"></span>
+            <button type="button" class="sess-key-link" data-open-key="${_esc(row.key)}" title="Open chat">${_esc(row.key)}</button>
+            ${agentMeta}
+          </div>
         </td>
-        <td><span class="chip ${statusChip}">${_esc(statusTip)}</span></td>
+        <td><div class="sess-status-stack"><span class="chip ${statusChip}">${_esc(statusTip)}</span>${runBadge}</div></td>
         <td class="sess-mono">${row.message_count != null ? Number(row.message_count).toLocaleString() : '—'}</td>
-        <td class="sess-mono sess-dim">${row.entry_count != null ? Number(row.entry_count).toLocaleString() : '—'}</td>
         <td class="sess-mono sess-dim">${_esc(modified)}</td>
         <td class="sess-table__cell--actions">
           <button class="sess-iconbtn" data-open-key="${_esc(row.key)}" title="Open chat">${icons.chat()}</button>
@@ -457,17 +492,27 @@ const SessionsView = (() => {
     if (keys.length === 0) return;
     UI.modal(
       'Delete sessions',
-      `<p>Delete <strong>${keys.length}</strong> session${keys.length === 1 ? '' : 's'}? This cannot be undone.</p>`,
+      `<p>Delete <strong>${keys.length}</strong> session${keys.length === 1 ? '' : 's'}? This cannot be undone.</p>
+       <p class="sess-modal__warn"><small>The transcript will not be flushed to disk; use <code>/reset</code> first if you want a backup.</small></p>`,
       [
         {
           label: 'Delete all', cls: 'btn-danger', onClick: async () => {
-            let failed = 0;
-            for (const key of keys) {
-              try { await _rpc.call('sessions.delete', { key }); }
-              catch { failed++; }
+            // Backend sessions.delete (rpc_sessions.py:1466) accepts {keys:[...]}
+            // for batch deletion and returns {deleted: [...], errors: [...]}.
+            // One round-trip instead of N preserves partial-failure semantics
+            // via the errors[] array.
+            try {
+              const res = await _rpc.call('sessions.delete', { keys });
+              const errCount = (res && res.errors && res.errors.length) || 0;
+              const okCount = (res && res.deleted && res.deleted.length) ?? (keys.length - errCount);
+              if (errCount > 0) {
+                UI.toast(`Deleted ${okCount}, ${errCount} failed`, 'warn');
+              } else {
+                UI.toast(`Deleted ${okCount} session${okCount === 1 ? '' : 's'}`, 'info');
+              }
+            } catch (err) {
+              UI.toast('Bulk delete failed: ' + (err?.message || 'unknown error'), 'err');
             }
-            if (failed > 0) UI.toast(`${failed} deletion(s) failed`, 'err');
-            else UI.toast(`Deleted ${keys.length} session${keys.length === 1 ? '' : 's'}`, 'info');
             _selected.clear();
             _loadData();
           }
@@ -480,7 +525,8 @@ const SessionsView = (() => {
   function _deleteSession(key) {
     UI.modal(
       'Delete session',
-      `<p>Delete session <strong>${_esc(key)}</strong>? This cannot be undone.</p>`,
+      `<p>Delete session <strong>${_esc(key)}</strong>? This cannot be undone.</p>
+       <p class="sess-modal__warn"><small>The transcript will not be flushed to disk; use <code>/reset</code> first if you want a backup.</small></p>`,
       [
         {
           label: 'Delete', cls: 'btn-danger', onClick: () => {
@@ -659,6 +705,72 @@ const SessionsView = (() => {
     return m ? m[1] : '';
   }
 
+  function _normalizeRunStatus(status) {
+    const value = String(status || '').toLowerCase();
+    if (value === 'abandoned') return 'interrupted';
+    if (value === 'succeeded' || value === 'success' || value === 'complete') return 'idle';
+    if (['queued', 'running', 'interrupted', 'failed', 'timeout', 'cancelled'].includes(value)) {
+      return value;
+    }
+    return 'idle';
+  }
+
+  function _sessionRunStatus(row) {
+    row = row || {};
+    const active = row.active_task || row.activeTask || null;
+    const activeStatus = active ? _normalizeRunStatus(active.status) : '';
+    const terminalStatus = _terminalRunStatus(row);
+    const rawStatus = row.run_status || row.runStatus || active?.status || terminalStatus || '';
+    const runStatus = _normalizeRunStatus(rawStatus);
+    if (active && (activeStatus === 'queued' || activeStatus === 'running')) return activeStatus;
+    if (terminalStatus) return _normalizeRunStatus(terminalStatus);
+    return runStatus;
+  }
+
+  function _terminalRunStatus(row) {
+    row = row || {};
+    const lastTask = row.last_task || row.lastTask || null;
+    const rawStatus = lastTask?.status || row.terminal_status || row.terminalStatus || '';
+    const status = _normalizeRunStatus(rawStatus);
+    return ['failed', 'timeout', 'cancelled', 'interrupted'].includes(status) ? status : '';
+  }
+
+  function _sessionVisualStatus(row) {
+    const runStatus = _sessionRunStatus(row);
+    if (runStatus === 'failed' || runStatus === 'timeout') return runStatus;
+    if (runStatus === 'cancelled' || runStatus === 'interrupted') return 'killed';
+    return String(row?.status || 'unknown').toLowerCase();
+  }
+
+  function _runStatusLabel(status) {
+    return {
+      queued: 'Task queued',
+      running: 'Task running',
+      interrupted: 'Interrupted',
+      failed: 'Last task failed',
+      timeout: 'Last task timed out',
+      cancelled: 'Last task cancelled',
+    }[status] || '';
+  }
+
+  function _runStatusChipClass(status) {
+    return {
+      queued: 'chip-warn',
+      running: 'chip-ok',
+      interrupted: 'chip-warn',
+      failed: 'chip-danger',
+      timeout: 'chip-warn',
+    }[status] || '';
+  }
+
+  function _runStatusBadge(row) {
+    const runStatus = _sessionRunStatus(row);
+    const label = _runStatusLabel(runStatus);
+    if (!label) return '';
+    const chipClass = _runStatusChipClass(runStatus);
+    return `<span class="chip ${chipClass} sess-run-chip" title="${_esc(label)}">${_esc(label)}</span>`;
+  }
+
   // Render the per-row agent subline. Shows the agent display name when known,
   // or a yellow ⚠ Orphaned chip when the session references an agent that no
   // longer exists in the registry. Returns '' for blank or built-in `main` so
@@ -676,6 +788,15 @@ const SessionsView = (() => {
       </div>`;
     }
     if (agentId === 'main') return '';
+    // Only mark a row "Orphaned" once we have actually loaded the registry and
+    // confirmed the id is missing. Before first successful agents.list (e.g.
+    // during a transient RPC failure) show the agent id as plain text so a
+    // network blip doesn't flood the table with false orphan warnings.
+    if (!_agentsLoaded) {
+      return `<div class="sess-key__sub">
+        <span class="sess-key__agent">${_esc(agentId)}</span>
+      </div>`;
+    }
     return `<div class="sess-key__sub">
       <span class="sess-key__agent sess-key__agent--orphan" title="Agent '${_esc(agentId)}' is no longer registered">
         ${_esc(agentId)}

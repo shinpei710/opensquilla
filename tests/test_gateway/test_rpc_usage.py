@@ -54,12 +54,102 @@ def test_usage_status_tracker_only_path_surfaces_cache_totals() -> None:
     assert row["estimatedCostUsd"] == row["costUsd"]
 
 
+def test_usage_status_tracker_row_source_matches_breakdown_when_billed() -> None:
+    """Tracker rows with real billed data must match breakdown cost sources.
+
+    A tracker-only row must not claim ``opensquilla_estimate`` while each
+    per-model breakdown item reports ``provider_billed``.
+    """
+    tracker = UsageTracker()
+    tracker.add(
+        "agent:webchat:billed",
+        input_tokens=29213,
+        output_tokens=400,
+        model_id="anthropic/claude-4.7-opus",
+        cache_read_tokens=11588,
+        cache_write_tokens=17772,
+        billed_cost=0.1254,
+    )
+    tracker.add(
+        "agent:webchat:billed",
+        input_tokens=9323,
+        output_tokens=0,
+        model_id="z-ai/glm-5.1",
+        billed_cost=0.0111,
+    )
+
+    ctx = _ctx(session_manager=None, usage_tracker=tracker)
+    payload = asyncio.run(_handle_usage_status(None, ctx))
+
+    [row] = payload["sessions"]
+    # Row now reports the real billed total + provider_billed source.
+    assert row["costSource"] == "provider_billed"
+    assert row["cost_source"] == "provider_billed"
+    assert row["costUsd"] == 0.1365
+    assert row["billedCostUsd"] == 0.1365
+    # Per-model breakdown items also provider_billed; sum equals row cost.
+    breakdown = row["modelBreakdown"]
+    assert all(item["costSource"] == "provider_billed" for item in breakdown)
+    breakdown_sum = sum(item["costUsd"] for item in breakdown)
+    assert breakdown_sum == row["costUsd"]
+
+
+def test_usage_status_tracker_row_source_mixed_when_some_models_unbilled() -> None:
+    """Mix of billed + unbilled models in the tracker → row gets 'mixed'
+    source (not provider_billed and not opensquilla_estimate). The row
+    cost must equal the breakdown sum (billed for billed models +
+    estimate for unbilled), not just the billed-only portion — otherwise
+    the row visibly under-reports against its own breakdown.
+    """
+    tracker = UsageTracker()
+    tracker.add(
+        "agent:webchat:mixed",
+        input_tokens=1000,
+        output_tokens=50,
+        model_id="claude-opus-4-7",
+        billed_cost=0.05,
+    )
+    tracker.add(
+        "agent:webchat:mixed",
+        input_tokens=2000,
+        output_tokens=80,
+        model_id="deepseek-v4-pro",
+        # no billed_cost — provider didn't return a price for this call
+    )
+
+    ctx = _ctx(session_manager=None, usage_tracker=tracker)
+    payload = asyncio.run(_handle_usage_status(None, ctx))
+
+    [row] = payload["sessions"]
+    assert row["costSource"] == "mixed"
+    # billed_cost_usd reflects only the truly billed portion.
+    assert row["billedCostUsd"] == 0.05
+    # Key invariant: row.cost_usd == sum of breakdown costs, i.e. billed
+    # (for billed models) + estimate (for unbilled models). Setting this to
+    # billed_cost only under-reports by the unbilled portion.
+    breakdown_sum = sum(item["costUsd"] for item in row["modelBreakdown"])
+    assert row["costUsd"] == breakdown_sum
+    # And the unbilled model contributed a non-zero estimate.
+    assert row["costUsd"] > 0.05
+
+
 class _FakeSessionManager:
     def __init__(self, sessions):
         self._sessions = sessions
 
     async def list_sessions(self):
         return self._sessions
+
+
+class _FakeTranscriptSessionManager(_FakeSessionManager):
+    def __init__(self, sessions, transcript):
+        super().__init__(sessions)
+        self._transcript = transcript
+        self.transcript_calls = 0
+
+    async def get_transcript(self, session_key):
+        self.transcript_calls += 1
+        return self._transcript
 
 
 def test_usage_status_session_manager_path_reads_cache_fields() -> None:
@@ -89,6 +179,61 @@ def test_usage_status_session_manager_path_reads_cache_fields() -> None:
     assert row["billedCostUsd"] == 0.0
     assert row["costSource"] == "opensquilla_estimate"
     assert row["costEphemeral"] is False
+
+
+def test_usage_status_reports_context_pressure_from_session_context_not_lifetime_usage() -> None:
+    session = SimpleNamespace(
+        session_key="agent:webchat:compact",
+        status="running",
+        input_tokens=1_137_000,
+        output_tokens=18_000,
+        context_tokens=36_809,
+        compaction_count=0,
+        model="z-ai/glm-5.1",
+    )
+    sm = _FakeSessionManager([session])
+
+    ctx = _ctx(session_manager=sm, usage_tracker=UsageTracker())
+    payload = asyncio.run(_handle_usage_status(None, ctx))
+
+    [row] = payload["sessions"]
+    context_status = row["contextStatus"]
+    assert context_status == row["context_status"]
+    assert context_status["contextTokens"] == 36_809
+    assert context_status["context_tokens"] == 36_809
+    assert context_status["contextWindowTokens"] == 202_752
+    assert context_status["context_window_tokens"] == 202_752
+    assert context_status["compactionCount"] == 0
+    assert context_status["pressure"] < 0.25
+    assert context_status["pressure"] < row["inputTokens"] / context_status["contextWindowTokens"]
+
+
+def test_usage_status_only_estimates_transcript_context_for_requested_session() -> None:
+    session = SimpleNamespace(
+        session_key="agent:webchat:requested",
+        status="running",
+        input_tokens=500_000,
+        output_tokens=10_000,
+        model="z-ai/glm-5.1",
+    )
+    sm = _FakeTranscriptSessionManager(
+        [session],
+        [
+            SimpleNamespace(token_count=1_500),
+            SimpleNamespace(content="apple book chair"),
+        ],
+    )
+    ctx = _ctx(session_manager=sm, usage_tracker=UsageTracker())
+
+    unrequested = asyncio.run(_handle_usage_status(None, ctx))
+    assert sm.transcript_calls == 0
+    assert unrequested["sessions"][0]["contextStatus"] is None
+
+    requested = asyncio.run(_handle_usage_status({"sessionKey": "agent:webchat:requested"}, ctx))
+    assert sm.transcript_calls == 1
+    context_status = requested["sessions"][0]["contextStatus"]
+    assert context_status["tokenSource"] == "transcript_estimate"
+    assert context_status["contextTokens"] >= 1_500
 
 
 def test_usage_status_exposes_session_timestamp_aliases() -> None:

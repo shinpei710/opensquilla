@@ -3,21 +3,24 @@
 from __future__ import annotations
 
 import json
-import re
-import unicodedata
 from typing import Any, Protocol
 
 import structlog
 
 from opensquilla.scheduler.payloads import (
+    REMINDER_KIND,
     SYSTEM_EVENT_KIND,
     make_agent_turn_payload,
+    make_reminder_payload,
     make_system_event_payload,
 )
+from opensquilla.scheduler.prompt_safety import scan_cron_prompt as _scan_cron_prompt
+from opensquilla.scheduler.schedule_normalizer import coerce_schedule_from_params
 from opensquilla.scheduler.types import (
     DeliveryConfig,
     DeliveryMode,
     ReplyTargetSnapshot,
+    ScheduleKind,
     SessionTarget,
 )
 from opensquilla.tools.registry import tool
@@ -26,63 +29,6 @@ from opensquilla.tools.types import ToolError
 log = structlog.get_logger(__name__)
 
 _VALID_CRON_ACTIONS = ("list", "add", "remove", "run")
-
-
-# ---------------------------------------------------------------------------
-# Cron prompt injection scanner
-# ---------------------------------------------------------------------------
-
-# Hard-block patterns — always rejected
-_HARD_BLOCK_PATTERNS: list[re.Pattern[str]] = [
-    # Invisible unicode characters
-    re.compile(r"[\u200b-\u200f\u2028-\u202f\u2060-\u206f\ufeff]"),
-    # Exfiltration via curl/wget with variable interpolation
-    re.compile(r"(curl|wget)\s+.*(\{\{|\\$[\w{])", re.IGNORECASE),
-    # Destructive system commands
-    re.compile(r"rm\s+-rf\s+/", re.IGNORECASE),
-    re.compile(r"mkfs\.", re.IGNORECASE),
-    re.compile(r":(){ :\|:& };:", re.IGNORECASE),  # fork bomb
-]
-
-# Soft-block patterns — logged as warning, still rejected
-_SOFT_BLOCK_PATTERNS: list[re.Pattern[str]] = [
-    # Instruction injection
-    re.compile(r"ignore\s+(all\s+)?previous\s+instructions", re.IGNORECASE),
-    re.compile(r"you\s+are\s+now\s+", re.IGNORECASE),
-    re.compile(r"system\s*:\s*", re.IGNORECASE),
-    re.compile(r"<\|im_start\|>", re.IGNORECASE),
-    re.compile(r"disregard\s+(all\s+)?prior", re.IGNORECASE),
-    # SQL destructive
-    re.compile(r"\b(DROP|TRUNCATE)\s+(TABLE|DATABASE)\b", re.IGNORECASE),
-]
-
-
-def _scan_cron_prompt(task: str) -> tuple[bool, str]:
-    """Scan a cron task prompt for injection/exfiltration patterns.
-
-    Returns (blocked: bool, reason: str). If blocked is True, the prompt
-    should be rejected.
-    """
-    # Check for invisible unicode characters
-    for char in task:
-        cat = unicodedata.category(char)
-        if cat in ("Cf", "Mn", "Cc") and char not in ("\n", "\r", "\t"):
-            log.warning("cron_prompt_blocked", pattern="invisible_unicode", char=repr(char))
-            return True, f"Blocked: invisible unicode character detected ({repr(char)})"
-
-    # Hard-block patterns
-    for pattern in _HARD_BLOCK_PATTERNS:
-        if pattern.search(task):
-            log.warning("cron_prompt_blocked", pattern=pattern.pattern)
-            return True, f"Blocked: dangerous pattern detected ({pattern.pattern})"
-
-    # Soft-block patterns
-    for pattern in _SOFT_BLOCK_PATTERNS:
-        if pattern.search(task):
-            log.warning("cron_prompt_blocked", pattern=pattern.pattern, severity="soft")
-            return True, f"Blocked: potential injection pattern ({pattern.pattern})"
-
-    return False, ""
 
 
 _VALID_GATEWAY_ACTIONS = ("restart", "config_get", "config_set")
@@ -94,21 +40,30 @@ class _SchedulerProtocol(Protocol):
     async def add_job(
         self,
         name: str,
-        schedule_raw: str | None = None,
+        *,
+        schedule_kind: Any,
+        schedule_value: str,
+        schedule_tz: str = "",
         handler_key: str = "agent_run",
         payload: dict[Any, Any] | None = None,
         session_target: SessionTarget = SessionTarget.ISOLATED,
         session_key: str = "",
         timeout_seconds: float = 600.0,
-        wake_mode: str = "now",
+        wake_mode: Any = "now",
         max_retries: int = 3,
         origin_session_key: str = "",
-        cron_expr: str | None = None,
         delivery: DeliveryConfig | None = None,
         tool_policy: dict[str, Any] | None = None,
+        tz: str = "",
+        jitter_seconds: float | None = None,
+        creator_session_key: str = "",
+        creator_sender_id: str = "",
+        creator_is_owner: bool = False,
     ) -> Any: ...
 
     async def update_job(self, job_id: str, **patch: Any) -> Any: ...
+
+    async def get_job(self, job_id: str) -> Any | None: ...
 
     async def remove_job(self, job_id: str) -> bool: ...
 
@@ -145,13 +100,63 @@ def gateway_config_available() -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _coerce_tool_schedule(
+    schedule: Any,
+    *,
+    tz: str = "",
+) -> tuple[ScheduleKind, str, str]:
+    """Validate the structured `schedule` param from the LLM tool call.
+
+    Returns ``(ScheduleKind, schedule_value, schedule_tz)`` ready for
+    ``add_job(schedule_kind=..., schedule_value=..., schedule_tz=...)``.
+
+    Raises ``ToolError`` whose message names the offending field and shows the
+    accepted shape so the model can self-correct on the next turn.
+    """
+    if not isinstance(schedule, dict):
+        raise ToolError(
+            "schedule must be an object with shape "
+            "{kind: 'cron'|'every'|'at', ...}; "
+            f"got {type(schedule).__name__}"
+        )
+    try:
+        return coerce_schedule_from_params({"schedule": schedule, "tz": tz})
+    except ValueError as exc:
+        raise ToolError(str(exc)) from exc
+
+
+def _owns_cron_job(job: Any, sender_id: str, session_key: str) -> bool:
+    """Caller-ownership test for non-owner cron actions.
+
+    Prefer the stable channel sender_id; fall back to session_key for jobs
+    created before sender_id tracking existed (or for non-channel sessions).
+    """
+    job_sender = (getattr(job, "creator_sender_id", "") or "")
+    job_session = (getattr(job, "creator_session_key", "") or "")
+    if sender_id and job_sender:
+        return job_sender == sender_id
+    if session_key and job_session:
+        return job_session == session_key
+    return False
+
+
 @tool(
     name="cron",
     description=(
         "Create, list, remove, or trigger scheduled cron jobs. "
         "Use this tool (NOT exec_command or background_process) for any recurring/timed "
-        "task scheduling or reminders. For reminders such as '每分钟提醒我喝水', use "
-        "job_kind=system_event and session_target=main."
+        "task scheduling or reminders. Translate any natural language into the "
+        "structured schedule shape yourself; the tool will not parse free-form text. "
+        "For proactive reminders, including reminders phrased as 'this/current "
+        "session', use job_kind=reminder and session_target=isolated so the "
+        "scheduled run delivers static text without invoking the agent/model "
+        "chain or adding a fake user turn to the visible conversation. Use "
+        "job_kind=system_event and session_target=main only for internal "
+        "main-session events. "
+        "For recurring background agent tasks such as 'every morning summarize "
+        "yesterday's emails', use job_kind=agent_turn with session_target=isolated. "
+        "Channel users can create reminders and tasks bound to the calling channel; "
+        "list / remove / run only affect jobs the caller created."
     ),
     params={
         "action": {
@@ -159,11 +164,43 @@ def gateway_config_available() -> bool:
             "description": "Action: list, add, remove, run",
         },
         "schedule": {
-            "type": "string",
+            "type": "object",
             "description": (
-                "Schedule: cron expr, natural language ('every 30m', '2h'), Chinese "
-                "reminders ('每分钟', '每5分钟', '45分钟后', '每天9点'), or ISO timestamp"
+                "Structured schedule. Choose one shape. "
+                "Do not pass human language in schedule; translate it before the tool call. "
+                "Examples: "
+                "for '每5分钟提醒我喝水' call schedule={kind:'cron', expr:'*/5 * * * *'}, "
+                "job_kind='reminder', session_target='isolated'; "
+                "for '45分钟后提醒我' call "
+                "schedule={kind:'at', at:'<now+45min as ISO-8601 with timezone>'}; "
+                "for '每30秒打印一次' call schedule={kind:'every', every_seconds:30}; "
+                "for 'every weekday at 9 AM Shanghai time' call "
+                "schedule={kind:'cron', expr:'0 9 * * 1-5', tz:'Asia/Shanghai'}."
             ),
+            "properties": {
+                "kind": {
+                    "type": "string",
+                    "enum": ["cron", "every", "at"],
+                },
+                "expr": {
+                    "type": "string",
+                    "description": "5-field POSIX cron (kind=cron)",
+                },
+                "tz": {
+                    "type": "string",
+                    "description": "Optional IANA timezone (kind=cron)",
+                },
+                "every_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Interval in seconds (kind=every)",
+                },
+                "at": {
+                    "type": "string",
+                    "description": "ISO-8601 with timezone (kind=at)",
+                },
+            },
+            "required": ["kind"],
         },
         "task": {
             "type": "string",
@@ -171,16 +208,24 @@ def gateway_config_available() -> bool:
         },
         "job_kind": {
             "type": "string",
-            "description": "system_event for reminders, agent_turn for background agent tasks.",
-            "enum": ["system_event", "agent_turn"],
+            "description": (
+                "Use reminder for static user-facing reminders; it does not call "
+                "the model. Use agent_turn only for scheduled background tasks "
+                "that need the agent/model to work. Use system_event only for "
+                "internal main-session events."
+            ),
+            "enum": ["reminder", "system_event", "agent_turn"],
         },
         "session_target": {
             "type": "string",
             "description": (
-                "Target session mode for add. Use main for reminders and isolated/session"
-                " for agent_turn jobs."
+                "Target session mode for add. Use main for internal system events, "
+                "isolated for proactive reminders that should deliver back to the "
+                "caller, current only when the user explicitly wants the scheduled "
+                "run to continue the current transcript as a conversation, or session "
+                "with target_session_key for a named session."
             ),
-            "enum": ["main", "isolated", "session"],
+            "enum": ["main", "isolated", "current", "session"],
         },
         "target_session_key": {
             "type": "string",
@@ -210,26 +255,35 @@ def gateway_config_available() -> bool:
                 "Optional per-job cron tool policy with profile, allow, also_allow, and deny."
             ),
         },
+        "tz": {
+            "type": "string",
+            "description": (
+                "Optional IANA timezone (e.g. 'America/Los_Angeles', 'Asia/Shanghai'). "
+                "Applies to cron expressions; '0 9 * * *' with tz='America/Los_Angeles' "
+                "fires at 09:00 LA wall time. Empty string keeps the legacy UTC behaviour."
+            ),
+        },
     },
     required=["action"],
-    owner_only=True,
+    owner_only=False,
 )
 async def cron(
     action: str,
-    schedule: str | None = None,
+    schedule: dict[str, Any] | None = None,
     task: str | None = None,
-    job_kind: str = "system_event",
-    session_target: str = "main",
+    job_kind: str = "reminder",
+    session_target: str = "isolated",
     target_session_key: str | None = None,
     job_id: str | None = None,
     agent_id: str = "main",
     wake_mode: str = "now",
     tool_policy: dict[str, Any] | None = None,
+    tz: str = "",
 ) -> str:
     if action not in _VALID_CRON_ACTIONS:
         raise ToolError(f"Invalid action: {action}. Must be list|add|remove|run")
 
-    if action == "add" and (not schedule or not task):
+    if action == "add" and (schedule is None or not task):
         raise ToolError("'schedule' and 'task' required for add")
     if action in ("remove", "run") and not job_id:
         raise ToolError(f"'job_id' required for {action}")
@@ -240,8 +294,45 @@ async def cron(
 
     sched = _scheduler
 
+    # Resolve caller context. Owner-context calls (loopback CLI, owner WebUI,
+    # channel_admin_senders) pass through unchanged. Non-owner channel callers
+    # get caller-scoped list / remove / run filtering and have target_session_key
+    # / tool_policy blocked (privilege escalation knobs the model should not
+    # synthesise on a normal channel turn).
+    from opensquilla.tools.types import current_tool_context
+
+    ctx = current_tool_context.get()
+    is_owner_caller = bool(getattr(ctx, "is_owner", False)) if ctx is not None else True
+    caller_session_key = (
+        ctx.session_key if ctx is not None and ctx.session_key else ""
+    )
+    caller_sender_id = str(getattr(ctx, "sender_id", "") or "") if ctx is not None else ""
+
+    if not is_owner_caller:
+        if not caller_session_key:
+            raise ToolError(
+                "cron requires a session context for non-owner callers; "
+                "call from a channel-bound session"
+            )
+        if action == "add":
+            if target_session_key:
+                raise ToolError(
+                    "target_session_key is reserved for owner callers; "
+                    "non-owner reminders are scoped to your current session"
+                )
+            if tool_policy:
+                raise ToolError(
+                    "tool_policy is reserved for owner callers"
+                )
+
     if action == "list":
         jobs = await sched.list_jobs()
+        if not is_owner_caller:
+            jobs = [
+                j
+                for j in jobs
+                if _owns_cron_job(j, caller_sender_id, caller_session_key)
+            ]
         items = [
             {
                 "job_id": j.id,
@@ -257,74 +348,143 @@ async def cron(
         assert schedule is not None
         assert task is not None
         wake_mode = str(wake_mode or "now").strip().lower()
+        schedule_kind, schedule_value, schedule_tz = _coerce_tool_schedule(
+            schedule,
+            tz=tz,
+        )
 
         # Scan prompt for injection/exfiltration before scheduling
         blocked, reason = _scan_cron_prompt(task)
         if blocked:
             raise ToolError(reason)
 
-        if job_kind not in ("system_event", "agent_turn"):
-            raise ToolError("job_kind must be system_event or agent_turn")
-        if session_target not in ("main", "isolated", "session"):
-            raise ToolError("session_target must be main, isolated, or session")
+        if job_kind not in ("reminder", "system_event", "agent_turn"):
+            raise ToolError("job_kind must be reminder, system_event, or agent_turn")
+        if session_target not in ("main", "isolated", "current", "session"):
+            raise ToolError("session_target must be main, isolated, current, or session")
+        if job_kind == "system_event" and session_target == "current":
+            job_kind = REMINDER_KIND
+            session_target = "isolated"
         if job_kind == "system_event" and session_target != "main":
             raise ToolError("system_event jobs must use session_target=main")
+        if job_kind == REMINDER_KIND and session_target == "main":
+            raise ToolError("reminder jobs cannot use session_target=main")
         if job_kind == "agent_turn" and session_target == "main":
             raise ToolError("agent_turn jobs cannot use session_target=main")
+        if session_target == "current" and not caller_session_key:
+            raise ToolError(
+                "session_target=current requires a caller session context"
+            )
         if session_target == "session" and not target_session_key:
             raise ToolError("target_session_key is required when session_target=session")
         if wake_mode not in ("now", "next-heartbeat"):
             raise ToolError("wake_mode must be now or next-heartbeat")
 
-        # Auto-detect delivery target
+        # Auto-detect delivery target from session storage.
         delivery = None
-        sk = ""
-        try:
-            from opensquilla.scheduler.delivery import infer_delivery
-            from opensquilla.tools.builtin.sessions import _get_session_manager
-            from opensquilla.tools.types import current_tool_context
+        if caller_session_key:
+            try:
+                from opensquilla.scheduler.delivery import infer_delivery
+                from opensquilla.tools.builtin.sessions import _get_session_manager
 
-            ctx = current_tool_context.get()
-            sk = ctx.session_key if ctx is not None and ctx.session_key else ""
-            if sk and session_target != "main":
                 mgr = _get_session_manager()
                 storage = getattr(mgr, "_storage", mgr)
-                delivery = await infer_delivery(
+                inferred = await infer_delivery(
                     session_storage=storage,
-                    session_key=sk,
+                    session_key=caller_session_key,
                     user_overrides=None,
                 )
                 if (
-                    delivery.mode == DeliveryMode.ORIGIN
-                    and delivery.channel_name
-                    and delivery.originating_reply_target is None
+                    inferred.mode == DeliveryMode.ORIGIN
+                    and inferred.channel_name
+                    and inferred.originating_reply_target is None
                 ):
-                    delivery.originating_reply_target = ReplyTargetSnapshot(
-                        channel_name=delivery.channel_name,
-                        channel_type=delivery.channel_name,
-                        to=delivery.channel_id,
-                        account_id=delivery.account_id,
-                        thread_id=delivery.thread_id,
+                    inferred.originating_reply_target = ReplyTargetSnapshot(
+                        channel_name=inferred.channel_name,
+                        channel_type=inferred.channel_name,
+                        to=inferred.channel_id,
+                        account_id=inferred.account_id,
+                        thread_id=inferred.thread_id,
                     )
-        except Exception:
-            pass
+                if session_target == "main":
+                    # Main heartbeat ignores the channel mode (persistence forces
+                    # NONE for main) but uses the snapshot to pin the reply target.
+                    if inferred.originating_reply_target is not None:
+                        delivery = DeliveryConfig(
+                            mode=DeliveryMode.NONE,
+                            originating_reply_target=inferred.originating_reply_target,
+                        )
+                else:
+                    delivery = inferred
+            except Exception:
+                pass
 
-        payload = (
-            make_system_event_payload(task, agent_id)
-            if job_kind == SYSTEM_EVENT_KIND
-            else make_agent_turn_payload(task, agent_id)
-        )
+        # Snapshot fallback: when session storage did not yield a channel-
+        # routable target (fresh session before last_channel was written), build
+        # one from the live ToolContext so the first cron call still binds.
+        if (
+            ctx is not None
+            and getattr(ctx, "channel_kind", None)
+            and getattr(delivery, "originating_reply_target", None) is None
+        ):
+            snapshot = ReplyTargetSnapshot(
+                channel_name=ctx.channel_kind or "",
+                channel_type=ctx.channel_kind or "",
+                to=ctx.channel_id or "",
+            )
+            if delivery is None:
+                if session_target == "main":
+                    delivery_mode = DeliveryMode.NONE
+                    channel_name = ""
+                    channel_id = ""
+                else:
+                    delivery_mode = DeliveryMode.ORIGIN
+                    channel_name = ctx.channel_kind or ""
+                    channel_id = ctx.channel_id or ""
+                delivery = DeliveryConfig(
+                    mode=delivery_mode,
+                    channel_name=channel_name,
+                    channel_id=channel_id,
+                    originating_reply_target=snapshot,
+                )
+            else:
+                delivery.originating_reply_target = snapshot
+                if session_target != "main" and delivery.mode == DeliveryMode.NONE:
+                    delivery.mode = DeliveryMode.ORIGIN
+                    delivery.channel_name = ctx.channel_kind or ""
+                    delivery.channel_id = ctx.channel_id or ""
+
+        if job_kind == SYSTEM_EVENT_KIND:
+            payload = make_system_event_payload(task, agent_id)
+            handler_key = "system_event"
+        elif job_kind == REMINDER_KIND:
+            payload = make_reminder_payload(task, agent_id)
+            handler_key = "static_message"
+        else:
+            payload = make_agent_turn_payload(task, agent_id)
+            handler_key = "agent_run"
+        effective_tz = (schedule_tz or tz or "").strip()
         job = await sched.add_job(
             name=task or "cron-tool-job",
-            schedule_raw=schedule,
-            handler_key="system_event" if job_kind == SYSTEM_EVENT_KIND else "agent_run",
+            handler_key=handler_key,
             payload=payload,
             session_target=SessionTarget(session_target),
-            session_key=target_session_key or "",
+            session_key=(
+                caller_session_key
+                if session_target == "current"
+                else (target_session_key or "")
+            ),
             wake_mode=wake_mode,
             delivery=delivery,
-            origin_session_key=sk,
+            origin_session_key=caller_session_key,
             tool_policy=tool_policy,
+            tz=effective_tz,
+            creator_session_key=caller_session_key,
+            creator_sender_id=caller_sender_id,
+            creator_is_owner=is_owner_caller,
+            schedule_kind=schedule_kind,
+            schedule_value=schedule_value,
+            schedule_tz=effective_tz,
         )
         # Populate ws_topic
         if job.delivery and not job.delivery.ws_topic:
@@ -337,17 +497,27 @@ async def cron(
             {
                 "action": "add",
                 "job_id": job.id,
-                "schedule": schedule,
+                "schedule_kind": schedule_kind.value,
+                "schedule_value": schedule_value,
                 "task": task,
                 "payload_kind": job_kind,
                 "session_target": session_target,
                 "wake_mode": wake_mode,
+                "tz": effective_tz,
                 "status": "scheduled",
             }
         )
 
     if action == "remove":
         assert job_id is not None
+        if not is_owner_caller:
+            target_job = await sched.get_job(job_id)
+            if target_job is None:
+                raise ToolError(f"Job not found: {job_id}")
+            if not _owns_cron_job(target_job, caller_sender_id, caller_session_key):
+                raise ToolError(
+                    "permission denied: you can only remove cron jobs you created"
+                )
         removed = await sched.remove_job(job_id)
         if not removed:
             raise ToolError(f"Job not found: {job_id}")
@@ -355,6 +525,14 @@ async def cron(
 
     # run
     assert job_id is not None
+    if not is_owner_caller:
+        target_job = await sched.get_job(job_id)
+        if target_job is None:
+            raise ToolError(f"Job not found: {job_id}")
+        if not _owns_cron_job(target_job, caller_sender_id, caller_session_key):
+            raise ToolError(
+                "permission denied: you can only run cron jobs you created"
+            )
     result = await sched.run_job_now(job_id)
     status = getattr(result, "status", "")
     status_str = status.value if hasattr(status, "value") else str(status)

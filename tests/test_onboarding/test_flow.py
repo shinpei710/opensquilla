@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import types
-from pathlib import Path
+from io import StringIO
+
+from rich.console import Console
 
 
 def test_wait_for_setup_start_flushes_visible_prompt_before_accepting_enter(monkeypatch):
@@ -288,6 +290,7 @@ def test_interactive_onboard_prompts_router_defaults_before_persist(tmp_path, mo
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr(flow, "_is_tty", lambda: True)
     monkeypatch.setattr(flow, "_wait_for_setup_start", lambda: calls.append("start gate"))
+    monkeypatch.setattr(flow, "detect_default_sources", lambda: [])
 
     calls: list[str] = []
 
@@ -354,6 +357,682 @@ def test_interactive_onboard_prompts_router_defaults_before_persist(tmp_path, mo
     assert 'model = "z-ai/glm-5.1"' in data
 
 
+def test_interactive_onboard_migration_defaults_to_all_sources_and_keeps_imported_provider(
+    tmp_path, monkeypatch
+):
+    import sys
+    import tomllib
+    import types
+
+    from opensquilla.onboarding import flow
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-imported-env")
+    monkeypatch.setattr(flow, "_is_tty", lambda: True)
+    monkeypatch.setattr(flow, "_wait_for_setup_start", lambda: calls.append("start gate"))
+    detected = [
+        flow.DetectedMigrationSource("openclaw", tmp_path / ".openclaw"),
+        flow.DetectedMigrationSource("hermes", tmp_path / ".hermes"),
+    ]
+    monkeypatch.setattr(flow, "detect_default_sources", lambda: detected)
+
+    calls: list[str] = []
+    batches: list[tuple[tuple[str, ...], bool, bool]] = []
+
+    def fake_run_migration_batch(_detected, selected, options):
+        batches.append((tuple(selected), options.apply, options.migrate_secrets))
+        if options.apply:
+            target.write_text(
+                "\n".join(
+                    [
+                        "[llm]",
+                        'provider = "openrouter"',
+                        'model = "anthropic/claude-sonnet-4.5"',
+                        'api_key_env = "OPENROUTER_API_KEY"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+        return flow.MigrationBatchResult(
+            selected=tuple(selected),
+            apply=options.apply,
+            reports={
+                name: {
+                    "output_dir": str(tmp_path / "reports" / name),
+                    "items": [
+                        {
+                            "kind": "config",
+                            "status": "applied" if options.apply else "planned",
+                        }
+                    ],
+                }
+                for name in selected
+            },
+        )
+
+    monkeypatch.setattr(flow, "run_migration_batch", fake_run_migration_batch)
+
+    class _Answer:
+        def __init__(self, value):
+            self.value = value
+
+        def ask(self):
+            return self.value
+
+    class _Choice:
+        def __init__(self, title, value, checked=False, description=None):
+            self.title = title
+            self.value = value
+            self.checked = checked
+            self.description = description
+
+    class _Questionary(types.SimpleNamespace):
+        Choice = _Choice
+
+        def checkbox(self, message: str, choices, **kwargs):
+            calls.append(message)
+            assert message == "Select sources to import"
+            assert kwargs.get("instruction") == (
+                "Space select | Enter continue | A toggle all"
+            )
+            assert [choice.value for choice in choices] == ["openclaw", "hermes"]
+            assert [choice.title for choice in choices] == ["OpenClaw", "Hermes Agent"]
+            assert [choice.description for choice in choices] == [
+                str(tmp_path / ".openclaw"),
+                str(tmp_path / ".hermes"),
+            ]
+            assert all(choice.checked for choice in choices)
+            return _Answer([choice.value for choice in choices])
+
+        def confirm(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "Review migration options now?":
+                assert kwargs.get("default") is True
+                return _Answer(True)
+            if message == "Import saved API keys/tokens from detected legacy .env files?":
+                assert kwargs.get("default") is False
+                return _Answer(False)
+            if message == "Apply this migration now?":
+                assert kwargs.get("default") is True
+                return _Answer(True)
+            if message == "Use imported provider credentials?":
+                assert kwargs.get("default") is True
+                return _Answer(True)
+            if message == "Edit router tier models now?":
+                return _Answer(False)
+            if message in {
+                "Configure a messaging channel now?",
+                "Configure web search now?",
+                "Enable image generation now?",
+            }:
+                return _Answer(False)
+            raise AssertionError(f"unexpected confirm prompt: {message}")
+
+        def select(self, message: str, **_kwargs):
+            calls.append(message)
+            if message == "Router mode":
+                return _Answer("SquillaRouter")
+            if message == "Default text model":
+                return _Answer(_kwargs.get("default"))
+            raise AssertionError(f"unexpected select prompt: {message}")
+
+        def text(self, message: str, **_kwargs):
+            calls.append(message)
+            raise AssertionError(f"unexpected text prompt: {message}")
+
+        def password(self, message: str, **_kwargs):
+            calls.append(message)
+            raise AssertionError(f"unexpected password prompt: {message}")
+
+    monkeypatch.setitem(sys.modules, "questionary", _Questionary())
+
+    flow.run_interactive_onboard(flow.OnboardOptions())
+
+    assert batches == [
+        (("openclaw", "hermes"), False, False),
+        (("openclaw", "hermes"), True, False),
+    ]
+    assert "LLM provider" not in calls
+    assert "Router mode" in calls
+    data = tomllib.loads(target.read_text())
+    assert data["llm"]["provider"] == "openrouter"
+    assert data["llm"]["api_key_env"] == "OPENROUTER_API_KEY"
+    assert data["llm"]["model"] == "deepseek/deepseek-v4-flash"
+    assert data["squilla_router"]["enabled"] is True
+    assert data["squilla_router"]["tier_profile"] == "openrouter"
+    assert "api_key" not in data["llm"]
+
+
+def test_interactive_onboard_imported_provider_prefers_inline_key_over_env(
+    tmp_path, monkeypatch
+):
+    import sys
+    import tomllib
+    import types
+
+    from opensquilla.onboarding import flow
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.setattr(flow, "_is_tty", lambda: True)
+    monkeypatch.setattr(flow, "_wait_for_setup_start", lambda: None)
+    monkeypatch.setattr(
+        flow,
+        "detect_default_sources",
+        lambda: [flow.DetectedMigrationSource("openclaw", tmp_path / ".openclaw")],
+    )
+
+    calls: list[str] = []
+
+    def fake_run_migration_batch(_detected, selected, options):
+        if options.apply:
+            target.write_text(
+                "\n".join(
+                    [
+                        "[llm]",
+                        'provider = "openrouter"',
+                        'model = "anthropic/claude-sonnet-4.5"',
+                        'api_key = "sk-imported"',
+                        'api_key_env = "OPENROUTER_API_KEY"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+        return flow.MigrationBatchResult(
+            selected=tuple(selected),
+            apply=options.apply,
+            reports={
+                "openclaw": {
+                    "output_dir": str(tmp_path / "reports" / "openclaw"),
+                    "items": [{"kind": "config", "status": "planned"}],
+                }
+            },
+        )
+
+    monkeypatch.setattr(flow, "run_migration_batch", fake_run_migration_batch)
+
+    class _Answer:
+        def __init__(self, value):
+            self.value = value
+
+        def ask(self):
+            return self.value
+
+    class _Questionary(types.SimpleNamespace):
+        def confirm(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "Review migration options now?":
+                return _Answer(True)
+            if message == "Import saved API keys/tokens from detected legacy .env files?":
+                return _Answer(True)
+            if message == "Apply this migration now?":
+                return _Answer(True)
+            if message == "Use imported provider credentials?":
+                return _Answer(True)
+            if message == "Edit router tier models now?":
+                return _Answer(False)
+            if message in {
+                "Configure a messaging channel now?",
+                "Configure web search now?",
+                "Enable image generation now?",
+            }:
+                return _Answer(False)
+            raise AssertionError(f"unexpected confirm prompt: {message}")
+
+        def select(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "Router mode":
+                return _Answer("SquillaRouter")
+            if message == "Default text model":
+                return _Answer(kwargs.get("default"))
+            raise AssertionError(f"unexpected select prompt: {message}")
+
+        def text(self, message: str, **_kwargs):
+            calls.append(message)
+            raise AssertionError(f"unexpected text prompt: {message}")
+
+        def password(self, message: str, **_kwargs):
+            calls.append(message)
+            raise AssertionError(f"unexpected password prompt: {message}")
+
+    monkeypatch.setitem(sys.modules, "questionary", _Questionary())
+
+    flow.run_interactive_onboard(flow.OnboardOptions())
+
+    assert "LLM provider" not in calls
+    data = tomllib.loads(target.read_text())
+    assert data["llm"]["provider"] == "openrouter"
+    assert data["llm"]["api_key"] == "sk-imported"
+    assert data["llm"].get("api_key_env", "") == ""
+    assert data["llm"]["model"] == "deepseek/deepseek-v4-flash"
+
+
+def test_interactive_onboard_imported_provider_finalize_error_continues_setup(
+    tmp_path, monkeypatch
+):
+    import sys
+    import tomllib
+    import types
+
+    from opensquilla.onboarding import flow
+
+    target = tmp_path / "c.toml"
+    console_output = StringIO()
+    monkeypatch.setattr(
+        flow,
+        "console",
+        Console(file=console_output, force_terminal=False, highlight=False),
+    )
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-env")
+    monkeypatch.setattr(flow, "_is_tty", lambda: True)
+    monkeypatch.setattr(flow, "_wait_for_setup_start", lambda: None)
+    monkeypatch.setattr(
+        flow,
+        "detect_default_sources",
+        lambda: [flow.DetectedMigrationSource("openclaw", tmp_path / ".openclaw")],
+    )
+    monkeypatch.setattr(
+        flow,
+        "_use_imported_provider_credentials_with_router_defaults",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("bad imported provider")),
+    )
+
+    calls: list[str] = []
+
+    def fake_run_migration_batch(_detected, selected, options):
+        if options.apply:
+            target.write_text(
+                "\n".join(
+                    [
+                        "[llm]",
+                        'provider = "openrouter"',
+                        'model = "anthropic/claude-sonnet-4.5"',
+                        'api_key_env = "OPENROUTER_API_KEY"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+        return flow.MigrationBatchResult(
+            selected=tuple(selected),
+            apply=options.apply,
+            reports={
+                "openclaw": {
+                    "output_dir": str(tmp_path / "reports" / "openclaw"),
+                    "items": [{"kind": "config", "status": "planned"}],
+                }
+            },
+        )
+
+    monkeypatch.setattr(flow, "run_migration_batch", fake_run_migration_batch)
+
+    class _Answer:
+        def __init__(self, value):
+            self.value = value
+
+        def ask(self):
+            return self.value
+
+    class _Questionary(types.SimpleNamespace):
+        def confirm(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "Review migration options now?":
+                return _Answer(True)
+            if message == "Import saved API keys/tokens from detected legacy .env files?":
+                return _Answer(False)
+            if message == "Apply this migration now?":
+                return _Answer(True)
+            if message == "Use imported provider credentials?":
+                return _Answer(True)
+            if message == "Edit router tier models now?":
+                return _Answer(False)
+            if message in {
+                "Configure a messaging channel now?",
+                "Configure web search now?",
+                "Enable image generation now?",
+            }:
+                return _Answer(False)
+            raise AssertionError(f"unexpected confirm prompt: {message}")
+
+        def select(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "LLM provider":
+                return _Answer("openrouter (OpenRouter)")
+            if message == "LLM API key source":
+                return _Answer("Use environment variable OPENROUTER_API_KEY")
+            if message == "Router mode":
+                return _Answer("SquillaRouter")
+            if message == "Default text model":
+                return _Answer(kwargs.get("default"))
+            raise AssertionError(f"unexpected select prompt: {message}")
+
+        def text(self, message: str, **_kwargs):
+            calls.append(message)
+            raise AssertionError(f"unexpected text prompt: {message}")
+
+        def password(self, message: str, **_kwargs):
+            calls.append(message)
+            raise AssertionError(f"unexpected password prompt: {message}")
+
+    monkeypatch.setitem(sys.modules, "questionary", _Questionary())
+
+    flow.run_interactive_onboard(flow.OnboardOptions())
+
+    assert "LLM provider" in calls
+    out = console_output.getvalue()
+    assert "Imported provider settings could not be finalized" in out
+    assert "Continue provider setup to finish onboarding" in out
+    data = tomllib.loads(target.read_text())
+    assert data["llm"]["provider"] == "openrouter"
+    assert data["llm"]["api_key_env"] == "OPENROUTER_API_KEY"
+    assert data["llm"]["model"] == "deepseek/deepseek-v4-flash"
+
+
+def test_onboard_migration_selection_summary_lists_checked_sources(tmp_path, monkeypatch):
+    from opensquilla.onboarding import flow
+
+    console_output = StringIO()
+    monkeypatch.setattr(
+        flow,
+        "console",
+        Console(file=console_output, force_terminal=False, highlight=False),
+    )
+
+    detected = [
+        flow.DetectedMigrationSource("openclaw", tmp_path / ".openclaw"),
+        flow.DetectedMigrationSource("hermes", tmp_path / ".hermes"),
+    ]
+
+    flow._print_selected_migration_sources(detected, ["openclaw", "hermes"])
+
+    out = console_output.getvalue()
+    assert "Selected migration sources" in out
+    assert "☑ OpenClaw" in out
+    assert "☑ Hermes Agent" in out
+    unwrapped_out = out.replace("\n", "")
+    assert str(tmp_path / ".openclaw") in unwrapped_out
+    assert str(tmp_path / ".hermes") in unwrapped_out
+
+
+def test_onboard_migration_source_prompt_uses_clear_continue_language(tmp_path):
+    from opensquilla.onboarding import flow
+
+    captured: dict[str, object] = {}
+
+    class _Answer:
+        def ask(self):
+            return ["openclaw", "hermes"]
+
+    class _Choice:
+        def __init__(self, title, value, checked=False, description=None):
+            self.title = title
+            self.value = value
+            self.checked = checked
+            self.description = description
+
+    class _Questionary:
+        Choice = _Choice
+
+        def checkbox(self, message: str, **kwargs):
+            captured["message"] = message
+            captured["instruction"] = kwargs.get("instruction")
+            return _Answer()
+
+    selected = flow._ask_migration_sources(
+        _Questionary(),
+        [
+            flow.DetectedMigrationSource("openclaw", tmp_path / ".openclaw"),
+            flow.DetectedMigrationSource("hermes", tmp_path / ".hermes"),
+        ],
+    )
+
+    assert selected == ["openclaw", "hermes"]
+    assert captured == {
+        "message": "Select sources to import",
+        "instruction": "Space select | Enter continue | A toggle all",
+    }
+
+
+def test_onboard_migration_preview_hides_unwritten_report_path(tmp_path, monkeypatch):
+    from opensquilla.onboarding import flow
+
+    console_output = StringIO()
+    monkeypatch.setattr(
+        flow,
+        "console",
+        Console(file=console_output, force_terminal=False, highlight=False),
+    )
+    missing_report_dir = tmp_path / "dry-run-report"
+
+    flow._print_migration_summary(
+        flow.MigrationBatchResult(
+            selected=("openclaw",),
+            apply=False,
+            reports={
+                "openclaw": {
+                    "output_dir": str(missing_report_dir),
+                    "items": [{"kind": "config", "status": "planned"}],
+                }
+            },
+        ),
+        title="Migration preview",
+    )
+
+    out = console_output.getvalue()
+    assert "Migration preview" in out
+    assert "planned=1" in out
+    assert str(missing_report_dir) not in out
+
+
+def test_interactive_onboard_migration_preview_failure_continues_provider_setup(
+    tmp_path, monkeypatch
+):
+    import sys
+    import types
+
+    from opensquilla.onboarding import flow
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(flow, "_is_tty", lambda: True)
+    monkeypatch.setattr(flow, "_wait_for_setup_start", lambda: calls.append("start gate"))
+    detected = [flow.DetectedMigrationSource("openclaw", tmp_path / ".openclaw")]
+    monkeypatch.setattr(flow, "detect_default_sources", lambda: detected)
+
+    calls: list[str] = []
+    batches: list[tuple[tuple[str, ...], bool]] = []
+
+    def fake_run_migration_batch(_detected, selected, options):
+        batches.append((tuple(selected), options.apply))
+        return flow.MigrationBatchResult(
+            selected=tuple(selected),
+            apply=options.apply,
+            reports={
+                "openclaw": {
+                    "output_dir": str(tmp_path / "reports" / "openclaw"),
+                    "items": [{"kind": "source", "status": "error", "reason": "bad source"}],
+                }
+            },
+        )
+
+    monkeypatch.setattr(flow, "run_migration_batch", fake_run_migration_batch)
+
+    class _Answer:
+        def __init__(self, value):
+            self.value = value
+
+        def ask(self):
+            return self.value
+
+    class _Questionary(types.SimpleNamespace):
+        def confirm(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "Review migration options now?":
+                assert kwargs.get("default") is True
+                return _Answer(True)
+            if message == "Import saved API keys/tokens from detected legacy .env files?":
+                assert kwargs.get("default") is False
+                return _Answer(False)
+            if message == "Edit router tier models now?":
+                return _Answer(False)
+            if message in {
+                "Configure a messaging channel now?",
+                "Configure web search now?",
+                "Enable image generation now?",
+            }:
+                return _Answer(False)
+            raise AssertionError(f"unexpected confirm prompt: {message}")
+
+        def select(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "LLM provider":
+                return _Answer("openrouter (OpenRouter)")
+            if message == "LLM API key source":
+                return _Answer("Use environment variable OPENROUTER_API_KEY")
+            if message == "Router mode":
+                return _Answer("SquillaRouter")
+            if message == "Default text model":
+                return _Answer(kwargs.get("default"))
+            raise AssertionError(f"unexpected select prompt: {message}")
+
+        def text(self, message: str, **_kwargs):
+            calls.append(message)
+            raise AssertionError(f"unexpected text prompt: {message}")
+
+        def password(self, message: str, **_kwargs):
+            calls.append(message)
+            raise AssertionError(f"unexpected password prompt: {message}")
+
+    monkeypatch.setitem(sys.modules, "questionary", _Questionary())
+
+    flow.run_interactive_onboard(flow.OnboardOptions())
+
+    assert batches == [(("openclaw",), False)]
+    assert "Apply this migration now?" not in calls
+    assert "LLM provider" in calls
+    data = target.read_text()
+    assert 'provider = "openrouter"' in data
+    assert 'api_key_env = "OPENROUTER_API_KEY"' in data
+
+
+def test_interactive_onboard_migration_prompts_for_missing_imported_provider_key(
+    tmp_path, monkeypatch
+):
+    import sys
+    import tomllib
+    import types
+
+    from opensquilla.onboarding import flow
+
+    target = tmp_path / "c.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
+    monkeypatch.delenv("IMPORTED_OPENROUTER_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(flow, "_is_tty", lambda: True)
+    monkeypatch.setattr(flow, "_wait_for_setup_start", lambda: calls.append("start gate"))
+    detected = [flow.DetectedMigrationSource("openclaw", tmp_path / ".openclaw")]
+    monkeypatch.setattr(flow, "detect_default_sources", lambda: detected)
+
+    calls: list[str] = []
+
+    def fake_run_migration_batch(_detected, selected, options):
+        if options.apply:
+            target.write_text(
+                "\n".join(
+                    [
+                        "[llm]",
+                        'provider = "openrouter"',
+                        'model = "anthropic/claude-sonnet-4.5"',
+                        'api_key_env = "IMPORTED_OPENROUTER_KEY"',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+        return flow.MigrationBatchResult(
+            selected=tuple(selected),
+            apply=options.apply,
+            reports={
+                "openclaw": {
+                    "output_dir": str(tmp_path / "reports" / "openclaw"),
+                    "items": [{"kind": "config", "status": "planned"}],
+                }
+            },
+        )
+
+    monkeypatch.setattr(flow, "run_migration_batch", fake_run_migration_batch)
+
+    class _Answer:
+        def __init__(self, value):
+            self.value = value
+
+        def ask(self):
+            return self.value
+
+    class _Questionary(types.SimpleNamespace):
+        def confirm(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "Review migration options now?":
+                return _Answer(True)
+            if message == "Import saved API keys/tokens from detected legacy .env files?":
+                assert kwargs.get("default") is False
+                return _Answer(False)
+            if message == "Apply this migration now?":
+                return _Answer(True)
+            if message == "Edit router tier models now?":
+                return _Answer(False)
+            if message in {
+                "Configure a messaging channel now?",
+                "Configure web search now?",
+                "Enable image generation now?",
+            }:
+                return _Answer(False)
+            raise AssertionError(f"unexpected confirm prompt: {message}")
+
+        def select(self, message: str, **kwargs):
+            calls.append(message)
+            if message == "LLM API key source":
+                assert "Use environment variable IMPORTED_OPENROUTER_KEY" in kwargs.get(
+                    "choices", []
+                )
+                assert "Use environment variable OPENROUTER_API_KEY" in kwargs.get(
+                    "choices", []
+                )
+                assert kwargs.get("default") == "Paste API key now"
+                return _Answer("Paste API key now")
+            if message == "Router mode":
+                return _Answer("SquillaRouter")
+            if message == "Default text model":
+                return _Answer(kwargs.get("default"))
+            raise AssertionError(f"unexpected select prompt: {message}")
+
+        def password(self, message: str, **_kwargs):
+            calls.append(message)
+            if message == "API key":
+                return _Answer("sk-new")
+            raise AssertionError(f"unexpected password prompt: {message}")
+
+        def text(self, message: str, **_kwargs):
+            calls.append(message)
+            raise AssertionError(f"unexpected text prompt: {message}")
+
+    monkeypatch.setitem(sys.modules, "questionary", _Questionary())
+
+    flow.run_interactive_onboard(flow.OnboardOptions())
+
+    assert "LLM provider" not in calls
+    assert "Router mode" in calls
+    data = tomllib.loads(target.read_text())
+    assert data["llm"]["provider"] == "openrouter"
+    assert data["llm"]["api_key"] == "sk-new"
+    assert data["llm"]["model"] == "deepseek/deepseek-v4-flash"
+
+
 def test_interactive_onboard_can_enable_image_generation(tmp_path, monkeypatch):
     import sys
     import tomllib
@@ -366,6 +1045,7 @@ def test_interactive_onboard_can_enable_image_generation(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-image-env")
     monkeypatch.setattr(flow, "_is_tty", lambda: True)
     monkeypatch.setattr(flow, "_wait_for_setup_start", lambda: None)
+    monkeypatch.setattr(flow, "detect_default_sources", lambda: [])
 
     calls: list[str] = []
 
@@ -547,15 +1227,19 @@ def test_router_tier_overrides_edit_only_selected_tiers():
     assert overrides == {"t2": {"provider": "openrouter", "model": "custom/reasoner"}}
 
 
-def test_interactive_feishu_websocket_prompts_only_core_fields(
-    tmp_path, monkeypatch, capsys
-):
+def test_interactive_feishu_websocket_prompts_only_core_fields(tmp_path, monkeypatch):
     import sys
     import types
 
     from opensquilla.onboarding import flow
 
     target = tmp_path / "c.toml"
+    console_output = StringIO()
+    monkeypatch.setattr(
+        flow,
+        "console",
+        Console(file=console_output, force_terminal=False, highlight=False),
+    )
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(target))
     monkeypatch.setattr(flow, "_is_tty", lambda: True)
     monkeypatch.setattr(flow.importlib.util, "find_spec", lambda name: None)
@@ -601,13 +1285,15 @@ def test_interactive_feishu_websocket_prompts_only_core_fields(
 
     flow.run_interactive_channel_add(None)
 
-    out = capsys.readouterr().out
+    out = console_output.getvalue()
     normalized_out = " ".join(out.split())
     assert "Feishu websocket mode requires the optional feishu extra" in out
     assert "Portable zip:" in out
     assert "latest recommended portable package" in out
-    assert "pwsh -ExecutionPolicy Bypass -File install.ps1 -Extras feishu" in normalized_out
-    assert "OPENSQUILLA_INSTALL_EXTRAS=feishu bash install.sh" in normalized_out
+    assert "OPENSQUILLA_INSTALL_EXTRAS" in normalized_out
+    assert "https://opensquilla.ai/install.ps1" in normalized_out
+    assert "https://opensquilla.ai/install.sh" in normalized_out
+    assert "bash -s --" in normalized_out
     assert "uv sync --extra recommended --extra feishu" in normalized_out
     assert "Restarting alone will not install Python packages." in out
     assert calls == ["Channel type", "Channel name", "App id", "App secret", "Connection mode"]
@@ -617,36 +1303,23 @@ def test_interactive_feishu_websocket_prompts_only_core_fields(
     assert 'connection_mode = "websocket"' in data
 
 
-def test_channel_saved_output_separates_configured_from_connected(capsys):
+def test_channel_saved_output_separates_configured_from_connected(monkeypatch):
+    from opensquilla.onboarding import flow
     from opensquilla.onboarding.flow import _print_channel_saved
+
+    console_output = StringIO()
+    monkeypatch.setattr(
+        flow,
+        "console",
+        Console(file=console_output, force_terminal=False, highlight=False),
+    )
 
     _print_channel_saved("feishu")
 
-    out = capsys.readouterr().out
+    out = console_output.getvalue()
     assert "configured, not connected yet" in out
     assert "Restart the gateway process" in out
     assert "opensquilla channels status feishu --json" in out
-
-
-def test_readme_distinguishes_recommended_profile_from_channel_extras() -> None:
-    readme = Path("README.md").read_text(encoding="utf-8")
-
-    assert (
-        "| New user | [Preview release package](#preview-release-package) | Recommended |"
-    ) in readme
-    assert (
-        "| Command-line user | [Install from source](#install-from-source) | Available now |"
-    ) in readme
-    assert "| Developer | [Develop from source](#develop-from-source) | Available now |" in readme
-    assert "Download the preview package if you want to try OpenSquilla as a local app" in readme
-    assert "`recommended` is the\nnormal runtime profile" in readme
-    assert "Messaging channel adapters are opt-in extras." in readme
-    assert "Feishu is shown only\nas an example channel adapter" in readme
-    assert "powershell -ExecutionPolicy Bypass -File .\\install.ps1 -Extras feishu" in readme
-    assert "OPENSQUILLA_INSTALL_EXTRAS=feishu bash install.sh" in readme
-    assert "Install extras into the same environment you run:" in readme
-    assert "uv sync --extra recommended --extra feishu" in readme
-    assert "where.exe opensquilla" in readme
 
 
 def test_search_provider_key_defaults_to_pasted_key_with_brave_hint(monkeypatch):

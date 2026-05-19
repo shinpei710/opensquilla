@@ -9,7 +9,6 @@ from opensquilla.gateway.config import (
     DiscordChannelEntry,
     FeishuChannelEntry,
     MatrixChannelEntry,
-    MSTeamsChannelEntry,
     QQChannelEntry,
     SlackChannelEntry,
     TelegramChannelEntry,
@@ -22,9 +21,11 @@ from opensquilla.onboarding.channel_specs import (
     list_channel_setup_specs,
 )
 
+# msteams is intentionally absent: the adapter is text-only and hidden
+# from runtime catalog surfaces until first-class support lands.
 ALL_TYPES = {
     "slack", "feishu", "discord", "dingtalk", "wecom", "qq",
-    "msteams", "matrix", "telegram",
+    "matrix", "telegram",
 }
 
 ENTRY_MODELS = {
@@ -34,12 +35,11 @@ ENTRY_MODELS = {
     "dingtalk": DingTalkChannelEntry,
     "wecom": WeComChannelEntry,
     "qq": QQChannelEntry,
-    "msteams": MSTeamsChannelEntry,
     "matrix": MatrixChannelEntry,
     "telegram": TelegramChannelEntry,
 }
 
-EXPECTED_PUBLIC_URL = {"slack", "wecom", "msteams"}
+EXPECTED_PUBLIC_URL = {"slack", "wecom"}
 CONDITIONAL_PUBLIC_URL = {"feishu", "telegram"}
 
 
@@ -174,7 +174,6 @@ def test_dependency_extras_are_set_for_optional_extras():
         "dingtalk": "dingtalk",
         "wecom": "wecom",
         "qq": "qq",
-        "msteams": "msteams",
         "matrix": "matrix",
     }
     for type_name, extra in expected.items():
@@ -185,6 +184,14 @@ def test_dependency_extras_are_set_for_optional_extras():
 def test_unknown_channel_raises():
     with pytest.raises(KeyError):
         get_channel_setup_spec("not-a-channel")
+
+
+def test_msteams_is_hidden_from_catalog():
+    """msteams must not be advertised via the onboarding catalog."""
+    types = {s.type for s in list_channel_setup_specs()}
+    assert "msteams" not in types
+    with pytest.raises(KeyError):
+        get_channel_setup_spec("msteams")
 
 
 def test_payload_redacts_secret_defaults():

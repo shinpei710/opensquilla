@@ -8,6 +8,7 @@ import httpx
 
 from opensquilla.search.registry import register_provider
 from opensquilla.search.types import SearchErrorKind, SearchProviderError, SearchResult
+from opensquilla.secrets import clean_header_secret
 
 _API_URL = "https://api.search.brave.com/res/v1/web/search"
 
@@ -24,7 +25,10 @@ class BraveSearchProvider:
         use_env_proxy: bool = False,
         diagnostics: bool = False,
     ) -> None:
-        self._api_key = api_key or os.environ.get("BRAVE_SEARCH_API_KEY", "")
+        self._api_key = clean_header_secret(
+            api_key or os.environ.get("BRAVE_SEARCH_API_KEY", ""),
+            label="Brave Search API key",
+        )
         self._proxy = proxy or None
         self._trust_env = bool(use_env_proxy) and not self._proxy
         self._diagnostics = bool(diagnostics)

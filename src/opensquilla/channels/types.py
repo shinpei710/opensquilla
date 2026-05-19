@@ -35,7 +35,20 @@ class Attachment(BaseModel):
 
 
 class IncomingMessage(BaseModel):
-    """Normalized inbound message from any channel."""
+    """Normalized inbound message from any channel.
+
+    Metadata contract for channel adapters:
+    - ``conversation_kind``: one of ``dm``, ``group``, ``group_dm``,
+      ``thread``, ``topic``, or ``interaction``.
+    - ``native_message_id``: platform-native message id.
+    - ``native_chat_id``: platform-native chat, channel, or room id.
+    - ``native_thread_id``: platform-native thread or topic id.
+    - ``native_parent_id``: platform-native parent message id.
+    - ``native_parent_channel_id``: platform-native parent channel id.
+    - ``native_root_id``: platform-native root message id.
+    - ``reply_target_id``: platform-native message id to reply to.
+    - ``is_group``: bool consumed by ``ChannelManager`` for session keys.
+    """
 
     sender_id: str
     channel_id: str

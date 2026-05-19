@@ -22,6 +22,7 @@ import asyncio
 import html
 import inspect
 import json
+import mimetypes
 import re
 import sys
 import time
@@ -41,6 +42,15 @@ from opensquilla.channels._attachment_io import (
     read_aiohttp_response_bytes_limited,
 )
 from opensquilla.channels._util import EventDedupeCache
+from opensquilla.channels.contract import (
+    ChannelCapabilities,
+    ChannelCapabilityProfile,
+    ChannelPlatformCapability,
+    ChannelPlatformCapabilityStatus,
+    ChannelPlatformCategories,
+    ChannelPlatformManifest,
+    ChannelSendResult,
+)
 from opensquilla.channels.types import (
     Attachment,
     ChannelHealth,
@@ -119,6 +129,46 @@ class MatrixChannel:
 
     def __post_init__(self) -> None:
         self._dedupe = EventDedupeCache(max_size=self.config.event_dedupe_size)
+
+    @property
+    def capability_profile(self) -> ChannelCapabilityProfile:
+        return ChannelCapabilityProfile(
+            channel_type="matrix",
+            group_chat=True,
+            mentions=True,
+            native_file_upload=True,
+            media=True,
+            reply=True,
+            edit=True,
+            delete=True,
+            transports=("websocket",),
+        )
+
+    @property
+    def platform_capability_manifest(self) -> ChannelPlatformManifest:
+        return ChannelPlatformManifest.from_channel_profile(
+            self.capability_profile,
+            has_send_file=True,
+            has_inbound_attachment_resolver=True,
+        ).with_capabilities(
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.FILES,
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=("media.upload", "room_send"),
+                mutates=True,
+                notes=("Matrix file delivery uploads media and sends an m.room.message event.",),
+            ),
+            ChannelPlatformCapability(
+                category=ChannelPlatformCategories.ATTACHMENTS,
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=("media.download",),
+                notes=("Inbound Matrix mxc media is downloaded through the content repository.",),
+            ),
+        )
+
+    @property
+    def capabilities(self) -> frozenset[str]:
+        return self.capability_profile.capability_tags()
 
     # ------------------------------------------------------------------
     # Workspace paths / session persistence
@@ -581,6 +631,53 @@ class MatrixChannel:
             content=content,
         )
         log.debug("matrix.outbound_sent", room_id=room_id)
+
+    async def send_file(
+        self,
+        room_id: str,
+        file_path: str,
+        content: str = "",
+    ) -> ChannelSendResult:
+        if self._client is None:
+            raise RuntimeError("Matrix adapter not started")
+        path = Path(file_path)
+        upload = getattr(self._client, "upload", None)
+        if not callable(upload):
+            raise RuntimeError("Matrix client does not expose media upload")
+        mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        with path.open("rb") as f:
+            upload_result = upload(f, content_type=mime_type, filename=path.name)
+            if inspect.isawaitable(upload_result):
+                upload_result = await upload_result
+        content_uri = self._matrix_upload_content_uri(upload_result)
+        if not content_uri:
+            raise RuntimeError("Matrix media upload did not return a content URI")
+        file_content = {
+            "msgtype": "m.file",
+            "body": path.name,
+            "filename": path.name,
+            "url": content_uri,
+            "info": {"mimetype": mime_type, "size": path.stat().st_size},
+        }
+        if content:
+            file_content["body"] = f"{content}\n{path.name}"
+        response = await self._client.room_send(
+            room_id=room_id,
+            message_type="m.room.message",
+            content=file_content,
+        )
+        return ChannelSendResult.sent(
+            capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+            target_id=room_id,
+            provider_message_id=str(getattr(response, "event_id", "")),
+            provider_file_id=content_uri,
+        )
+
+    @staticmethod
+    def _matrix_upload_content_uri(upload_result: Any) -> str:
+        if isinstance(upload_result, dict):
+            return str(upload_result.get("content_uri", ""))
+        return str(getattr(upload_result, "content_uri", ""))
 
     async def edit(self, message_id: str, content: str) -> None:
         """Edit a previously sent event by ``event_id`` via ``m.replace``.

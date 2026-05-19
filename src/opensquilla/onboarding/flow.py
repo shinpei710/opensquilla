@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import os
 import re
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, cast
 
 from opensquilla.onboarding.channel_specs import (
@@ -21,6 +23,7 @@ from opensquilla.onboarding.config_store import (
     load_config,
     persist_config,
 )
+from opensquilla.onboarding.errors import UserCancelledError
 from opensquilla.onboarding.image_generation_specs import (
     ImageGenerationProviderSetupSpec,
     get_image_generation_provider_setup_spec,
@@ -77,6 +80,13 @@ def _styled(q):
     style = _qs()
     if style is None:
         return q
+    try:
+        import questionary.prompts.common as questionary_common
+
+        questionary_common.INDICATOR_SELECTED = "☑"
+        questionary_common.INDICATOR_UNSELECTED = "☐"
+    except Exception:
+        pass
 
     def _wrap(name):
         fn = getattr(q, name)
@@ -87,6 +97,8 @@ def _styled(q):
         text=_wrap("text"),
         confirm=_wrap("confirm"),
         password=_wrap("password"),
+        checkbox=_wrap("checkbox"),
+        Choice=getattr(q, "Choice", None),
     )
 
 
@@ -103,6 +115,7 @@ class OnboardOptions:
     base_url: str | None = None
     router_mode: str = "recommended"
     minimal: bool = False
+    skip_migration: bool = False
 
 
 def _is_tty() -> bool:
@@ -206,6 +219,20 @@ def _print_noninteractive_hint() -> PersistResult:
     )
 
 
+def _ask_or_cancel(prompt, section: str) -> Any:
+    """Run a questionary prompt and convert a ``None`` answer into ``UserCancelledError``.
+
+    ``questionary`` returns ``None`` when the user aborts (Ctrl+C / Esc). Letting
+    that flow into downstream validation or upsert calls produces misleading
+    error messages — convert it to a typed cancellation at the input boundary
+    so callers can route the user back to a resumable state.
+    """
+    value = prompt.ask()
+    if value is None:
+        raise UserCancelledError(section=section)
+    return value
+
+
 def _ask_provider_choice(questionary, options: OnboardOptions):
     if options.provider_id:
         spec = get_provider_setup_spec(options.provider_id)
@@ -213,11 +240,10 @@ def _ask_provider_choice(questionary, options: OnboardOptions):
     supported = [s for s in list_provider_setup_specs() if s.runtime_supported]
     choices = [f"{s.provider_id} ({s.label})" for s in supported]
     default = next((choice for choice in choices if choice.startswith("openrouter ")), None)
-    pid = questionary.select(
-        "LLM provider",
-        choices=choices,
-        default=default,
-    ).ask()
+    pid = _ask_or_cancel(
+        questionary.select("LLM provider", choices=choices, default=default),
+        section="provider",
+    )
     pid_clean = pid.split(" ")[0]
     return get_provider_setup_spec(pid_clean), pid_clean
 
@@ -318,12 +344,12 @@ def _ask_provider_fields(
             answers["api_key_env"] = selected_env_key
             answers["api_key"] = ""
             if not selected_env_key:
-                answers["api_key"] = (
+                answers["api_key"] = _ask_or_cancel(
                     questionary.password(
                         "API key",
                         validate=_secret_value_validator("API key"),
-                    ).ask()
-                    or ""
+                    ),
+                    section="provider",
                 )
                 answers["api_key_env"] = ""
     else:
@@ -340,10 +366,13 @@ def _ask_provider_fields(
 
 def _ask_search_choice(questionary):
     supported = [s for s in list_search_provider_setup_specs() if s.runtime_supported]
-    provider_id = questionary.select(
-        "Search provider",
-        choices=[f"{s.provider_id} ({s.label})" for s in supported],
-    ).ask()
+    provider_id = _ask_or_cancel(
+        questionary.select(
+            "Search provider",
+            choices=[f"{s.provider_id} ({s.label})" for s in supported],
+        ),
+        section="search",
+    )
     provider_id_clean = provider_id.split(" ")[0]
     return get_search_provider_setup_spec(provider_id_clean), provider_id_clean
 
@@ -355,41 +384,57 @@ def _ask_search_fields(questionary, spec) -> dict[str, Any]:
         use_env_key = False
         if env_key and os.environ.get(env_key):
             use_env_key = bool(
-                questionary.confirm(
-                    f"Use {env_key} from environment?",
-                    default=False,
-                ).ask()
+                _ask_or_cancel(
+                    questionary.confirm(
+                        f"Use {env_key} from environment?",
+                        default=False,
+                    ),
+                    section="search",
+                )
             )
         if use_env_key:
             answers["api_key"] = ""
             answers["api_key_env"] = env_key
         else:
-            answers["api_key"] = (
+            answers["api_key"] = _ask_or_cancel(
                 questionary.password(
                     _search_api_key_prompt(spec),
                     validate=_secret_value_validator("Search API key"),
-                ).ask()
-                or ""
+                ),
+                section="search",
             )
             answers["api_key_env"] = ""
     else:
         answers["api_key"] = ""
         answers["api_key_env"] = ""
-    max_results = questionary.text("Max search results", default="5").ask() or "5"
+    max_results = _ask_or_cancel(
+        questionary.text("Max search results", default="5"), section="search"
+    ) or "5"
     answers["max_results"] = int(max_results)
-    answers["proxy"] = questionary.text("Search HTTP proxy", default="").ask() or ""
-    answers["use_env_proxy"] = questionary.confirm(
-        "Use environment proxy for search?", default=False
-    ).ask()
-    fallback_choice = questionary.select(
-        "Search fallback policy",
-        choices=list(_SEARCH_FALLBACK_LABELS.values()),
-        default=_SEARCH_FALLBACK_LABELS["off"],
-    ).ask()
+    answers["proxy"] = _ask_or_cancel(
+        questionary.text("Search HTTP proxy", default=""), section="search"
+    )
+    answers["use_env_proxy"] = bool(
+        _ask_or_cancel(
+            questionary.confirm("Use environment proxy for search?", default=False),
+            section="search",
+        )
+    )
+    fallback_choice = _ask_or_cancel(
+        questionary.select(
+            "Search fallback policy",
+            choices=list(_SEARCH_FALLBACK_LABELS.values()),
+            default=_SEARCH_FALLBACK_LABELS["off"],
+        ),
+        section="search",
+    )
     answers["fallback_policy"] = _search_fallback_choice_to_value(fallback_choice)
-    answers["diagnostics"] = questionary.confirm(
-        _SEARCH_DIAGNOSTICS_PROMPT, default=False
-    ).ask()
+    answers["diagnostics"] = bool(
+        _ask_or_cancel(
+            questionary.confirm(_SEARCH_DIAGNOSTICS_PROMPT, default=False),
+            section="search",
+        )
+    )
     return answers
 
 
@@ -886,8 +931,10 @@ def _warn_channel_dependency_gaps(spec: ChannelSetupSpec, answers: dict[str, Any
                     "[bold]Portable zip:[/]\n"
                     "  Use the latest recommended portable package, then restart.\n\n"
                     "[bold]Installed command:[/]\n"
-                    "  pwsh -ExecutionPolicy Bypass -File install.ps1 -Extras feishu\n"
-                    "  OPENSQUILLA_INSTALL_EXTRAS=feishu bash install.sh\n"
+                    "  $env:OPENSQUILLA_INSTALL_EXTRAS=\"feishu\"; "
+                    "irm https://opensquilla.ai/install.ps1 | iex\n"
+                    "  OPENSQUILLA_INSTALL_EXTRAS=feishu "
+                    "curl -LsSf https://opensquilla.ai/install.sh | bash -s --\n"
                     "  opensquilla gateway restart\n\n"
                     "[bold]Development checkout:[/]\n"
                     "  uv sync --extra recommended --extra feishu\n"
@@ -912,10 +959,501 @@ def _print_channel_saved(name: str) -> None:
     )
 
 
+_MIGRATION_SOURCE_LABELS = {
+    "openclaw": "OpenClaw",
+    "hermes": "Hermes Agent",
+}
+
+
+@dataclass(frozen=True)
+class DetectedMigrationSource:
+    name: str
+    path: Path
+
+
+@dataclass(frozen=True)
+class MigrationBatchOptions:
+    config: Path
+    apply: bool
+    migrate_secrets: bool
+    overwrite: bool
+    preset: str
+    include: tuple[str, ...]
+    exclude: tuple[str, ...]
+    skill_conflict: str
+    persona_conflict: str
+
+
+@dataclass(frozen=True)
+class MigrationBatchResult:
+    selected: tuple[str, ...]
+    reports: dict[str, dict[str, Any]]
+    apply: bool
+
+    @property
+    def has_error(self) -> bool:
+        return any(
+            item.get("status") == "error"
+            for report in self.reports.values()
+            for item in report.get("items", [])
+            if isinstance(item, dict)
+        )
+
+
+def _config_path_from_loaded_config(cfg: Any) -> Path:
+    raw = getattr(cfg, "config_path", "") or default_config_path()
+    return Path(raw).expanduser()
+
+
+def _migration_orchestrator() -> Any:
+    return importlib.import_module("opensquilla.migration.orchestrator")
+
+
+def detect_default_sources() -> list[Any]:
+    return cast(list[Any], _migration_orchestrator().detect_default_sources())
+
+
+def run_migration_batch(
+    detected: list[Any], selected: list[str] | tuple[str, ...], options: Any
+) -> Any:
+    migration = _migration_orchestrator()
+    if isinstance(options, MigrationBatchOptions):
+        options = migration.MigrationBatchOptions(
+            config=options.config,
+            apply=options.apply,
+            migrate_secrets=options.migrate_secrets,
+            overwrite=options.overwrite,
+            preset=options.preset,
+            include=options.include,
+            exclude=options.exclude,
+            skill_conflict=options.skill_conflict,
+            persona_conflict=options.persona_conflict,
+        )
+    return migration.run_migration_batch(detected, selected, options)
+
+
+def report_status_counts(report: dict[str, Any]) -> dict[str, int]:
+    return cast(dict[str, int], _migration_orchestrator().report_status_counts(report))
+
+
+def _run_onboard_migration_step(
+    questionary,
+    *,
+    config_path: Path,
+) -> Any | None:
+    """Run the interactive onboarding migration pre-step.
+
+    Migration is intentionally isolated from the rest of onboarding: detection,
+    dry-run, apply, and report rendering failures all degrade to "skip migration"
+    so provider setup can continue normally.
+    """
+
+    migration = None
+    try:
+        migration = _migration_orchestrator()
+        detected = detect_default_sources()
+        if not detected:
+            return None
+        _print_detected_migration_sources(detected)
+        should_migrate = bool(
+            _ask_or_cancel(
+                questionary.confirm(
+                    "Review migration options now?",
+                    default=True,
+                ),
+                section="migration",
+            )
+        )
+        if not should_migrate:
+            console.print("[dim]Migration skipped.[/dim]")
+            return None
+
+        selected = _ask_migration_sources(questionary, detected)
+        if not selected:
+            console.print("[yellow]No migration source selected; skipping migration.[/yellow]")
+            return None
+        _print_selected_migration_sources(detected, selected)
+
+        migrate_secrets = bool(
+            _ask_or_cancel(
+                questionary.confirm(
+                    "Import saved API keys/tokens from detected legacy .env files?",
+                    default=False,
+                ),
+                section="migration",
+            )
+        )
+        dry_run_options = _onboard_migration_options(
+            migration=migration,
+            config_path=config_path,
+            apply=False,
+            migrate_secrets=migrate_secrets,
+        )
+        dry_run = run_migration_batch(detected, selected, dry_run_options)
+        _print_migration_summary(dry_run, title="Migration preview")
+        if dry_run.has_error:
+            console.print(
+                warning_panel(
+                    "Migration preview found errors. Onboarding will continue without "
+                    "applying migration; retry later with `opensquilla migrate --apply`."
+                )
+            )
+            return None
+
+        apply_now = bool(
+            _ask_or_cancel(
+                questionary.confirm("Apply this migration now?", default=True),
+                section="migration",
+            )
+        )
+        if not apply_now:
+            console.print("[dim]Migration not applied.[/dim]")
+            return None
+
+        applied_options = _onboard_migration_options(
+            migration=migration,
+            config_path=config_path,
+            apply=True,
+            migrate_secrets=migrate_secrets,
+        )
+        applied = run_migration_batch(detected, selected, applied_options)
+        _print_migration_summary(applied, title="Migration complete")
+        if applied.has_error:
+            console.print(
+                warning_panel(
+                    "Migration reported errors after apply. Onboarding will continue; "
+                    "review the migration report before relying on imported data."
+                )
+            )
+            return None
+        return applied
+    except UserCancelledError:
+        console.print("[yellow]Migration setup cancelled — continuing onboarding.[/yellow]")
+        return None
+    except KeyboardInterrupt:
+        console.print("[yellow]Migration interrupted — continuing onboarding.[/yellow]")
+        return None
+    except Exception as exc:
+        option_error = getattr(migration, "MigrationOptionError", None)
+        if isinstance(option_error, type) and isinstance(exc, option_error):
+            console.print(
+                warning_panel(
+                    f"Migration options were rejected: {exc}. "
+                    "Onboarding will continue without migration."
+                )
+            )
+            return None
+        console.print(
+            warning_panel(
+                f"Migration failed before onboarding completed: {exc}. "
+                "Onboarding will continue without migration."
+            )
+        )
+        return None
+
+
+def _onboard_migration_options(
+    *,
+    migration: Any,
+    config_path: Path,
+    apply: bool,
+    migrate_secrets: bool,
+) -> Any:
+    return MigrationBatchOptions(
+        config=config_path,
+        apply=apply,
+        migrate_secrets=migrate_secrets,
+        overwrite=False,
+        preset="full",
+        include=(),
+        exclude=(),
+        skill_conflict="skip",
+        persona_conflict="use-opensquilla",
+    )
+
+
+def _print_detected_migration_sources(detected: list[Any]) -> None:
+    console.print(f"[bold {ACCENT}]◆[/] [bold]Existing agent data detected[/]")
+    for source in detected:
+        label = _MIGRATION_SOURCE_LABELS.get(source.name, source.name)
+        console.print(f"  [{ACCENT_SOFT}]✓[/] {label} [dim]{source.path}[/dim]")
+
+
+def _print_selected_migration_sources(
+    detected: list[Any],
+    selected: list[str],
+) -> None:
+    selected_names = set(selected)
+    console.print(f"[bold {ACCENT}]◆[/] [bold]Selected migration sources[/]")
+    for source in detected:
+        if source.name not in selected_names:
+            continue
+        label = _MIGRATION_SOURCE_LABELS.get(source.name, source.name)
+        console.print(f"  [{ACCENT_SOFT}]☑[/] {label} [dim]{source.path}[/dim]")
+
+
+def _ask_migration_sources(
+    questionary,
+    detected: list[Any],
+) -> list[str]:
+    if len(detected) == 1:
+        return [detected[0].name]
+    choice_cls = getattr(questionary, "Choice", None)
+    if choice_cls is None:
+        choices = [
+            f"{_MIGRATION_SOURCE_LABELS.get(source.name, source.name)} - {source.path}"
+            for source in detected
+        ]
+        selected = _ask_or_cancel(
+            questionary.checkbox(
+                "Select sources to import",
+                choices=choices,
+                instruction="Space select | Enter continue | A toggle all",
+            ),
+            section="migration",
+        )
+        selected_text = {str(value).split(" ", 1)[0].lower() for value in selected}
+        return [source.name for source in detected if source.name in selected_text]
+    choices = [
+        choice_cls(
+            title=_MIGRATION_SOURCE_LABELS.get(source.name, source.name),
+            value=source.name,
+            checked=True,
+            description=str(source.path),
+        )
+        for source in detected
+    ]
+    selected = _ask_or_cancel(
+        questionary.checkbox(
+            "Select sources to import",
+            choices=choices,
+            instruction="Space select | Enter continue | A toggle all",
+        ),
+        section="migration",
+    )
+    return [str(value) for value in selected]
+
+
+def _print_migration_summary(result: Any, *, title: str) -> None:
+    console.print(f"[bold {ACCENT}]◆[/] [bold]{title}[/]")
+    mode = "applied" if result.apply else "dry-run"
+    for name in result.selected:
+        report = result.reports.get(name, {})
+        label = _MIGRATION_SOURCE_LABELS.get(name, name)
+        counts = report_status_counts(report)
+        pieces = [
+            f"{status}={count}"
+            for status, count in sorted(counts.items())
+            if count
+        ]
+        summary = ", ".join(pieces) if pieces else "no changes"
+        console.print(f"  {label}: {mode}; {summary}")
+        output_dir = str(report.get("output_dir") or "")
+        report_file = Path(output_dir) / "report.json" if output_dir else None
+        if output_dir and (result.apply or (report_file is not None and report_file.is_file())):
+            console.print(f"    [dim]Report:[/dim] {output_dir}")
+
+
+def _migration_result_path(
+    cfg: Any,
+    migration_result: Any | None,
+    *,
+    config_path: Path,
+) -> PersistResult:
+    if migration_result is None:
+        return PersistResult(
+            path=_config_path_from_loaded_config(cfg),
+            backup_path=None,
+            restart_required=False,
+        )
+    return PersistResult(
+        path=config_path,
+        backup_path=None,
+        restart_required=bool(migration_result.apply),
+    )
+
+
+def _reload_after_migration(config_path: Path, fallback: Any):
+    try:
+        return load_config(config_path)
+    except Exception as exc:
+        console.print(
+            warning_panel(
+                f"Imported configuration could not be reloaded: {exc}. "
+                "Continuing with the pre-migration onboarding state."
+            )
+        )
+        return fallback
+
+
+def _keep_imported_provider(questionary, cfg: Any) -> bool:
+    llm = getattr(cfg, "llm", None)
+    provider = str(getattr(llm, "provider", "") or "")
+    model = str(getattr(llm, "model", "") or "")
+    router_supported = _imported_provider_router_supported(cfg)
+    if provider:
+        console.print(
+            f"[bold {ACCENT}]◆[/] [bold]Imported provider settings found[/]"
+        )
+        console.print(f"  Provider: [{ACCENT_SOFT}]{markup_escape(provider)}[/]")
+        if router_supported:
+            console.print(
+                "  Model: [dim]will use SquillaRouter defaults; "
+                "old direct model is not imported[/dim]"
+            )
+        elif model:
+            console.print(f"  Model: [{ACCENT_SOFT}]{markup_escape(model)}[/]")
+    return bool(
+        _ask_or_cancel(
+            questionary.confirm("Use imported provider credentials?", default=True),
+            section="provider",
+        )
+    )
+
+
+def _imported_provider_router_supported(cfg: Any) -> bool:
+    llm = getattr(cfg, "llm", None)
+    provider = str(getattr(llm, "provider", "") or "")
+    if not provider:
+        return False
+    try:
+        spec = get_provider_setup_spec(provider)
+    except KeyError:
+        return False
+    return bool(getattr(spec, "router_supported", False))
+
+
+def _provider_id_from_config(cfg: Any) -> str:
+    llm = getattr(cfg, "llm", None)
+    return str(getattr(llm, "provider", "") or "")
+
+
+def _imported_provider_key_payload(llm: Any) -> dict[str, str]:
+    api_key = str(getattr(llm, "api_key", "") or "")
+    api_key_env = str(getattr(llm, "api_key_env", "") or "")
+    if api_key:
+        api_key_env = ""
+    return {"api_key": api_key, "api_key_env": api_key_env}
+
+
+def _use_imported_provider_credentials_with_router_defaults(
+    questionary,
+    cfg: Any,
+    *,
+    requested_mode: str,
+):
+    llm = getattr(cfg, "llm", None)
+    provider = _provider_id_from_config(cfg)
+    key_payload = _imported_provider_key_payload(llm)
+    res = upsert_llm_provider(
+        cfg,
+        provider_id=provider,
+        model="",
+        api_key=key_payload["api_key"],
+        api_key_env=key_payload["api_key_env"],
+        base_url=str(getattr(llm, "base_url", "") or ""),
+        proxy=str(getattr(llm, "proxy", "") or ""),
+        provider_routing=dict(getattr(llm, "provider_routing", {}) or {}),
+    )
+    cfg_after_provider = res.config
+    if requested_mode:
+        router_payload = _ask_router_fields(
+            questionary,
+            cfg_after_provider,
+            provider_id=provider,
+            requested_mode=requested_mode,
+        )
+        router_res = upsert_router(
+            cfg_after_provider,
+            mode=router_payload["mode"],
+            default_tier=router_payload.get("defaultTier"),
+            tiers=router_payload.get("tiers"),
+        )
+        cfg_after_provider = router_res.config
+    return cfg_after_provider
+
+
+def _complete_imported_provider_credentials(questionary, cfg: Any):
+    llm = getattr(cfg, "llm", None)
+    provider = str(getattr(llm, "provider", "") or "")
+    model = str(getattr(llm, "model", "") or "")
+    base_url = str(getattr(llm, "base_url", "") or "")
+    imported_env_key = str(getattr(llm, "api_key_env", "") or "")
+    if not provider or not model:
+        return None
+    try:
+        spec = get_provider_setup_spec(provider)
+    except KeyError:
+        return None
+    if not spec.runtime_supported or not spec.requires_api_key:
+        return None
+    if spec.requires_base_url and not base_url:
+        return None
+
+    console.print(
+        warning_panel(
+            "Provider settings were imported, but no usable API key is available. "
+            "Set the key now to finish onboarding."
+        )
+    )
+    credentials = _ask_imported_provider_credentials(
+        questionary,
+        spec,
+        imported_env_key=imported_env_key,
+    )
+    res = upsert_llm_provider(
+        cfg,
+        provider_id=provider,
+        model="" if _imported_provider_router_supported(cfg) else model,
+        api_key=credentials["api_key"],
+        api_key_env=credentials["api_key_env"],
+        base_url=base_url,
+    )
+    return res.config
+
+
+def _ask_imported_provider_credentials(
+    questionary,
+    spec,
+    *,
+    imported_env_key: str,
+) -> dict[str, str]:
+    choices = [_PASTE_API_KEY_CHOICE]
+    seen_env_keys: set[str] = set()
+    for env_key in (imported_env_key, spec.env_key):
+        if env_key and env_key not in seen_env_keys:
+            seen_env_keys.add(env_key)
+            choices.append(
+                _api_key_env_choice(env_key, detected=bool(os.environ.get(env_key)))
+            )
+    detected_choice = next((choice for choice in choices if _DETECTED_ENV_SUFFIX in choice), None)
+    key_source = _ask_or_cancel(
+        questionary.select(
+            "LLM API key source",
+            choices=choices,
+            default=detected_choice or _PASTE_API_KEY_CHOICE,
+        ),
+        section="provider",
+    )
+    selected_env_key = _api_key_env_from_choice(key_source or "")
+    if selected_env_key:
+        return {"api_key": "", "api_key_env": selected_env_key}
+    return {
+        "api_key": _ask_or_cancel(
+            questionary.password(
+                "API key",
+                validate=_secret_value_validator("API key"),
+            ),
+            section="provider",
+        ),
+        "api_key_env": "",
+    }
+
+
 def run_interactive_onboard(options: OnboardOptions) -> PersistResult:
     cfg = load_config()
     status = get_onboarding_status(cfg)
-    if options.if_needed and status.has_config and status.llm_configured:
+    if options.if_needed and status.has_config and not status.needs_onboarding:
         return persist_config(cfg, restart_required=False, backup=False)
 
     if not _is_tty():
@@ -927,36 +1465,103 @@ def run_interactive_onboard(options: OnboardOptions) -> PersistResult:
     console.print(
         banner_panel(
             "OpenSquilla Onboarding",
-            "Provider · Router · Channel · Search",
+            "Migration · Provider · Router · Channel · Search",
         )
     )
     _wait_for_setup_start()
-    spec, provider_id = _ask_provider_choice(questionary, options)
-    answers = _ask_provider_fields(questionary, spec, options)
-    res = upsert_llm_provider(
-        cfg,
-        provider_id=provider_id,
-        model=answers["model"],
-        api_key=answers.get("api_key", ""),
-        api_key_env=answers.get("api_key_env", ""),
-        base_url=answers.get("base_url", ""),
-    )
-    cfg_after_provider = res.config
-    if options.router_mode:
-        router_payload = _ask_router_fields(
+    config_path = _config_path_from_loaded_config(cfg)
+    migration_result: Any | None = None
+    if not options.skip_migration:
+        migration_result = _run_onboard_migration_step(
             questionary,
-            cfg_after_provider,
-            provider_id=provider_id,
-            requested_mode=options.router_mode,
+            config_path=config_path,
         )
-        router_res = upsert_router(
-            cfg_after_provider,
-            mode=router_payload["mode"],
-            default_tier=router_payload.get("defaultTier"),
-            tiers=router_payload.get("tiers"),
+        if migration_result is not None:
+            cfg = _reload_after_migration(config_path, cfg)
+            status = get_onboarding_status(cfg)
+
+    keep_imported = (
+        migration_result is not None
+        and not migration_result.has_error
+        and status.llm_configured
+        and _keep_imported_provider(questionary, cfg)
+    )
+    if keep_imported:
+        try:
+            if _imported_provider_router_supported(cfg):
+                cfg_after_provider = _use_imported_provider_credentials_with_router_defaults(
+                    questionary,
+                    cfg,
+                    requested_mode=options.router_mode,
+                )
+                persist = persist_config(cfg_after_provider, restart_required=False)
+            else:
+                cfg_after_provider = cfg
+                persist = _migration_result_path(cfg, migration_result, config_path=config_path)
+        except Exception as exc:
+            keep_imported = False
+            console.print(
+                warning_panel(
+                    f"Imported provider settings could not be finalized: {exc}. "
+                    "Continue provider setup to finish onboarding."
+                )
+            )
+    if not keep_imported:
+        completed_imported = (
+            _complete_imported_provider_credentials(questionary, cfg)
+            if migration_result is not None and not status.llm_configured
+            else None
         )
-        cfg_after_provider = router_res.config
-    persist = persist_config(cfg_after_provider, restart_required=False)
+        if completed_imported is not None:
+            cfg_after_provider = completed_imported
+            if _imported_provider_router_supported(cfg_after_provider) and options.router_mode:
+                router_payload = _ask_router_fields(
+                    questionary,
+                    cfg_after_provider,
+                    provider_id=_provider_id_from_config(cfg_after_provider),
+                    requested_mode=options.router_mode,
+                )
+                router_res = upsert_router(
+                    cfg_after_provider,
+                    mode=router_payload["mode"],
+                    default_tier=router_payload.get("defaultTier"),
+                    tiers=router_payload.get("tiers"),
+                )
+                cfg_after_provider = router_res.config
+        else:
+            if migration_result is not None and not status.llm_configured:
+                console.print(
+                    warning_panel(
+                        "Provider settings were not fully usable after migration. "
+                        "Continue provider setup to finish onboarding."
+                    )
+                )
+            spec, provider_id = _ask_provider_choice(questionary, options)
+            answers = _ask_provider_fields(questionary, spec, options)
+            res = upsert_llm_provider(
+                cfg,
+                provider_id=provider_id,
+                model=answers["model"],
+                api_key=answers.get("api_key", ""),
+                api_key_env=answers.get("api_key_env", ""),
+                base_url=answers.get("base_url", ""),
+            )
+            cfg_after_provider = res.config
+            if options.router_mode:
+                router_payload = _ask_router_fields(
+                    questionary,
+                    cfg_after_provider,
+                    provider_id=provider_id,
+                    requested_mode=options.router_mode,
+                )
+                router_res = upsert_router(
+                    cfg_after_provider,
+                    mode=router_payload["mode"],
+                    default_tier=router_payload.get("defaultTier"),
+                    tiers=router_payload.get("tiers"),
+                )
+                cfg_after_provider = router_res.config
+        persist = persist_config(cfg_after_provider, restart_required=False)
 
     if options.minimal:
         return persist
@@ -964,19 +1569,64 @@ def run_interactive_onboard(options: OnboardOptions) -> PersistResult:
     if not options.skip_channels and questionary.confirm(
         "Configure a messaging channel now?", default=False
     ).ask():
-        run_interactive_channel_add(None)
+        _run_optional_section(
+            section="channel",
+            label="channel",
+            runner=run_interactive_channel_add,
+            args=(None,),
+        )
 
     if not options.skip_search and questionary.confirm(
         "Configure web search now?", default=False
     ).ask():
-        run_interactive_search_configure()
+        _run_optional_section(
+            section="search",
+            label="search",
+            runner=run_interactive_search_configure,
+        )
 
     if not options.skip_image_generation and questionary.confirm(
         "Enable image generation now?", default=False
     ).ask():
-        run_interactive_image_generation_configure()
+        _run_optional_section(
+            section="image-generation",
+            label="image generation",
+            runner=run_interactive_image_generation_configure,
+        )
 
     return persist
+
+
+def _run_optional_section(
+    *,
+    section: str,
+    label: str,
+    runner,
+    args: tuple = (),
+    kwargs: dict | None = None,
+) -> None:
+    """Run an optional onboarding step, isolating cancellation from siblings.
+
+    ``section`` is the slug consumed by ``opensquilla configure <section>``;
+    ``label`` is the user-facing wording (which can contain spaces). Only
+    cancellation-shaped exceptions are caught here — real validation or
+    programming errors propagate so they surface in the operator's terminal
+    instead of being silently buried alongside the "skipping" message.
+    """
+    try:
+        runner(*args, **(kwargs or {}))
+    except UserCancelledError:
+        console.print(
+            f"[yellow]{label} setup cancelled — skipping.[/yellow]"
+        )
+        console.print(
+            f"  [dim]Resume later with[/dim] "
+            f"[{ACCENT_SOFT}]opensquilla configure {section}[/]"
+        )
+    except KeyboardInterrupt:
+        console.print(
+            f"[yellow]{label} setup interrupted — skipping.[/yellow]"
+        )
 
 
 def run_interactive_channel_add(type_name: str | None) -> PersistResult:

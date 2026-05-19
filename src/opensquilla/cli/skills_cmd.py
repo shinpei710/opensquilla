@@ -16,7 +16,7 @@ from opensquilla.cli.gateway_rpc import (
     run_gateway_sync,
 )
 from opensquilla.cli.output import emit_error, print_json
-from opensquilla.cli.ui import console
+from opensquilla.cli.ui import ACCENT, console
 from opensquilla.skills.hub.source import SkillSource
 
 skills_app = typer.Typer(help="Skill management - list, search, install, uninstall.")
@@ -163,7 +163,7 @@ def skills_list(
         return
 
     table = Table(title=f"Skills ({len(rows)})")
-    table.add_column("Name", style="cyan")
+    table.add_column("Name", style=ACCENT)
     table.add_column("Layer")
     table.add_column("Eligible")
     table.add_column("Description")
@@ -213,7 +213,7 @@ def skills_search(
             return
 
         table = Table(title=f"Search: {query}")
-        table.add_column("Name", style="cyan")
+        table.add_column("Name", style=ACCENT)
         table.add_column("Source")
         table.add_column("Trust")
         table.add_column("Description")
@@ -241,7 +241,7 @@ def skills_view(
         return
 
     table = Table(title=f"Skill: {payload.get('name', name)}")
-    table.add_column("Field", style="cyan")
+    table.add_column("Field", style=ACCENT)
     table.add_column("Value")
     for key in (
         "name",
@@ -284,7 +284,7 @@ def skills_update(
         print_json(payload)
     else:
         table = Table(title="Skill updates")
-        table.add_column("Name", style="cyan")
+        table.add_column("Name", style=ACCENT)
         table.add_column("Status")
         table.add_column("Message")
         for row in results:

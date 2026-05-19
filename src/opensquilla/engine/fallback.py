@@ -6,13 +6,27 @@ import random
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
+
 
 class ProviderErrorKind(StrEnum):
     RATE_LIMIT = "rate_limit"
     AUTH_FAILURE = "auth_failure"
     OVERLOADED = "overloaded"
     CONTEXT_OVERFLOW = "context_overflow"
+    TRANSPORT_TRANSIENT = "transport_transient"
+    EMPTY_RESPONSE = "empty_response"
     UNKNOWN = "unknown"
+
+
+_FAILURE_KIND_MAP: dict[ProviderFailureKind, ProviderErrorKind] = {
+    ProviderFailureKind.PROVIDER_OVERLOADED: ProviderErrorKind.TRANSPORT_TRANSIENT,
+    ProviderFailureKind.TRANSPORT_TRANSIENT: ProviderErrorKind.TRANSPORT_TRANSIENT,
+    ProviderFailureKind.RATE_LIMITED: ProviderErrorKind.RATE_LIMIT,
+    ProviderFailureKind.AUTH_INVALID: ProviderErrorKind.AUTH_FAILURE,
+    ProviderFailureKind.CONTEXT_OVERFLOW: ProviderErrorKind.CONTEXT_OVERFLOW,
+    ProviderFailureKind.EMPTY_RESPONSE: ProviderErrorKind.EMPTY_RESPONSE,
+}
 
 
 @dataclass
@@ -27,19 +41,8 @@ class FallbackPolicy:
     @staticmethod
     def classify_error(message: str) -> ProviderErrorKind:
         """Classify a provider error message into a retry category."""
-        msg = message.lower()
-        if "rate_limit" in msg or "rate limit" in msg or "429" in msg:
-            return ProviderErrorKind.RATE_LIMIT
-        if "auth" in msg or "401" in msg or "403" in msg or "invalid api key" in msg:
-            return ProviderErrorKind.AUTH_FAILURE
-        if "overload" in msg or "503" in msg or "502" in msg or "capacity" in msg:
-            return ProviderErrorKind.OVERLOADED
-        ctx_match = "context" in msg and (
-            "exceed" in msg or "length" in msg or "too long" in msg or "overflow" in msg
-        )
-        if ctx_match:
-            return ProviderErrorKind.CONTEXT_OVERFLOW
-        return ProviderErrorKind.UNKNOWN
+        kind = classify_provider_error("openrouter", None, message=message)
+        return _FAILURE_KIND_MAP.get(kind, ProviderErrorKind.UNKNOWN)
 
     def should_retry(self, kind: ProviderErrorKind, attempt: int) -> bool:
         """Whether to retry after this error kind at this attempt number."""
@@ -51,6 +54,7 @@ class FallbackPolicy:
             ProviderErrorKind.RATE_LIMIT,
             ProviderErrorKind.OVERLOADED,
             ProviderErrorKind.CONTEXT_OVERFLOW,
+            ProviderErrorKind.TRANSPORT_TRANSIENT,
         )
         if kind in retryable:
             return True

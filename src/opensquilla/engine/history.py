@@ -5,12 +5,34 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from opensquilla.execution_status import (
+    normalize_execution_status,
+    normalize_legacy_execution_status,
+)
 from opensquilla.provider import (
     ContentBlockText,
     ContentBlockToolResult,
     ContentBlockToolUse,
     Message,
 )
+
+_SYNTHETIC_USER_PREFIXES = (
+    "[Available skills for this turn]",
+    "[Context summary]",
+    "[Request context for this turn]",
+    "[Runtime context for this turn]",
+)
+
+
+def _is_real_user_turn(message: Message) -> bool:
+    if message.role != "user":
+        return False
+    content = message.content
+    if isinstance(content, str):
+        return not content.startswith(_SYNTHETIC_USER_PREFIXES)
+    if isinstance(content, list):
+        return not all(isinstance(block, ContentBlockToolResult) for block in content)
+    return True
 
 
 def limit_turns(messages: list[Message], max_turns: int) -> list[Message]:
@@ -22,11 +44,12 @@ def limit_turns(messages: list[Message], max_turns: int) -> list[Message]:
     if max_turns <= 0 or not messages:
         return messages
 
-    # Count user messages from the end; cut just before the (max_turns+1)th user msg
+    # Count real user messages from the end; synthetic context messages should
+    # not evict conversation turns from the provider prefix.
     user_count = 0
     cut_index = 0
     for i in range(len(messages) - 1, -1, -1):
-        if messages[i].role == "user":
+        if _is_real_user_turn(messages[i]):
             user_count += 1
             if user_count > max_turns:
                 # i is the user msg we want to exclude; next msg after i is the cut point
@@ -36,7 +59,9 @@ def limit_turns(messages: list[Message], max_turns: int) -> list[Message]:
                 # so cut at the first non-excluded index, which is i+1 only if i+1 is a user msg.
                 # Simpler: scan forward from i+1 to find the next user message.
                 cut_index = i + 1
-                while cut_index < len(messages) and messages[cut_index].role != "user":
+                while cut_index < len(messages) and not _is_real_user_turn(
+                    messages[cut_index]
+                ):
                     cut_index += 1
                 break
 
@@ -223,6 +248,11 @@ def reconstruct_messages_from_entry(
                     tool_use_id=tool_use_id,
                     content=result_content,
                     is_error=bool(seg.get("is_error")),
+                    execution_status=(
+                        normalize_execution_status(seg.get("execution_status"))
+                        if "execution_status" in seg
+                        else normalize_legacy_execution_status(is_error=bool(seg.get("is_error")))
+                    ),
                 )
             )
 

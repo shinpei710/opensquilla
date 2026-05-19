@@ -18,10 +18,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from opensquilla.memory.dream_prompts import (
     phase1_prompt,
@@ -79,6 +80,63 @@ class _Phase2Outcome:
     tool_calls: int
     changes: int
     applied_operations: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _CandidateIdentity:
+    path: str
+    mtime_ns: int
+    size: int
+    sha256: str
+
+
+class _DreamFileLock:
+    """Small cross-process exclusive lock for Dream file mutations."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._fh: Any | None = None
+
+    def __enter__(self) -> _DreamFileLock:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self.path.open("a+b")
+        self._fh.seek(0, os.SEEK_END)
+        if self._fh.tell() == 0:
+            self._fh.write(b"\0")
+            self._fh.flush()
+        self._fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            getattr(msvcrt, "locking")(self._fh.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+        else:
+            fcntl = cast(Any, __import__("fcntl"))
+
+            flock = getattr(fcntl, "flock")
+            lock_ex = getattr(fcntl, "LOCK_EX")
+            flock(self._fh.fileno(), lock_ex)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._fh is None:
+            return
+        try:
+            self._fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                getattr(msvcrt, "locking")(
+                    self._fh.fileno(), getattr(msvcrt, "LK_UNLCK"), 1
+                )
+            else:
+                fcntl = cast(Any, __import__("fcntl"))
+
+                flock = getattr(fcntl, "flock")
+                lock_un = getattr(fcntl, "LOCK_UN")
+                flock(self._fh.fileno(), lock_un)
+        finally:
+            self._fh.close()
+            self._fh = None
 
 
 class DreamCursor:
@@ -150,7 +208,7 @@ class Dream:
     ) -> None:
         self.workspace = workspace
         self.memory_dir = workspace / "memory"
-        self.memory_md = self.memory_dir / "MEMORY.md"
+        self.memory_md = workspace / "MEMORY.md"
         self.cursor = DreamCursor(self.memory_dir)
         self.provider = provider
         self.model = model
@@ -347,6 +405,49 @@ class Dream:
         except ValueError:
             return str(path)
 
+    def _phase2_lock_path(self) -> Path:
+        return self.memory_dir / ".dream.lock"
+
+    def _candidate_identities(self, files: list[Path]) -> dict[str, _CandidateIdentity]:
+        identities: dict[str, _CandidateIdentity] = {}
+        for path in files:
+            rel_path = self._workspace_relative(path)
+            try:
+                stat = path.stat()
+                data = path.read_bytes()
+            except OSError:
+                continue
+            identities[rel_path] = _CandidateIdentity(
+                path=rel_path,
+                mtime_ns=stat.st_mtime_ns,
+                size=stat.st_size,
+                sha256=hashlib.sha256(data).hexdigest(),
+            )
+        return identities
+
+    def _stale_batch_reason(
+        self,
+        files: list[Path],
+        expected: dict[str, _CandidateIdentity],
+        *,
+        cursor_before: float,
+    ) -> str | None:
+        current_cursor = self.cursor.load()
+        if current_cursor != cursor_before:
+            return "cursor advanced"
+        current = self._candidate_identities(files)
+        expected_paths = {self._workspace_relative(path) for path in files}
+        if set(expected) != expected_paths:
+            missing = sorted(expected_paths - set(expected))
+            return f"candidate identity missing before phase2: {missing}"
+        if set(current) != expected_paths:
+            missing = sorted(expected_paths - set(current))
+            return f"candidate disappeared or became unreadable: {missing}"
+        for rel_path in sorted(expected_paths):
+            if current[rel_path] != expected[rel_path]:
+                return f"candidate changed: {rel_path}"
+        return None
+
     def _backup_memory_md(self, artifact_id: str) -> str:
         backup_dir = self.memory_dir / ".dream_backups" / artifact_id
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -450,13 +551,11 @@ class Dream:
             raise ValueError("Phase 1 fallback analysis was empty, invalid, or low-confidence")
         return fallback_analysis, True
 
-    async def _phase2_apply_edits(
+    async def _phase2_generate_edit_plan(
         self,
         phase1_output: str,
-        *,
-        dry_run: bool = False,
-    ) -> _Phase2Outcome:
-        """Phase 2: request a JSON edit plan, validate, apply to MEMORY.md."""
+    ) -> list[dict[str, Any]]:
+        """Phase 2 provider call: request and validate a JSON edit plan."""
         prompt = phase2_prompt(phase1_output)
         messages = [Message(role="user", content=prompt)]
         text = await _run_complete(self.provider, messages, 4096)
@@ -471,7 +570,15 @@ class Dream:
         edits = plan.get("edits") or []
         if not isinstance(edits, list):
             raise ValueError(f"Phase 2 edits must be a list, got {type(edits).__name__}")
+        return [edit for edit in edits if isinstance(edit, dict)]
 
+    async def _phase2_apply_edit_plan(
+        self,
+        edits: list[dict[str, Any]],
+        *,
+        dry_run: bool = False,
+    ) -> _Phase2Outcome:
+        """Apply an already-generated Phase 2 edit plan to MEMORY.md."""
         content = self.memory_md.read_text(encoding="utf-8") if self.memory_md.exists() else ""
         changes = 0
         applied_operations: list[dict[str, Any]] = []
@@ -535,6 +642,16 @@ class Dream:
             applied_operations=applied_operations,
         )
 
+    async def _phase2_apply_edits(
+        self,
+        phase1_output: str,
+        *,
+        dry_run: bool = False,
+    ) -> _Phase2Outcome:
+        """Back-compat wrapper for tests that call the old combined helper."""
+        edits = await self._phase2_generate_edit_plan(phase1_output)
+        return await self._phase2_apply_edit_plan(edits, dry_run=dry_run)
+
     async def run(self) -> DreamResult:
         """Entry point — orchestrates Phase 1 + Phase 2.
 
@@ -585,76 +702,117 @@ class Dream:
             result.cursor_after = result.cursor_before
             return result
 
-        # Phase 2 — holds session lock during edits.
+        # Phase 2 — provider planning stays outside file locks; only
+        # filesystem mutation/cursor/receipt side effects are serialized.
         p2_start = time.monotonic()
         max_mtime = max(
             (p.stat().st_mtime for p in files),
             default=result.cursor_before,
         )
         artifact_id = self._artifact_id()
-        memory_backup_path = self._backup_memory_md(artifact_id)
-        candidate_backups = self._backup_candidates(files, artifact_id)
+        expected_identities = self._candidate_identities(files)
 
-        async def _phase2() -> _Phase2Outcome:
-            if result.dry_run:
-                return await self._phase2_apply_edits(analysis, dry_run=True)
-            return await self._phase2_apply_edits(analysis)
+        async def _phase2_apply_locked(edits: list[dict[str, Any]]) -> _Phase2Outcome:
+            nonlocal max_mtime
+            with _DreamFileLock(self._phase2_lock_path()):
+                stale_reason = self._stale_batch_reason(
+                    files,
+                    expected_identities,
+                    cursor_before=result.cursor_before,
+                )
+                if stale_reason is not None:
+                    result.phase2_status = "conflict"
+                    result.error = f"phase2_stale_batch: {stale_reason}"
+                    result.cursor_after = result.cursor_before
+                    result.memory_md_sha_after = (
+                        hashlib.sha256(self.memory_md.read_bytes()).hexdigest()
+                        if self.memory_md.exists()
+                        else None
+                    )
+                    outcome = _Phase2Outcome(tool_calls=1, changes=0)
+                    result.edit_receipt_path = self._write_edit_receipt(
+                        artifact_id=artifact_id,
+                        result=result,
+                        outcome=outcome,
+                        files=files,
+                        deleted_paths=[],
+                        memory_backup_path="",
+                        candidate_backups=[],
+                        max_candidate_mtime=result.cursor_before,
+                        error=result.error,
+                    )
+                    return outcome
 
-        outcome: _Phase2Outcome | None = None
-        deleted_paths: list[str] = []
-        try:
-            if self.session_lock is not None:
-                async with self.session_lock:
-                    outcome = await _phase2()
-            else:
-                outcome = await _phase2()
-            result.phase2_ms = int((time.monotonic() - p2_start) * 1000)
-            result.phase2_status = "ok"
-            result.phase2_tool_calls = outcome.tool_calls
-            cleanup_error: Exception | None = None
-            if result.dry_run:
-                result.files_processed = 0
-                result.cursor_after = result.cursor_before
-            else:
-                for p in files:
+                current_mtimes: list[float] = []
+                for path in files:
                     try:
-                        p.unlink()
-                        deleted_paths.append(self._workspace_relative(p))
-                        result.files_deleted += 1
-                    except FileNotFoundError:
+                        current_mtimes.append(path.stat().st_mtime)
+                    except OSError:
                         pass
+                max_mtime = max(current_mtimes, default=result.cursor_before)
+                memory_backup_path = self._backup_memory_md(artifact_id)
+                candidate_backups = self._backup_candidates(files, artifact_id)
+                outcome = await self._phase2_apply_edit_plan(edits, dry_run=result.dry_run)
+
+                deleted_paths: list[str] = []
+                cleanup_error: Exception | None = None
+                if result.dry_run:
+                    result.files_processed = 0
+                    result.cursor_after = result.cursor_before
+                else:
+                    for p in files:
+                        try:
+                            p.unlink()
+                            deleted_paths.append(self._workspace_relative(p))
+                            result.files_deleted += 1
+                        except FileNotFoundError:
+                            pass
+                        except Exception as exc:  # noqa: BLE001
+                            cleanup_error = cleanup_error or exc
+                            logger.warning(
+                                "dream.candidate_delete_failed",
+                                extra={"path": str(p), "error": str(exc)},
+                            )
+                    result.files_processed = len(files)
+                    try:
+                        self.cursor.save(max_mtime)
+                        result.cursor_after = max_mtime
                     except Exception as exc:  # noqa: BLE001
                         cleanup_error = cleanup_error or exc
-                        logger.warning(
-                            "dream.candidate_delete_failed",
-                            extra={"path": str(p), "error": str(exc)},
-                        )
-                result.files_processed = len(files)
-                try:
-                    self.cursor.save(max_mtime)
-                    result.cursor_after = max_mtime
-                except Exception as exc:  # noqa: BLE001
-                    cleanup_error = cleanup_error or exc
-                    result.cursor_after = result.cursor_before
-            result.memory_md_sha_after = (
-                hashlib.sha256(self.memory_md.read_bytes()).hexdigest()
-                if self.memory_md.exists()
-                else None
-            )
-            if cleanup_error is not None:
-                result.phase2_status = "error"
-                result.error = f"phase2_cleanup: {cleanup_error}"
-            result.edit_receipt_path = self._write_edit_receipt(
-                artifact_id=artifact_id,
-                result=result,
-                outcome=outcome,
-                files=files,
-                deleted_paths=deleted_paths,
-                memory_backup_path=memory_backup_path,
-                candidate_backups=candidate_backups,
-                max_candidate_mtime=max_mtime,
-                error=result.error,
-            )
+                        result.cursor_after = result.cursor_before
+                result.memory_md_sha_after = (
+                    hashlib.sha256(self.memory_md.read_bytes()).hexdigest()
+                    if self.memory_md.exists()
+                    else None
+                )
+                if cleanup_error is not None:
+                    result.phase2_status = "error"
+                    result.error = f"phase2_cleanup: {cleanup_error}"
+                result.edit_receipt_path = self._write_edit_receipt(
+                    artifact_id=artifact_id,
+                    result=result,
+                    outcome=outcome,
+                    files=files,
+                    deleted_paths=deleted_paths,
+                    memory_backup_path=memory_backup_path,
+                    candidate_backups=candidate_backups,
+                    max_candidate_mtime=max_mtime,
+                    error=result.error,
+                )
+                return outcome
+
+        outcome: _Phase2Outcome | None = None
+        try:
+            edits = await self._phase2_generate_edit_plan(analysis)
+            if self.session_lock is not None:
+                async with self.session_lock:
+                    outcome = await _phase2_apply_locked(edits)
+            else:
+                outcome = await _phase2_apply_locked(edits)
+            result.phase2_ms = int((time.monotonic() - p2_start) * 1000)
+            if result.phase2_status not in {"conflict", "error"}:
+                result.phase2_status = "ok"
+            result.phase2_tool_calls = outcome.tool_calls
         except Exception as exc:  # noqa: BLE001
             result.phase2_ms = int((time.monotonic() - p2_start) * 1000)
             result.phase2_status = "error"
@@ -679,9 +837,9 @@ class Dream:
                         result=result,
                         outcome=outcome,
                         files=files,
-                        deleted_paths=deleted_paths,
-                        memory_backup_path=memory_backup_path,
-                        candidate_backups=candidate_backups,
+                        deleted_paths=[],
+                        memory_backup_path="",
+                        candidate_backups=[],
                         max_candidate_mtime=max_mtime,
                         error=result.error,
                     )

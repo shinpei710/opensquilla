@@ -341,7 +341,9 @@ _BUILDERS = {
     "discord": _discord_spec,
     "feishu": _feishu_spec,
     "matrix": _matrix_spec,
-    "msteams": _msteams_spec,
+    # msteams is intentionally absent: the adapter is text-only and hidden
+    # from runtime catalog surfaces until first-class support lands. The
+    # _msteams_spec helper is retained for future restoration.
     "qq": _qq_spec,
     "slack": _slack_spec,
     "telegram": _telegram_spec,

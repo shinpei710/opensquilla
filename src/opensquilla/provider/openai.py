@@ -18,10 +18,17 @@ import httpx
 import structlog
 
 from opensquilla.env import trust_env as _trust_env
+from opensquilla.execution_status import compact_provider_status, derive_is_error
+from opensquilla.secrets import clean_header_secret
 
 from .minimax_compat import contains_minimax_protocol, parse_minimax_tool_calls
 from .openrouter_attribution import openrouter_app_headers
 from .protocol import ProviderConnectionConfig, ProviderMetadata
+from .request_proof import (
+    ProviderRequestBudgetExceeded,
+    prove_or_compact_provider_payload,
+    prove_provider_payload_from_env,
+)
 from .types import (
     ChatConfig,
     DoneEvent,
@@ -47,6 +54,25 @@ _PLAIN_JSON_TOOL_CALL_RE = re.compile(
 _PLAIN_JSON_TOOL_PREFIX_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_.:-]*)\s*(?=\{)",
 )
+
+_OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS = 4000
+
+
+def _openai_tool_result_content(block: Any) -> str:
+    content = block.content if isinstance(block.content, str) else json.dumps(block.content)
+    status = getattr(block, "execution_status", None)
+    if status is None or not derive_is_error(status):
+        return content
+    output = content
+    if len(output) > _OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS:
+        output = output[:_OPENAI_TOOL_STATUS_OUTPUT_MAX_CHARS]
+    return json.dumps(
+        {
+            "execution_status": compact_provider_status(status),
+            "output": output,
+        },
+        ensure_ascii=False,
+    )
 
 
 def _provider_display_name(provider_kind: str) -> str:
@@ -346,6 +372,12 @@ def _resolve_tool_call_index(
         return _coerce_int(tc["index"])
     if provider_kind != "gemini":
         raise KeyError("index")
+    tool_call_id = tc.get("id")
+    if isinstance(tool_call_id, str) and tool_call_id:
+        for idx, call in pending_calls.items():
+            if call.get("id") == tool_call_id:
+                return idx
+        return max(pending_calls.keys(), default=-1) + 1
     if len(pending_calls) == 1:
         return cast(int, next(iter(pending_calls)))
     return max(pending_calls.keys(), default=-1) + 1
@@ -562,11 +594,7 @@ def _build_openai_messages(
                 {
                     "role": "tool",
                     "tool_call_id": block.tool_use_id,
-                    "content": (
-                        block.content
-                        if isinstance(block.content, str)
-                        else json.dumps(block.content)
-                    ),
+                    "content": _openai_tool_result_content(block),
                 }
             )
 
@@ -626,7 +654,7 @@ class OpenAIProvider:
         provider_kind: str | None = None,
         provider_routing: Mapping[str, str] | None = None,
     ) -> None:
-        self._api_key = api_key
+        self._api_key = clean_header_secret(api_key, label="LLM API key")
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._proxy = _resolve_llm_proxy(proxy)
@@ -821,6 +849,35 @@ class OpenAIProvider:
             and _should_disable_openrouter_reasoning_by_default(self._model)
         ):
             payload["reasoning"] = {"enabled": False}
+
+        fallback_reason = (
+            "native_is_error_unavailable"
+            if any(message.get("role") == "tool" for message in openai_messages)
+            else None
+        )
+        try:
+            payload, _proof = prove_or_compact_provider_payload(
+                payload,
+                projection_adapter=self._provider_kind,
+                proof_budget=cfg.provider_request_max_chars,
+                status_projection_mode="content_envelope",
+                fallback_reason=fallback_reason,
+            )
+            if _proof is not None:
+                log.info("provider.request_proof", **_proof)
+            prove_provider_payload_from_env(
+                payload,
+                projection_adapter=self._provider_kind,
+                status_projection_mode="content_envelope",
+                fallback_reason=fallback_reason,
+            )
+        except ProviderRequestBudgetExceeded as exc:
+            log.warning("provider.request_budget_exhausted", **exc.proof)
+            yield ErrorEvent(
+                message=json.dumps(exc.proof, ensure_ascii=False, sort_keys=True),
+                code="provider_request_budget_exhausted",
+            )
+            return
 
         headers: dict[str, str] = {
             "Authorization": f"Bearer {self._api_key}",

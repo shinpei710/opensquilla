@@ -5,10 +5,14 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.engine.types import ToolCall
 from opensquilla.tools.builtin import filesystem as fs
+from opensquilla.tools.dispatch import build_tool_handler
+from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import CallerKind, ToolContext, ToolError, current_tool_context
 
 
@@ -90,6 +94,25 @@ async def test_workspace_strict_allows_inside_workspace(tmp_path: Path) -> None:
         assert "needle" in await fs.grep_search("needle", path=str(tmp_path))
 
 
+def test_resolve_path_rejects_foreign_posix_absolute_path_on_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(fs, "os", SimpleNamespace(name="nt"), raising=False)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with tool_context(workspace):
+        with pytest.raises(ToolError) as exc_info:
+            fs._resolve_path("/Users/a1/Desktop/report.pptx")
+
+    message = str(exc_info.value)
+    assert "foreign_host_path" in message
+    assert "/Users/a1/Desktop/report.pptx" in message
+    assert "workspace-relative" in message
+    assert "D:\\Users" not in message
+
+
 @pytest.mark.asyncio
 async def test_workspace_strict_blocks_outside_base_path(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
@@ -111,6 +134,35 @@ async def test_workspace_strict_blocks_outside_base_path(tmp_path: Path) -> None
         ):
             with pytest.raises(ToolError, match="outside active workspace"):
                 await call()
+
+
+@pytest.mark.asyncio
+async def test_workspace_strict_block_is_actionable_in_tool_failure_envelope(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    handler = build_tool_handler(get_default_registry())
+
+    with tool_context(workspace):
+        result = await handler(
+            ToolCall(
+                tool_use_id="tc-glob-outside",
+                tool_name="glob_search",
+                arguments={"pattern": "*.txt", "path": str(outside)},
+            )
+        )
+
+    envelope = json.loads(result.content)
+
+    assert result.is_error is True
+    assert envelope["status"] == "error"
+    assert envelope["tool"] == "glob_search"
+    assert "outside active workspace" in envelope["user_message"]
+    assert "internal error" not in envelope["user_message"]
+    assert envelope["retry_allowed"] is False
 
 
 @pytest.mark.asyncio

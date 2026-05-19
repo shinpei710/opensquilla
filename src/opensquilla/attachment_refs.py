@@ -54,7 +54,8 @@ def _media_disk_usage_bytes(media_root: Path) -> int:
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    tmp_path = Path(str(path) + f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{secrets.token_hex(4)}")
     try:
         with open(tmp_path, "wb") as f:
             f.write(data)

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-# fmt: off
-import json
 import os
 import threading
 import warnings
@@ -23,6 +21,10 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from opensquilla.gateway.config_migration import (
+    backup_and_write_migrated_config,
+    migrate_config_payload,
+)
 from opensquilla.paths import default_opensquilla_home
 from opensquilla.sandbox.config import SandboxSettings
 
@@ -135,6 +137,14 @@ class ToolsConfig(BaseModel):
         return validate_trusted_fake_ip_cidrs(values)
 
 
+class PermissionsConfig(BaseModel):
+    """Default owner permission posture for local/operator turns."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_mode: Literal["off", "on", "bypass", "full"] = "bypass"
+
+
 class TaskRuntimeConfig(BaseModel):
     """Server-side task-runtime queue settings."""
 
@@ -144,6 +154,61 @@ class TaskRuntimeConfig(BaseModel):
     # task_runtime._global_sem). Configured here so OPENSQUILLA_CHANNEL_INFLIGHT_CAP
     # has a stable env name regardless of channel adapter wiring.
     channel_inflight_cap: int = Field(default=8, ge=1)
+    # Hard ceiling on how long a single turn may hold the OUTER per-session
+    # lock before the dead-turn breaker fires. ``None`` keeps the historical
+    # behaviour (no breaker, jam tolerated).
+    turn_hard_deadline_s: float | None = Field(default=None, gt=0)
+    # Global default policy when ``max_pending_per_session`` is exceeded.
+    # ``reject_newest`` preserves legacy reject-on-overflow. ``drop_oldest``
+    # evicts the oldest QUEUED pending task on the session and accepts the
+    # new turn — useful for noisy realtime channels where the freshest
+    # message matters more than the queued backlog.
+    pending_overflow_policy: str = Field(default="reject_newest")
+    # Per-channel override map. Keys are channel ids (e.g. ``"feishu"``),
+    # values are policy strings.  Channels not listed fall back to
+    # ``pending_overflow_policy``. Empty dict by default — no channel is
+    # tuned independently.
+    pending_overflow_policy_per_channel: dict[str, str] = Field(default_factory=dict)
+    # Stream relay coalescing window. Consecutive text deltas inside a single
+    # window are concatenated into one chunk before being yielded to the
+    # channel adapter's ``send_streaming``. ``0`` (default) preserves the
+    # historical one-chunk-per-delta behaviour. Operators tune this for
+    # adapters that incur a per-call cost on ``send_streaming`` updates.
+    stream_relay_coalesce_ms: float = Field(default=0.0, ge=0)
+    # Hard cap on the size of a coalesced chunk. ``0`` (default) keeps the
+    # historical behaviour — used together with
+    # ``stream_relay_coalesce_ms`` to enable batching.
+    stream_relay_coalesce_chars: int = Field(default=0, ge=0)
+
+    @field_validator("pending_overflow_policy")
+    @classmethod
+    def _validate_overflow_policy(cls, value: str) -> str:
+        from opensquilla.gateway.task_runtime import PendingOverflowPolicy
+
+        try:
+            PendingOverflowPolicy(value)
+        except ValueError as exc:
+            valid = ", ".join(member.value for member in PendingOverflowPolicy)
+            raise ValueError(
+                f"pending_overflow_policy must be one of {{{valid}}}"
+            ) from exc
+        return value
+
+    @field_validator("pending_overflow_policy_per_channel")
+    @classmethod
+    def _validate_per_channel_policy(cls, value: dict[str, str]) -> dict[str, str]:
+        from opensquilla.gateway.task_runtime import PendingOverflowPolicy
+
+        valid = ", ".join(member.value for member in PendingOverflowPolicy)
+        for channel, policy in value.items():
+            try:
+                PendingOverflowPolicy(policy)
+            except ValueError as exc:
+                raise ValueError(
+                    f"pending_overflow_policy_per_channel[{channel!r}] "
+                    f"must be one of {{{valid}}}"
+                ) from exc
+        return value
 
 
 class LlmProviderConfig(BaseSettings):
@@ -185,52 +250,6 @@ class LlmProviderConfig(BaseSettings):
 # before either calls set()), which would emit duplicate warnings.
 _LEGACY_ENABLED_WARN_LOCK = threading.Lock()
 _LEGACY_ENABLED_WARNED = False
-
-# Deprecated memory.* field names (dotted notation as they appear in config.toml).
-# These were removed from the schema; old configs containing them must not cause
-# ValidationError — they are silently dropped and a single aggregated
-# DeprecationWarning is emitted per process.
-_DEPRECATED_MEMORY_FIELDS: frozenset[str] = frozenset(
-    {
-        "memory.profile",
-        "memory.cost.embedding_cache",
-        "memory.cost.rerank_cache",
-        "memory.cost.llm_judge_cache",
-        "memory.facts_enabled",
-        "memory.facts_top_k",
-        "memory.facts_max_chars",
-        "memory.multi_hop_enabled",
-        "memory.multi_hop_max_depth",
-        "memory.multi_hop_score_threshold",
-        "memory.recall_frequency",
-        "memory.recall_top_k_default",
-        "memory.semantic_chunking_enabled",
-        "memory.eviction_policy",
-        "memory.summary_model",
-        "memory.summary_max_tokens",
-    }
-)
-
-# Dedupe state for the aggregated legacy memory-field DeprecationWarning.
-_LEGACY_MEMORY_FIELDS_LOCK = threading.Lock()
-_LEGACY_MEMORY_FIELDS_WARNED: bool = False
-# Accumulates all deprecated field names seen this process (for log detail).
-_LEGACY_MEMORY_FIELDS_SEEN: set[str] = set()
-
-# Leaf-name views derived from ``_DEPRECATED_MEMORY_FIELDS`` so the dotted list
-# above is the single source of truth. Each pydantic ``before`` validator only
-# sees its own model's leaf keys, not the dotted form.
-_DEPRECATED_COST_LEAVES: frozenset[str] = frozenset(
-    k.removeprefix("memory.cost.")
-    for k in _DEPRECATED_MEMORY_FIELDS
-    if k.startswith("memory.cost.")
-)
-_DEPRECATED_MEMORY_LEAVES: frozenset[str] = frozenset(
-    k.removeprefix("memory.")
-    for k in _DEPRECATED_MEMORY_FIELDS
-    if k.startswith("memory.") and not k.startswith("memory.cost.")
-)
-
 
 # Pydantic-style truthy/falsy string sets (case-insensitive). Mirrors the
 # loose ``bool`` validator semantics so the migrated ``enabled`` key behaves
@@ -422,97 +441,12 @@ class MemoryEmbeddingConfig(BaseModel):
         return self.provider
 
 
-def _handle_deprecated_memory_fields(
-    found: dict[str, object],
-    source: str,
-) -> None:
-    """Pop deprecated fields, accumulate to the process set, emit one aggregated warning.
-
-    ``found`` maps leaf field name -> popped value (already removed from input dict).
-    ``source`` is ``"MemoryConfig"`` or ``"MemoryCostConfig"`` for log detail.
-    """
-    import datetime
-    import logging
-
-    global _LEGACY_MEMORY_FIELDS_WARNED
-
-    if not found:
-        return
-
-    # Snapshot the aggregate under the same lock as the one-shot warning so the
-    # warning count reflects the fields seen before the sentinel flips.
-    with _LEGACY_MEMORY_FIELDS_LOCK:
-        _LEGACY_MEMORY_FIELDS_SEEN.update(found.keys())
-        should_warn = not _LEGACY_MEMORY_FIELDS_WARNED
-        if should_warn:
-            _LEGACY_MEMORY_FIELDS_WARNED = True
-            warning_fields = sorted(_LEGACY_MEMORY_FIELDS_SEEN)
-        else:
-            warning_fields = []
-
-    # Write per-field detail to a timestamped log file.
-    try:
-        logs_dir = default_opensquilla_home() / "logs"
-        logs_dir.mkdir(parents=True, exist_ok=True)
-        iso_now = datetime.datetime.now(tz=datetime.UTC).strftime(
-            "%Y%m%dT%H%M%SZ"
-        )
-        log_path = logs_dir / f"legacy_config_{iso_now}.log"
-        with log_path.open("a", encoding="utf-8") as fh:
-            for leaf, value in found.items():
-                entry = {
-                    "timestamp": datetime.datetime.now(tz=datetime.UTC).isoformat(),
-                    "field": leaf,
-                    "source": source,
-                    "value_repr": str(value)[:200],
-                }
-                fh.write(json.dumps(entry) + "\n")
-    except OSError:
-        pass  # log write failure is non-fatal
-
-    if should_warn:
-        n = len(warning_fields)
-        first_three = ", ".join(warning_fields[:3])
-        try:
-            logs_dir = default_opensquilla_home() / "logs"
-            log_ref = str(logs_dir)
-        except Exception:
-            log_ref = "~/.opensquilla/logs"
-        warnings.warn(
-            f"OpenSquilla: {n} legacy memory.* config field(s) ignored "
-            f"(e.g. {first_three}); see {log_ref} for details. "
-            f"These fields will be removed in 0.2.0.",
-            DeprecationWarning,
-            stacklevel=6,
-        )
-        logging.getLogger(__name__).warning(
-            "OpenSquilla: %d legacy memory.* config field(s) ignored (e.g. %s); "
-            "see %s for details. These fields will be removed in 0.2.0.",
-            n,
-            first_three,
-            log_ref,
-        )
-
-
 class MemoryCostConfig(BaseModel):
     """Stable memory implementation cost knobs."""
 
     model_config = ConfigDict(extra="forbid")
 
     query_embedding_cache: Literal["off", "shadow", "on"] = "on"
-
-    @model_validator(mode="before")
-    @classmethod
-    def _drop_deprecated_cost_fields(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-        found = {
-            f"memory.cost.{k}": data.pop(k)
-            for k in list(data)
-            if k in _DEPRECATED_COST_LEAVES
-        }
-        _handle_deprecated_memory_fields(found, "MemoryCostConfig")
-        return data
 
 
 class MemoryConfig(BaseSettings):
@@ -521,28 +455,6 @@ class MemoryConfig(BaseSettings):
         env_nested_delimiter="__",
         extra="forbid",
     )
-
-    @model_validator(mode="before")
-    @classmethod
-    def _drop_deprecated_memory_fields(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-        found = {
-            f"memory.{k}": data.pop(k)
-            for k in list(data)
-            if k in _DEPRECATED_MEMORY_LEAVES
-        }
-        cost_data = data.get("cost")
-        if isinstance(cost_data, dict):
-            found.update(
-                {
-                    f"memory.cost.{k}": cost_data.pop(k)
-                    for k in list(cost_data)
-                    if k in _DEPRECATED_COST_LEAVES
-                }
-            )
-        _handle_deprecated_memory_fields(found, "MemoryConfig")
-        return data
 
     cost: MemoryCostConfig = Field(default_factory=MemoryCostConfig)
 
@@ -563,26 +475,25 @@ class MemoryConfig(BaseSettings):
 
     # TTL (0 = disabled, no auto-prune)
     entry_ttl_days: int = 0
-    # Background TTL sweep cadence (minutes). Default 60 covers archive
-    # files (memory/archive/**) that the in-line memory_save TTL never
-    # reaches. Set to 0 to opt out of background sweep while keeping
-    # in-line TTL on memory_save. No-op when
-    # entry_ttl_days = 0.
+    # Background TTL sweep cadence (minutes). Set to 0 to opt out of
+    # background sweep while keeping in-line TTL on memory_save. No-op
+    # when entry_ttl_days = 0.
     ttl_sweep_interval_minutes: float = Field(default=60.0, ge=0.0)
 
     # Flush (pre-compaction memory save)
     flush_enabled: bool = True
-    flush_timeout_seconds: float = 5.0
+    flush_timeout_seconds: float = 15.0
+    flush_background_timeout_seconds: float = 120.0
     flush_backoff_initial_seconds: float = 30.0
     flush_backoff_max_seconds: float = 300.0
     flush_archive_max_bytes: int = 800_000
+    flush_compaction_requires_safe_receipt: bool = False
 
     # Per-turn auto capture / recall
     auto_capture_enabled: bool = True
-    capture_mode: Literal["archive_turn_pair", "off"] = "archive_turn_pair"
+    capture_mode: Literal["turn_pair", "off"] = "turn_pair"
     capture_user: bool = True
     capture_assistant: bool = False
-    index_captured_turns: bool = False
     capture_excluded_run_kinds: list[str] = Field(
         default_factory=lambda: ["recall", "session_recall"]
     )
@@ -591,13 +502,6 @@ class MemoryConfig(BaseSettings):
     )
     capture_max_chars: int = 2000
     capture_roll_max_chars: int = Field(default=50_000, ge=0)
-    auto_recall_enabled: bool | None = None
-
-    # Per-turn auto prefetch (legacy field kept for compatibility)
-    prefetch_enabled: bool = False  # disabled by default for safe rollout
-    prefetch_max_results: int = 3
-    prefetch_min_score: float = 0.3
-    prefetch_total_max_chars: int = Field(default=1500, ge=0)
     daily_note_max_chars: int = Field(default=4000, ge=0)
     daily_notes_total_max_chars: int = Field(default=8000, ge=0)
 
@@ -609,7 +513,7 @@ class MemoryConfig(BaseSettings):
     vector_weight: float = 0.7
     text_weight: float = 0.3
 
-    # Dream consolidation (PR4)
+    # Dream consolidation
     dream: DreamConfig = Field(default_factory=DreamConfig)
 
 
@@ -990,6 +894,7 @@ class SquillaRouterConfig(BaseSettings):
     confidence_threshold: float = 0.5
     v4_bundle_dir: str | None = None  # V4 Phase 3 bundle root; defaults to bundled assets
     v4_use_aux_head: bool | None = True  # override router.runtime.yaml aux head when set
+    routing_timeout_seconds: float = Field(default=5.0, gt=0.0)
     kv_cache_anti_downgrade_enabled: bool = True
     kv_cache_anti_downgrade_window_seconds: int = 600
     complaint_upgrade_enabled: bool = True
@@ -1036,6 +941,9 @@ class AgentTokenSavingConfig(BaseSettings):
     tool_result_compression_summary_max_tokens: int = Field(default=1024, ge=64)
     tool_result_compression_summary_timeout_seconds: float = Field(default=20.0, gt=0.0)
     tool_result_compression_summary_input_max_chars: int = Field(default=60_000, ge=1000)
+    tool_result_store_max_bytes: int = Field(default=8 * 1024 * 1024, ge=0)
+    tool_result_store_disk_budget_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
+    tool_result_store_retention_seconds: int = Field(default=7 * 24 * 60 * 60, ge=0)
 
     @property
     def effective_tool_result_compression_mode(self) -> Literal["off", "truncate", "summarize"]:
@@ -1048,7 +956,7 @@ class CompactionLlmConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_COMPACTION_")
 
     model: str | None = None  # None = use session model
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = 90.0
     enabled: bool = True
 
 
@@ -1404,7 +1312,7 @@ class GatewayConfig(BaseSettings):
     # precedence order (explicit kwarg/flag > OPENSQUILLA_LISTEN > OPENSQUILLA_GATEWAY_HOST
     # > default) is testable without the pydantic-settings env cache.
     host: str = "127.0.0.1"
-    port: int = 18790
+    port: int = 18791
     version: str = "0.1.0"
     debug: bool = False
     log_file_enabled: bool = True
@@ -1423,6 +1331,7 @@ class GatewayConfig(BaseSettings):
     attachments: AttachmentsConfig = Field(default_factory=AttachmentsConfig)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    permissions: PermissionsConfig = Field(default_factory=PermissionsConfig)
     task_runtime: TaskRuntimeConfig = Field(default_factory=TaskRuntimeConfig)
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     llm: LlmProviderConfig = Field(default_factory=LlmProviderConfig)
@@ -1494,6 +1403,18 @@ class GatewayConfig(BaseSettings):
     # Agent runtime timeout (whole turn lifecycle). ``None`` means use the
     # long built-in runtime default; ``0`` disables the runtime budget.
     agent_runtime_timeout_seconds: float | None = None
+    # Per-iteration timeout: one LLM call + its tool executions. ``None``
+    # means use the AgentConfig default.
+    agent_iteration_timeout_seconds: float | None = None
+    # Per-tool execution timeout. ``None`` means use the AgentConfig default.
+    agent_tool_timeout_seconds: float | None = None
+    # Per-turn override for the single LLM HTTP/streaming request timeout.
+    # ``None`` defers to ``llm_request_timeout_seconds`` so existing
+    # deployments keep their tuned value.
+    agent_request_timeout_seconds: float | None = None
+    # Maximum provider-level retries for transient errors. ``None`` means
+    # use the AgentConfig default.
+    agent_max_provider_retries: int | None = None
     # Agent model/tool loop budget for a single turn.
     agent_max_iterations: int = Field(default=100, ge=1)
     # Provider request timeout (single LLM HTTP/streaming request).
@@ -1502,18 +1423,17 @@ class GatewayConfig(BaseSettings):
     # non-persistent UI/CLI feedback while a turn is still active; the idle
     # timeout remains the real upstream stall detector.
     agent_stream_heartbeat_interval_seconds: float = 15.0
-    agent_stream_idle_timeout_seconds: float = 180.0
+    agent_stream_idle_timeout_seconds: float = 600.0
     # Browser-side fallback grace. Keep this above the gateway stream idle
     # timeout so server terminal errors arrive before the WebUI local fallback.
-    webui_stream_idle_grace_seconds: float = 210.0
+    webui_stream_idle_grace_seconds: float = 630.0
     # Maximum time the WebUI WebSocket may sit silent before the gateway
     # closes it with code 1011 and emits ``gateway.client_ws_keepalive_timeout``.
     # ``0`` disables the keepalive deadline entirely (legacy behaviour).
     # Sleeping browsers commonly stop sending pings; without this knob the
     # server retains half-open connections after suspend.
     client_ws_keepalive_timeout_s: float = 120.0
-    # WebSocket per-connection outbound writer queue (Principle 2 in
-    # docs/plans/ws-writer-queue.md). When enabled, every connection gets a
+    # WebSocket per-connection outbound writer queue. When enabled, every connection gets a
     # bounded asyncio.Queue + dedicated writer task; producers enqueue and
     # return immediately. Slow clients trigger a fast 1011 close instead of
     # back-pressuring the turn pipeline. Kill switch is read at connection
@@ -1649,7 +1569,6 @@ class GatewayConfig(BaseSettings):
             "dream_input_slimming": self.memory.dream.input_slimming,
             "dream_preview_mode": str(self.memory.dream.preview_mode).lower(),
             "dream_auto_schedule": str(self.memory.dream.auto_schedule).lower(),
-            "prefetch_total_max_chars": str(self.memory.prefetch_total_max_chars),
             "daily_note_max_chars": str(self.memory.daily_note_max_chars),
             "daily_notes_total_max_chars": str(self.memory.daily_notes_total_max_chars),
             "auto_capture_enabled": str(self.memory.auto_capture_enabled).lower(),
@@ -1657,7 +1576,6 @@ class GatewayConfig(BaseSettings):
             "capture_mode": self.memory.capture_mode,
             "capture_user": str(self.memory.capture_user).lower(),
             "capture_assistant": str(self.memory.capture_assistant).lower(),
-            "index_captured_turns": str(self.memory.index_captured_turns).lower(),
             "capture_excluded_run_kinds": ",".join(self.memory.capture_excluded_run_kinds),
             "capture_excluded_provenance_kinds": ",".join(
                 self.memory.capture_excluded_provenance_kinds
@@ -1712,15 +1630,20 @@ class GatewayConfig(BaseSettings):
         """Load config from a TOML file."""
         import tomllib
 
-        with open(Path(path), "rb") as f:
+        target = Path(path)
+        with open(target, "rb") as f:
             data = tomllib.load(f)
-        return cls(**data)
+        migration = migrate_config_payload(data)
+        cfg = cls(**migration.payload)
+        if migration.changed:
+            backup_and_write_migrated_config(target, migration.payload, migration)
+        return cfg
 
     @classmethod
     def load(cls, config_path: str | Path | None = None) -> GatewayConfig:
         """Auto-discover and load config.
 
-        Precedence: explicit path > cwd/opensquilla.toml > ~/.opensquilla/config.toml > defaults.
+        Precedence: explicit path > current-directory config > user config > defaults.
         Environment variables always override TOML values (Pydantic Settings behavior).
         """
         import tomllib
@@ -1736,7 +1659,10 @@ class GatewayConfig(BaseSettings):
             if path.is_file():
                 with open(path, "rb") as f:
                     data = tomllib.load(f)
-                cfg = cls(**data)
+                migration = migrate_config_payload(data)
+                cfg = cls(**migration.payload)
+                if migration.changed:
+                    backup_and_write_migrated_config(path, migration.payload, migration)
                 cfg.config_path = str(path)
                 return cfg
 

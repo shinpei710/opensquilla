@@ -12,6 +12,7 @@ import structlog
 
 from opensquilla.channels.types import OutgoingMessage
 from opensquilla.session.models import AgentTaskStatus
+from opensquilla.session.terminal_reply import sanitize_agent_error
 
 log = structlog.get_logger(__name__)
 
@@ -256,12 +257,22 @@ class BackgroundCompletionManager:
                 stream_event_sink=stream_collector,
             )
         except Exception as exc:  # noqa: BLE001 - failure becomes a group event.
+            error_class, error_message = sanitize_agent_error(
+                {
+                    "status": "failed",
+                    "terminal_reason": "error",
+                    "error_class": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+                fallback_error_class=type(exc).__name__,
+                fallback_error_message=str(exc) or "Agent error",
+            )
             await self._emit_terminal_failure(
                 parent_session_key=parent_session_key,
                 parent_task_id=parent_task_id,
                 synthesis_task_id=None,
-                error_class=type(exc).__name__,
-                error_message=str(exc),
+                error_class=error_class,
+                error_message=error_message,
             )
             async with self._state_lock:
                 self._wake_groups.discard(group_id)
@@ -328,12 +339,22 @@ class BackgroundCompletionManager:
         try:
             record = await task_runtime.wait(synthesis_task_id)
         except Exception as exc:  # noqa: BLE001 - failure becomes a group event.
+            error_class, error_message = sanitize_agent_error(
+                {
+                    "status": "failed",
+                    "terminal_reason": "error",
+                    "error_class": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+                fallback_error_class=type(exc).__name__,
+                fallback_error_message=str(exc) or "Agent error",
+            )
             await self._emit_terminal_failure(
                 parent_session_key=parent_session_key,
                 parent_task_id=parent_task_id,
                 synthesis_task_id=synthesis_task_id,
-                error_class=type(exc).__name__,
-                error_message=str(exc),
+                error_class=error_class,
+                error_message=error_message,
             )
             return
 

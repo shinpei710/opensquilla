@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -218,6 +219,23 @@ class CacheBreakMonitor:
 
 default_cache_break_monitor = CacheBreakMonitor()
 
+_CompactionListener = Callable[[str, dict[str, Any]], None]
+_compaction_listeners: list[_CompactionListener] = []
+
+
+def add_compaction_listener(listener: _CompactionListener) -> Callable[[], None]:
+    """Register a best-effort listener for successful compaction events."""
+
+    _compaction_listeners.append(listener)
+
+    def remove() -> None:
+        try:
+            _compaction_listeners.remove(listener)
+        except ValueError:
+            pass
+
+    return remove
+
 
 def record_prompt_state(
     *,
@@ -246,5 +264,16 @@ def check_response_for_cache_break(
     )
 
 
-def notify_compaction(session_key: str) -> None:
-    default_cache_break_monitor.notify_compaction(session_key)
+def notify_compaction(session_key: str, **payload: Any) -> None:
+    event_payload = {
+        "status": str(payload.pop("status", "completed") or "completed"),
+        "source": str(payload.pop("source", "automatic") or "automatic"),
+        **payload,
+    }
+    if event_payload["status"].lower() == "completed":
+        default_cache_break_monitor.notify_compaction(session_key)
+    for listener in tuple(_compaction_listeners):
+        try:
+            listener(session_key, dict(event_payload))
+        except Exception:
+            pass
