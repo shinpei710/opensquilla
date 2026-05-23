@@ -2575,18 +2575,22 @@ class Agent:
                         continue
 
                     if provider_error is not None:
+                        provider_error_status_code = (
+                            int(provider_error.code)
+                            if str(provider_error.code).isdigit()
+                            else None
+                        )
                         failure_kind = classify_provider_error(
                             provider_name=getattr(self.provider, "provider_name", ""),
-                            status_code=(
-                                int(provider_error.code)
-                                if str(provider_error.code).isdigit()
-                                else None
-                            ),
+                            status_code=provider_error_status_code,
                             raw_code=provider_error.code,
                             message=provider_error.message,
                         )
                         kind = _fallback.classify_error(
                             provider_error.message,
+                            provider_name=getattr(self.provider, "provider_name", ""),
+                            status_code=provider_error_status_code,
+                            raw_code=provider_error.code,
                         )
                         if artifact_delivery_final_response_pending:
                             yield _finish_artifact_delivery_degraded(
