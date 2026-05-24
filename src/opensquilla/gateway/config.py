@@ -127,6 +127,7 @@ class ToolsConfig(BaseModel):
     allow: list[str] = Field(default_factory=list)
     deny: list[str] = Field(default_factory=list)
     also_allow: list[str] = Field(default_factory=list)
+    workspace_write_deny_globs: list[str] = Field(default_factory=list)
     trusted_fake_ip_cidrs: list[str] = Field(default_factory=list)
 
     @field_validator("trusted_fake_ip_cidrs")

@@ -4,6 +4,7 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 
+from opensquilla.gateway.config import GatewayConfig
 from opensquilla.tools import policy_helpers
 from opensquilla.tools.policy import apply_tool_policy_from_config
 from opensquilla.tools.policy_config import (
@@ -170,6 +171,22 @@ def test_policy_helpers_apply_workspace_write_deny_globs_from_config() -> None:
     )
 
     assert set(ctx.workspace_write_deny_globs) == {"generated/**", "*.secret"}
+
+
+def test_gateway_tools_config_preserves_workspace_write_deny_globs() -> None:
+    cfg = GatewayConfig(
+        tools={
+            "workspace_write_deny_globs": ["tests/**", "*.spec.*"],
+        }
+    )
+
+    ctx = apply_tool_policy_from_config(
+        ToolContext(),
+        available_tools=["write_file", "exec_command"],
+        config=cfg,
+    )
+
+    assert set(ctx.workspace_write_deny_globs) == {"tests/**", "*.spec.*"}
 
 
 def test_policy_helpers_apply_runtime_policy_through_config_boundary() -> None:
