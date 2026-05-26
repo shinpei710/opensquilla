@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json as _json
+import shlex
 import tomllib
 
 from typer.testing import CliRunner
@@ -10,6 +11,10 @@ from typer.testing import CliRunner
 from opensquilla.cli.main import app
 
 runner = CliRunner()
+
+
+def _config_arg(path) -> str:
+    return shlex.quote(str(path))
 
 
 def test_onboard_noninteractive_provider(tmp_path, monkeypatch):
@@ -361,8 +366,8 @@ def test_onboard_status_table_keeps_explicit_config_path_in_next_step(
 
     assert result.exit_code == 0, result.stdout
     assert (
-        f"opensquilla onboard --if-needed --config {target}"
-        in " ".join(result.stdout.split())
+        f"opensquillaonboard--if-needed--config{_config_arg(target)}"
+        in "".join(result.stdout.split())
     )
     assert not default_target.exists()
 
@@ -378,7 +383,7 @@ def test_onboard_if_needed_non_tty_hint_keeps_explicit_config_path(
     result = runner.invoke(app, ["onboard", "--if-needed", "--config", str(target)])
 
     assert result.exit_code == 2
-    assert f"--config {target}" in result.stdout
+    assert f"--config {_config_arg(target)}" in result.stdout
     assert not default_target.exists()
 
 

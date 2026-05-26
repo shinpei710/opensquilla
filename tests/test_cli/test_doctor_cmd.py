@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from typing import Any
 
 from typer.testing import CliRunner
@@ -8,6 +9,10 @@ from typer.testing import CliRunner
 from opensquilla.cli.main import app
 
 runner = CliRunner()
+
+
+def _config_arg(path: Any) -> str:
+    return shlex.quote(str(path))
 
 
 class _FakeGatewayClient:
@@ -144,8 +149,8 @@ def test_doctor_config_derived_gateway_recovery_preserves_config_target(
     )
     commands = [step["command"] for step in finding["fixSteps"] if "command" in step]
     assert commands[:2] == [
-        f"opensquilla gateway start --config {target}",
-        f"opensquilla gateway status --json --config {target}",
+        f"opensquilla gateway start --config {_config_arg(target)}",
+        f"opensquilla gateway status --json --config {_config_arg(target)}",
     ]
     assert all("--bind 127.0.0.1" not in command for command in commands)
     assert all("--port 20002" not in command for command in commands[:2])
@@ -177,7 +182,8 @@ def test_doctor_targets_existing_cwd_config_without_explicit_config(
     )
     commands = [step["command"] for step in provider_finding["fixSteps"] if "command" in step]
     assert commands == [
-        f"opensquilla providers configure openrouter --api-key YOUR_API_KEY --config {target}"
+        "opensquilla providers configure openrouter --api-key YOUR_API_KEY "
+        f"--config {_config_arg(target)}"
     ]
 
 
@@ -205,7 +211,8 @@ def test_doctor_targets_env_config_without_explicit_config(
     )
     commands = [step["command"] for step in provider_finding["fixSteps"] if "command" in step]
     assert commands == [
-        f"opensquilla providers configure openrouter --api-key YOUR_API_KEY --config {target}"
+        "opensquilla providers configure openrouter --api-key YOUR_API_KEY "
+        f"--config {_config_arg(target)}"
     ]
 
 
@@ -226,7 +233,8 @@ def test_doctor_config_scopes_gateway_recovery_commands(tmp_path, monkeypatch) -
     )
     commands = [step["command"] for step in finding["fixSteps"] if "command" in step]
     assert commands == [
-        f"opensquilla providers configure openrouter --api-key YOUR_API_KEY --config {target}"
+        "opensquilla providers configure openrouter --api-key YOUR_API_KEY "
+        f"--config {_config_arg(target)}"
     ]
 
 
@@ -280,8 +288,8 @@ def test_doctor_config_scopes_config_set_recovery_commands(tmp_path, monkeypatch
     )
     commands = [step["command"] for step in finding["fixSteps"] if "command" in step]
     assert commands == [
-        f"opensquilla config set log_file_enabled true --config {target}",
-        f"opensquilla gateway restart --config {target}",
+        f"opensquilla config set log_file_enabled true --config {_config_arg(target)}",
+        f"opensquilla gateway restart --config {_config_arg(target)}",
     ]
 
 
@@ -452,8 +460,11 @@ def test_doctor_config_reports_running_gateway_config_mismatch(
     assert finding["evidence"]["requestedConfigPath"] == str(requested)
     assert finding["evidence"]["runningConfigPath"] == str(running)
     commands = [step["command"] for step in finding["fixSteps"] if "command" in step]
-    assert f"opensquilla gateway restart --config {requested}" in commands
-    assert f"opensquilla gateway status --json --config {requested}" in commands
+    assert f"opensquilla gateway restart --config {_config_arg(requested)}" in commands
+    assert (
+        f"opensquilla gateway status --json --config {_config_arg(requested)}"
+        in commands
+    )
 
 
 def test_doctor_config_mismatch_prioritizes_requested_gateway_recovery(
@@ -517,7 +528,8 @@ def test_doctor_config_mismatch_keeps_running_findings_scoped_to_running_config(
         step["command"] for step in provider_finding["fixSteps"] if "command" in step
     ]
     assert provider_commands == [
-        f"opensquilla providers configure openrouter --api-key YOUR_API_KEY --config {running}"
+        "opensquilla providers configure openrouter --api-key YOUR_API_KEY "
+        f"--config {_config_arg(running)}"
     ]
     mismatch_finding = next(
         finding
@@ -527,7 +539,7 @@ def test_doctor_config_mismatch_keeps_running_findings_scoped_to_running_config(
     mismatch_commands = [
         step["command"] for step in mismatch_finding["fixSteps"] if "command" in step
     ]
-    assert f"opensquilla gateway restart --config {requested}" in mismatch_commands
+    assert f"opensquilla gateway restart --config {_config_arg(requested)}" in mismatch_commands
 
 
 def test_doctor_table_prints_fix_steps(monkeypatch) -> None:
@@ -914,13 +926,14 @@ def test_doctor_gateway_unavailable_uses_requested_config_path(
         step["command"] for step in gateway_finding["fixSteps"] if "command" in step
     ]
     assert gateway_commands[:2] == [
-        f"opensquilla gateway start --bind 127.0.0.1 --port 19999 --config {target}",
+        "opensquilla gateway start --bind 127.0.0.1 --port 19999 "
+        f"--config {_config_arg(target)}",
         (
             "opensquilla gateway status --bind 127.0.0.1 --port 19999 "
-            f"--json --config {target}"
+            f"--json --config {_config_arg(target)}"
         ),
     ]
-    assert f"opensquilla diagnostics status --config {target}" in gateway_commands
+    assert f"opensquilla diagnostics status --config {_config_arg(target)}" in gateway_commands
     finding = next(
         finding
         for finding in payload["findings"]
@@ -930,8 +943,8 @@ def test_doctor_gateway_unavailable_uses_requested_config_path(
     assert "CUSTOM_LLM_KEY" in finding["detail"]
     commands = [step["command"] for step in finding["fixSteps"] if "command" in step]
     assert commands[-2:] == [
-        f"opensquilla onboard status --json --config {target}",
-        f"opensquilla onboard --if-needed --config {target}",
+        f"opensquilla onboard status --json --config {_config_arg(target)}",
+        f"opensquilla onboard --if-needed --config {_config_arg(target)}",
     ]
 
 
@@ -963,8 +976,8 @@ def test_doctor_gateway_unavailable_prioritizes_unreadable_config(
         step["command"] for step in payload["findings"][0]["fixSteps"] if "command" in step
     ]
     assert first_commands == [
-        f"opensquilla onboard status --json --config {target}",
-        f"opensquilla onboard --if-needed --config {target}",
+        f"opensquilla onboard status --json --config {_config_arg(target)}",
+        f"opensquilla onboard --if-needed --config {_config_arg(target)}",
     ]
 
 
