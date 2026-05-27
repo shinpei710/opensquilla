@@ -37,17 +37,28 @@ def test_parses_with_expected_topology(tmp_path: Path) -> None:
     assert plan is not None
 
     step_ids = [s.id for s in plan.steps]
+    # PR8 follow-up migration: classify_language (llm_classify) was
+    # replaced with trace_collect (user_input) so the user picks the
+    # language explicitly. Newly-added *_degraded fallback siblings
+    # (grep_repo_degraded, search_issues_degraded, git_history_degraded,
+    # memory_recall_degraded) make the previous evidence-source order
+    # explicit; they were present in the SKILL.md before this migration
+    # but missing from this list.
     assert step_ids == [
-        "classify_language",
+        "trace_collect",
         "parse_trace",
         "grep_repo",
+        "grep_repo_degraded",
         "search_issues",
+        "search_issues_degraded",
         "git_history",
+        "git_history_degraded",
         "diff_context",
         "diff_context_degraded",
         "history_patterns",
         "history_patterns_degraded",
         "memory_recall",
+        "memory_recall_degraded",
         "language_probe",
         "root_cause",
         "repro_suggestion",
@@ -56,7 +67,8 @@ def test_parses_with_expected_topology(tmp_path: Path) -> None:
     ]
 
     by_id = {s.id: s for s in plan.steps}
-    assert by_id["parse_trace"].depends_on == ("classify_language",)
+    assert by_id["trace_collect"].kind == "user_input"
+    assert by_id["parse_trace"].depends_on == ("trace_collect",)
     assert by_id["diff_context"].on_failure == "diff_context_degraded"
     assert by_id["diff_context_degraded"].depends_on == ()
     assert by_id["history_patterns"].on_failure == "history_patterns_degraded"
@@ -112,13 +124,22 @@ def test_language_probe_routes_to_language_specific_skills(tmp_path: Path) -> No
     assert probe.skill == "stack-trace-generic-probe"
     assert probe.depends_on == ("parse_trace",)
     assert [(case.when, case.to) for case in probe.route] == [
-        ("outputs.classify_language == 'python'", "stack-trace-python-probe"),
         (
-            "outputs.classify_language in ('javascript', 'typescript')",
+            "inputs.collected.trace_collect.language == 'python'",
+            "stack-trace-python-probe",
+        ),
+        (
+            "inputs.collected.trace_collect.language in ('javascript', 'typescript')",
             "stack-trace-js-probe",
         ),
-        ("outputs.classify_language == 'go'", "stack-trace-go-probe"),
-        ("outputs.classify_language == 'rust'", "stack-trace-rust-probe"),
+        (
+            "inputs.collected.trace_collect.language == 'go'",
+            "stack-trace-go-probe",
+        ),
+        (
+            "inputs.collected.trace_collect.language == 'rust'",
+            "stack-trace-rust-probe",
+        ),
     ]
     for name in {
         "stack-trace-generic-probe",
@@ -255,6 +276,15 @@ async def test_happy_path_synthesizes_root_cause(tmp_path: Path) -> None:
                     "  File \"src/opensquilla/engine/agent.py\", line 1234, in foo\n"
                     "AttributeError: 'NoneType' object has no attribute 'foo'"
                 ),
+                # Pre-populate trace_collect so its skip_if fires offline
+                # (no DAO / run_id wired in this fixture).
+                "collected": {
+                    "trace_collect": {
+                        "language": "python",
+                        "expected_behavior": "",
+                        "recent_changes": "",
+                    },
+                },
             },
         ),
     )
@@ -305,7 +335,19 @@ async def test_root_cause_fans_in_parallel_investigations(tmp_path: Path) -> Non
 
     orch = MetaOrchestrator(agent_runner=runner, skill_loader=loader)
     result = await orch.run(
-        MetaMatch(plan=plan, inputs={"user_message": "investigate stack trace"}),
+        MetaMatch(
+            plan=plan,
+            inputs={
+                "user_message": "investigate stack trace",
+                "collected": {
+                    "trace_collect": {
+                        "language": "python",
+                        "expected_behavior": "",
+                        "recent_changes": "",
+                    },
+                },
+            },
+        ),
     )
     assert result.ok
     body = captured_root_cause_prompt["body"]

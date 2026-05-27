@@ -4719,6 +4719,37 @@ class Agent:
                 )
                 return
 
+            # Spec §10: "New meta_invoke while awaiting | Reject the new
+            # invocation". Without this guard the new run hits the
+            # partial unique index on (session_key) WHERE
+            # status='awaiting_user' deep inside try_claim_awaiting and
+            # the user sees an opaque "awaiting claim rejected" error
+            # instead of a clear "please finish or cancel the previous
+            # form" hint.
+            if (
+                self._meta_run_writer is not None
+                and self._session_key
+            ):
+                try:
+                    existing_awaiting = self._meta_run_writer.peek_awaiting(
+                        session_id=self._session_key,
+                    )
+                except Exception:  # noqa: BLE001 — fail-open
+                    existing_awaiting = None
+                if existing_awaiting is not None:
+                    yield ToolResult(
+                        tool_use_id=tc.tool_use_id,
+                        tool_name="meta_invoke",
+                        content=(
+                            f"上一个 meta-skill ({existing_awaiting.step_id!r} "
+                            f"in run {existing_awaiting.run_id}) 还在等你回答，"
+                            "请先回答表单或回 '取消' 终止后再发起新的 meta-skill。"
+                        ),
+                        is_error=True,
+                        terminates_turn=True,
+                    )
+                    return
+
             skill_spec = skill_loader.get_by_name(name)
             if skill_spec is None or getattr(skill_spec, "kind", "skill") != "meta":
                 yield ToolResult(

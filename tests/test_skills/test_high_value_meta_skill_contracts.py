@@ -289,7 +289,10 @@ def test_stack_trace_investigator_supports_language_routing_and_degraded_output(
     assert spec is not None
     raw = str(spec.composition_raw)
 
-    assert {"classify_language", "repro_suggestion", "degraded_summary"} <= ids
+    # PR8 follow-up migration: classify_language (llm_classify) was
+    # replaced with trace_collect (user_input) so the user picks the
+    # language explicitly.
+    assert {"trace_collect", "repro_suggestion", "degraded_summary"} <= ids
     assert "javascript" in raw
     assert "typescript" in raw
     assert "go" in raw
