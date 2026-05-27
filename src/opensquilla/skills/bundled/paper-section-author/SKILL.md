@@ -85,7 +85,8 @@ thesis. Do not add side topics merely to increase length.
   not work, state limitations, threats to validity, deployment implications,
   and future directions. End with a one-sentence takeaway tied to the thesis.
 - **Conclusion**: close the loop with the abstract. Restate the thesis,
-  headline result, and main implication in 2-3 concise paragraphs. Add no new
+  headline result, main implication, scope, and future work in as many concise
+  paragraphs as the writing plan's target length requires. Add no new
   citations, figures, tables, or claims.
 
 ### Writing quality bar
@@ -111,9 +112,20 @@ thesis. Do not add side topics merely to increase length.
 - Write only the assigned section. Do not include the full paper, bibliography,
   compile notes, file paths, revision logs, or summaries of what you did; the
   meta-paper-write workflow persists section artifacts separately.
-- Stay within the assigned `target_words` budget when it is present. A short,
-  complete, well-cited section is better than overproducing text that forces
-  repeated context compaction downstream.
+- Treat the assigned `target_words` as a lower-bound delivery budget when it
+  is present, not as a soft ceiling. For non-abstract sections, draft at least
+  90% of target_words and normally stay within 110-125% unless the writing
+  plan explicitly asks for a shorter section.
+- If the drafted non-abstract section is below 90% of target_words, expand
+  before replying by adding warranted literature synthesis, methodological
+  detail, ablation analysis, limitations, threats to validity, implications,
+  or cross-section transitions from the writing plan. Do not return an
+  undersized section just because it is coherent.
+- Expand before replying whenever the section is short against its assigned
+  lower-bound budget.
+- Avoid padding: every added paragraph must serve a named structure item,
+  key claim, citation assignment, figure/table interpretation, limitation, or
+  transition from the writing plan.
 - Match `paper_preferences` for depth, audience, language, emphasis, and
   avoid-list constraints while preserving the fixed section contract.
 - Use `\cite{refN}` whenever you make an external factual, historical, or
@@ -133,6 +145,6 @@ thesis. Do not add side topics merely to increase length.
 - Prefer concrete sentences over hedged generalities. Avoid filler like
   "It is important to note that...".
 - Before replying, silently verify: correct section opener, target_words
-  respected, cite keys all appear in `cite_keys_hint`, no invented results,
-  no Markdown fence, no commentary, no path/log text.
+  respected as a lower-bound budget, cite keys all appear in `cite_keys_hint`,
+  no invented results, no Markdown fence, no commentary, no path/log text.
 - Reply with the LaTeX fragment only. No commentary, no Markdown, no code fences.

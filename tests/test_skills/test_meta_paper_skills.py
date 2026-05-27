@@ -73,7 +73,7 @@ def test_meta_paper_write_declares_long_paper_generation_contract() -> None:
     assert "writing-plan-derived" in section
     assert "Do not impose a fixed page count" in section
     assert "Write only the assigned section" in section
-    assert "repeated context compaction" in section
+    assert "lower-bound delivery budget" in section
     assert "related_work" in section
     assert "conclusion" in section
     assert "Do not call tools" in section
@@ -133,6 +133,22 @@ def test_meta_paper_write_plans_user_requested_page_target_up_front() -> None:
     assert "target_words from writing_plan" in meta
     assert "PDF_PAGE_TARGET_NOT_MET" not in meta
     assert "LENGTH_GATE: fail" not in meta
+
+
+def test_meta_paper_write_pushes_length_into_plan_and_section_prompts() -> None:
+    meta = (BUNDLED / "meta-paper-write" / "SKILL.md").read_text(encoding="utf-8")
+    section = (BUNDLED / "paper-section-author" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "TARGET_PAGES × 820" in meta
+    assert "TARGET_PAGES × 760" in meta
+    assert "target_words is a lower-bound writing budget" in meta
+    assert "at least 90% of target_words" in meta
+    assert "Do not return an undersized section" in meta
+    assert "lower-bound delivery budget" in section
+    assert "below 90% of target_words" in section
+    assert "Expand before replying" in section
+    assert "short, complete, well-cited section" not in section
+    assert "repeated context compaction" not in section
 
 
 def test_paper_preference_planner_declares_two_generation_modes() -> None:

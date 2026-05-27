@@ -575,9 +575,9 @@ composition:
           - Convert the requested compiled-page target into an approximate
             total word budget using the paper language, figure/table count,
             and venue style. For normal academic article formatting, set the
-            minimum total target_words to at least TARGET_PAGES × 650 English
+            minimum total target_words to at least TARGET_PAGES × 820 English
             words (or the equivalent dense prose units for non-English text).
-            Do not reduce below TARGET_PAGES × 580 for figures/tables; instead
+            Do not reduce below TARGET_PAGES × 760 for figures/tables; instead
             add analysis, limitations, related-work synthesis, and method detail.
           - Allocate words across sections according to the requested paper
             type and contribution shape. A method-heavy paper should give
@@ -586,8 +586,14 @@ composition:
           - The sum of PER_SECTION_BLUEPRINT.*.target_words must meet or
             exceed the minimum total target_words implied by TARGET_PAGES. If
             the target is 12 pages, the blueprint should normally allocate at
-            least 7,800 total words across abstract/introduction/related_work/
+            least 9,840 total words across abstract/introduction/related_work/
             method/experiments/discussion/conclusion.
+          - In every PER_SECTION_BLUEPRINT entry, target_words is a
+            lower-bound writing budget. It is not a ceiling. Give each
+            section enough planned subclaims, paragraphs, evidence, analysis,
+            and transitions that a section author can satisfy at least 90% of
+            target_words without padding.
+          - Do not return an undersized section from any non-abstract section author.
           - Treat paper_preferences.CITATION_TARGET and CITATION_STRATEGY as
             authoritative. If they are AUTO, derive a citation budget
             proportional to target length and available verified references;
@@ -717,6 +723,8 @@ composition:
           - Do not include \cite{...}.
           - Match TERMINOLOGY_LOCK and NOTATION_LOCK exactly.
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.abstract.target_words
+          - For the abstract, follow the 4-6 sentence contract first; do not
+            expand it just to satisfy the long-form page target.
           - Only output the LaTeX fragment. No commentary, no fences.
     - id: section_introduction
       kind: agent
@@ -751,6 +759,11 @@ composition:
             and only keys present in cite_keys_hint.
           - Match TERMINOLOGY_LOCK and NOTATION_LOCK exactly.
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.introduction.target_words.
+          - Length floor: target_words is a lower-bound writing budget. Do
+            not return until the section reaches at least 90% of target_words;
+            expand with plan-aligned motivation, prior-work contrast,
+            contribution detail, and roadmap prose if short. Do not return an
+            undersized section.
           - Output ONLY the LaTeX fragment for this section. No fences.
     - id: section_related_work
       kind: agent
@@ -786,6 +799,11 @@ composition:
           - Do NOT include figures/tables here.
           - Match TERMINOLOGY_LOCK exactly.
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.related_work.target_words.
+          - Length floor: target_words is a lower-bound writing budget. Do
+            not return until the section reaches at least 90% of target_words;
+            expand with plan-aligned thematic comparisons, citation synthesis,
+            and explicit gap analysis if short. Do not return an undersized
+            section.
           - Output ONLY the LaTeX fragment. No fences, no preamble.
     - id: section_method
       kind: agent
@@ -826,6 +844,11 @@ composition:
             that supports method exposition; reference it via \ref{fig:<id>}.
           - Match TERMINOLOGY_LOCK / NOTATION_LOCK exactly.
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.method.target_words.
+          - Length floor: target_words is a lower-bound writing budget. Do
+            not return until the section reaches at least 90% of target_words;
+            expand with plan-aligned assumptions, definitions, algorithmic
+            detail, instrumentation, and reproducibility notes if short. Do
+            not return an undersized section.
           - Output ONLY the LaTeX fragment. No fences.
     - id: section_experiments
       kind: agent
@@ -870,6 +893,12 @@ composition:
             headline number.
           - Use ONLY notation/terminology locked in writing_plan.
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.experiments.target_words.
+          - Length floor: target_words is a lower-bound writing budget. Do
+            not return until the section reaches at least 90% of target_words;
+            expand with plan-aligned setup, metric rationale, baseline
+            comparison, ablation interpretation, sensitivity analysis, and
+            failure-case discussion if short. Do not return an undersized
+            section.
           - Output ONLY the LaTeX fragment. No fences.
     - id: section_discussion
       kind: agent
@@ -908,6 +937,11 @@ composition:
             \subsection{Threats to Validity}.
           - Match TERMINOLOGY_LOCK / NOTATION_LOCK exactly.
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.discussion.target_words.
+          - Length floor: target_words is a lower-bound writing budget. Do
+            not return until the section reaches at least 90% of target_words;
+            expand with plan-aligned interpretation, boundary conditions,
+            limitations, threats to validity, and implications if short. Do
+            not return an undersized section.
           - Output ONLY the LaTeX fragment.
     - id: section_conclusion
       kind: agent
@@ -931,11 +965,18 @@ composition:
 
           Output rules:
           - Start with \section{Conclusion}.
-          - 2-3 paragraphs covering: 1) restated thesis + headline result,
-            2) key contributions reiterated, 3) future-work pointer.
+          - Cover: 1) restated thesis + headline result, 2) key contributions
+            reiterated, 3) scope and limitations, 4) future-work pointer. Use
+            as many concise paragraphs as the writing_plan target_words
+            requires; do not cap the conclusion at 2-3 paragraphs when the
+            requested page target is long.
           - No new claims, no new figures, no \cite{}.
           - Match TERMINOLOGY_LOCK exactly.
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.conclusion.target_words.
+          - Length floor: target_words is a lower-bound writing budget. Do
+            not return until the section reaches at least 90% of target_words;
+            expand with plan-aligned synthesis and implications if short. Do
+            not return an undersized section.
           - Output ONLY the LaTeX fragment.
     - id: persist_sections
       kind: tool_call
