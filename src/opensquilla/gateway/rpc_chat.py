@@ -347,6 +347,81 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
     return {"messages": messages}
 
 
+def _clarify_fields_to_text(fields: dict[str, object]) -> str:
+    """Serialise a clarify-form submission into a ``key: value\\n`` reply.
+
+    The synthetic message is fed back through ``chat.send`` so it
+    traverses the regular meta-resolution pipeline:
+      peek_awaiting → parse_clarify_reply (key:value mode) →
+      try_claim_resume → DAG continues.
+
+    Bools are rendered as ``true``/``false``; everything else uses
+    Python's natural string representation. Empty / None values are
+    skipped — they signal "optional field omitted".
+    """
+    lines: list[str] = []
+    for key, value in fields.items():
+        if value is None or value == "":
+            continue
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        else:
+            rendered = str(value)
+        lines.append(f"{key}: {rendered}")
+    return "\n".join(lines)
+
+
+@_d.method("chat.clarify_submit", scope="operator.write")
+async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> dict:
+    """Accept a structured clarify-form submission from a Web UI surface.
+
+    Params:
+      ``sessionKey``  (str)  — same WebChat session that triggered the pause
+      ``fields``      (dict) — ``{field_name: value}`` collected by the form
+      ``run_id``      (str, optional) — awaiting run id for trace/log only;
+                                          the awaiting branch in meta_resolution
+                                          uses ``session_key`` for the CAS
+
+    The fields dict is serialised into ``key: value\\n`` text and fed
+    into the regular ``chat.send`` path so meta_resolution's awaiting
+    branch picks it up. This is purely a convenience surface — clients
+    can equivalently call ``chat.send`` with the same text.
+    """
+    if not isinstance(params, dict):
+        raise ValueError("params required: sessionKey, fields")
+    fields = params.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        raise ValueError("params.fields must be a non-empty mapping")
+
+    session_key = _canonical_webchat_session_key(params.get("sessionKey"))
+    text = _clarify_fields_to_text(fields)
+    if not text:
+        raise ValueError("params.fields contained only empty values")
+
+    send_params: dict = {
+        "message": text,
+        "sessionKey": session_key,
+        # Tag the submission so observers can distinguish a form submit
+        # from a typed reply if they care; meta_resolution itself does
+        # not branch on this — the awaiting peek + parse logic is the
+        # same code path.
+        "intent": "clarify_submit",
+        "inputProvenance": "clarify_form",
+    }
+    run_id = params.get("run_id")
+    if isinstance(run_id, str) and run_id:
+        send_params["_source"] = {
+            "caller_kind": "web",
+            "channel_kind": "webchat",
+            "channel_id": f"webchat:{session_key}",
+            "source_kind": "webui",
+            "source_name": "WebChat",
+            "clarify_run_id": run_id,
+        }
+    result = await _handle_chat_send(send_params, ctx)
+    return cast(dict, result)
+
+
 @_d.method("chat.inject", scope="operator.admin")
 async def _handle_chat_inject(params: dict | None, ctx: RpcContext) -> dict:
     if not isinstance(params, dict):
