@@ -182,6 +182,66 @@ async def test_meta_paused_emits_matching_tool_result_event():
 
 
 @pytest.mark.asyncio
+async def test_meta_paused_tool_result_carries_clarify_schema_protocol():
+    """PR5: the synthetic ToolResultEvent must include the surface
+    protocol payload so Web/CLI/IM can render a form without parsing
+    SkillSpec again."""
+    from opensquilla.engine.types import ToolResultEvent
+
+    cfg = ClarifyStepConfig(
+        mode="form",
+        fields=(
+            ClarifyField(name="destination", type="string", required=True,
+                         prompt="目的地"),
+            ClarifyField(name="days", type="int", required=True, min=1, max=14,
+                         prompt="天数"),
+        ),
+        intro="需要 4 个字段",
+        cancel_keywords=("cancel",),
+    )
+
+    async def _dispatch(step, effective_skill, match_inputs, outputs):
+        if step.id == "collect":
+            raise MetaPaused(run_id="r-clarify", step_id="collect", schema=cfg)
+        return
+        yield  # type: ignore[unreachable]
+
+    match = MetaMatch(
+        plan=MetaPlan(
+            name="t", triggers=(), priority=0,
+            steps=(MetaStep(id="collect", skill="collect",
+                             kind="user_input", clarify_config=cfg),),
+        ),
+        inputs={"user_message": "hi"},
+    )
+
+    events: list[object] = []
+    async for ev in run_dag(
+        match,
+        dispatch_step_stream=_dispatch,
+        yield_skill_view_preface=_yield_skill_view,
+    ):
+        events.append(ev)
+
+    paused_result = next(
+        e for e in events
+        if isinstance(e, ToolResultEvent) and e.arguments.get("paused") is True
+    )
+    args = paused_result.arguments
+    assert args["kind"] == "user_input"
+    assert args["step"] == "collect"
+    assert args["run_id"] == "r-clarify"
+    # Schema protocol payload is JSON-shaped, matches clarify_schema output.
+    protocol = args["clarify_schema"]
+    assert protocol["mode"] == "form"
+    assert protocol["intro"] == "需要 4 个字段"
+    assert len(protocol["fields"]) == 2
+    assert protocol["fields"][0]["name"] == "destination"
+    assert protocol["fields"][1]["min"] == 1
+    assert protocol["cancel_keywords"] == ["cancel"]
+
+
+@pytest.mark.asyncio
 async def test_meta_paused_does_not_trigger_on_failure_substitute():
     """A step that raises MetaPaused does NOT cause on_failure substitute
     to spawn (pause ≠ failure, design §8.1)."""

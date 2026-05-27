@@ -3828,6 +3828,24 @@ const ChatView = (() => {
     return details;
   }
 
+  function _retitleToolCallDOM(details, name, input) {
+    if (!details || !name) return;
+    const current = details.getAttribute('data-tool-name') || '';
+    if (current === name) return;
+    details.setAttribute('data-tool-name', name);
+    const summary = details.querySelector('.chat-tools-summary');
+    if (!summary) return;
+    const providerBadge = summary.querySelector('.chat-tool-provider');
+    if (providerBadge) providerBadge.remove();
+    summary.textContent = '';
+    const iconSpan = document.createElement('span');
+    iconSpan.className = 'chat-tools-icon';
+    iconSpan.textContent = _toolEmoji(name);
+    summary.appendChild(iconSpan);
+    summary.appendChild(document.createTextNode(' ' + _toolDisplayName(name, input)));
+    if (providerBadge) summary.appendChild(providerBadge);
+  }
+
   function _findToolDetailsById(root, toolId) {
     if (!root || !toolId) return null;
     return Array.from(root.querySelectorAll('[data-tool-id]')).find(
@@ -3978,6 +3996,22 @@ const ChatView = (() => {
 
   function _appendToolResult(payload) {
     if (!payload) return;
+
+    // PR5: meta-skill user_input paused signal — render a clickable form
+    // instead of a plain tool-result card. The scheduler emits this with
+    // arguments.kind === 'user_input' and arguments.clarify_schema as the
+    // surface protocol payload (see clarify_schema.schema_to_protocol).
+    const _args = payload && payload.arguments;
+    if (
+      _args
+      && _args.kind === 'user_input'
+      && _args.paused === true
+      && _args.clarify_schema
+    ) {
+      _appendClarifyForm(payload, _args);
+      return;
+    }
+
     const raw = payload.result || payload.content || payload.output || '';
     const content = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
     const isError = _toolResultIsError(payload);
@@ -3992,6 +4026,7 @@ const ChatView = (() => {
     if (toolId) {
       const details = _findToolDetailsById(body, toolId);
       if (details) {
+        if (toolName) _retitleToolCallDOM(details, toolName, payload.arguments || payload.input || '');
         toolName = toolName || details.getAttribute('data-tool-name') || '';
         details.classList.remove('chat-tools-collapse--running');
         details.classList.add(_toolResultStateClass(payload));
@@ -4030,6 +4065,197 @@ const ChatView = (() => {
     if (toolId) resultDiv.setAttribute('data-tool-result-for', toolId);
     resultTarget.appendChild(resultDiv);
     if (_autoScroll) _scrollToBottom();
+  }
+
+  // ── PR5: meta-skill user_input form rendering ──
+
+  function _appendClarifyForm(payload, args) {
+    // The scheduler payload carries:
+    //   args.clarify_schema = { mode, intro, fields, cancel_keywords,
+    //                            timeout_hours, nl_extract }
+    //   args.run_id         = awaiting run identifier
+    //   args.step           = user_input step id
+    const schema = args.clarify_schema || {};
+    const runId = args.run_id || '';
+    const fields = Array.isArray(schema.fields) ? schema.fields : [];
+
+    const bubble = _ensureStreamBubble();
+    const body = bubble.querySelector('.msg-body');
+
+    const card = document.createElement('div');
+    card.className = 'clarify-form chat-tools-collapse';
+    card.setAttribute('data-clarify-step', args.step || '');
+    card.setAttribute('data-clarify-run', runId);
+
+    const header = document.createElement('div');
+    header.className = 'clarify-form-header';
+    header.textContent = '请确认以下信息';
+    card.appendChild(header);
+
+    if (schema.intro) {
+      const intro = document.createElement('div');
+      intro.className = 'clarify-form-intro';
+      // schema.intro is xml_escape'd server-side; safe as textContent.
+      intro.textContent = schema.intro;
+      card.appendChild(intro);
+    }
+
+    const form = document.createElement('form');
+    form.className = 'clarify-form-fields';
+    form.setAttribute('novalidate', '');
+
+    fields.forEach((field) => {
+      const row = document.createElement('div');
+      row.className = 'clarify-form-row';
+
+      const label = document.createElement('label');
+      label.className = 'clarify-form-label';
+      const requiredFlag = field.required ? ' *' : '';
+      label.textContent = (field.prompt || field.name) + requiredFlag;
+      label.setAttribute('for', 'clarify-' + field.name);
+      row.appendChild(label);
+
+      let input;
+      if (field.type === 'enum' && Array.isArray(field.choices)) {
+        input = document.createElement('select');
+        if (!field.required) {
+          const blank = document.createElement('option');
+          blank.value = '';
+          blank.textContent = field.default ? '(默认: ' + field.default + ')' : '(可选)';
+          input.appendChild(blank);
+        }
+        field.choices.forEach((choice) => {
+          const opt = document.createElement('option');
+          opt.value = choice;
+          opt.textContent = choice;
+          if (field.default === choice) opt.selected = true;
+          input.appendChild(opt);
+        });
+      } else if (field.type === 'bool') {
+        input = document.createElement('select');
+        ['', 'true', 'false'].forEach((v) => {
+          const opt = document.createElement('option');
+          opt.value = v;
+          opt.textContent = v === '' ? '(未选)' : v;
+          if (field.default === (v === 'true')) opt.selected = true;
+          input.appendChild(opt);
+        });
+      } else if (field.type === 'int') {
+        input = document.createElement('input');
+        input.type = 'number';
+        if (field.min !== undefined && field.min !== null) input.min = String(field.min);
+        if (field.max !== undefined && field.max !== null) input.max = String(field.max);
+        if (field.default !== undefined && field.default !== null) {
+          input.value = String(field.default);
+        }
+      } else {
+        input = document.createElement('input');
+        input.type = 'text';
+        if (field.max_chars) input.maxLength = field.max_chars;
+        if (field.default) input.value = String(field.default);
+      }
+      input.className = 'clarify-form-input';
+      input.id = 'clarify-' + field.name;
+      input.setAttribute('data-clarify-field', field.name);
+      input.setAttribute('data-clarify-type', field.type);
+      if (field.required) input.setAttribute('data-clarify-required', '1');
+      row.appendChild(input);
+      form.appendChild(row);
+    });
+
+    const actions = document.createElement('div');
+    actions.className = 'clarify-form-actions';
+
+    const submitBtn = document.createElement('button');
+    submitBtn.type = 'submit';
+    submitBtn.className = 'clarify-form-submit';
+    submitBtn.textContent = '提交';
+    actions.appendChild(submitBtn);
+
+    const cancelKeyword = (
+      Array.isArray(schema.cancel_keywords) && schema.cancel_keywords.length > 0
+        ? schema.cancel_keywords[0]
+        : ''
+    );
+    if (cancelKeyword) {
+      const cancelBtn = document.createElement('button');
+      cancelBtn.type = 'button';
+      cancelBtn.className = 'clarify-form-cancel';
+      cancelBtn.textContent = '取消';
+      cancelBtn.addEventListener('click', () => {
+        const sessionKey = _currentSessionKey();
+        _rpc.call('chat.send', {
+          message: cancelKeyword,
+          sessionKey: sessionKey,
+          intent: 'clarify_cancel',
+        }).catch((err) => {
+          UI.toast('取消失败: ' + (err && err.message || err), 'error');
+        });
+        submitBtn.disabled = true;
+        cancelBtn.disabled = true;
+      });
+      actions.appendChild(cancelBtn);
+    }
+    form.appendChild(actions);
+
+    form.addEventListener('submit', (evt) => {
+      evt.preventDefault();
+      const collected = {};
+      let firstErrorEl = null;
+      form.querySelectorAll('[data-clarify-field]').forEach((el) => {
+        const name = el.getAttribute('data-clarify-field');
+        const type = el.getAttribute('data-clarify-type');
+        const required = el.getAttribute('data-clarify-required') === '1';
+        let value = el.value;
+        if (typeof value === 'string') value = value.trim();
+        if (value === '' || value === null) {
+          if (required && !firstErrorEl) firstErrorEl = el;
+          return; // omit empty (RPC handler skips empties)
+        }
+        if (type === 'int') {
+          const parsed = parseInt(value, 10);
+          if (Number.isNaN(parsed)) {
+            if (!firstErrorEl) firstErrorEl = el;
+            return;
+          }
+          collected[name] = parsed;
+        } else if (type === 'bool') {
+          collected[name] = (value === 'true');
+        } else {
+          collected[name] = value;
+        }
+      });
+      if (firstErrorEl) {
+        firstErrorEl.focus();
+        UI.toast('请检查必填字段', 'warn');
+        return;
+      }
+      if (Object.keys(collected).length === 0) {
+        UI.toast('请至少填写一个字段', 'warn');
+        return;
+      }
+      submitBtn.disabled = true;
+      const sessionKey = _currentSessionKey();
+      _rpc.call('chat.clarify_submit', {
+        sessionKey: sessionKey,
+        run_id: runId,
+        fields: collected,
+      }).catch((err) => {
+        submitBtn.disabled = false;
+        UI.toast('提交失败: ' + (err && err.message || err), 'error');
+      });
+    });
+
+    card.appendChild(form);
+    body.appendChild(card);
+    if (_autoScroll) _scrollToBottom();
+  }
+
+  function _currentSessionKey() {
+    // Read the module-private _sessionKey populated at chat init / nav
+    // (see ~line 12, 890, 933). Fallback to the documented WebChat
+    // default if not yet set (rare race during very first paint).
+    return _sessionKey || 'default';
   }
 
   function _appendArtifact(payload) {
@@ -4254,10 +4480,12 @@ const ChatView = (() => {
           const toolId = seg.tool_use_id || '';
           const isError = _toolResultIsError(seg);
           const content = seg.result || '';
+          const resultToolName = seg.name || _toolNameById[toolId] || '';
 
           if (toolId) {
             const details = _findToolDetailsById(body, toolId);
             if (details) {
+              _retitleToolCallDOM(details, resultToolName, seg.input || '');
               details.classList.remove('chat-tools-collapse--running');
               details.classList.add(_toolResultStateClass(seg));
               const toolsBody = details.querySelector('.chat-tools-body');
@@ -4267,7 +4495,7 @@ const ChatView = (() => {
                 content,
                 isError,
                 _toolResultIsTruncated(seg),
-                _toolNameById[toolId] || ''
+                resultToolName
               );
               if (resultDiv) {
                 resultDiv.setAttribute('data-tool-result-for', toolId);
@@ -4275,7 +4503,7 @@ const ChatView = (() => {
               }
 
               // web_search: inject provider badge and seed _searchProvider from persisted result
-              if (_toolNameById[toolId] === 'web_search' && content) {
+              if (resultToolName === 'web_search' && content) {
                 const provider = _toolResultProvider(seg, content);
                 if (provider) {
                   _setSearchProvider(provider, { refreshRunning: false });

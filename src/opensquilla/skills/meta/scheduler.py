@@ -493,8 +493,18 @@ async def run_dag(
                 # ToolResultEvent, Web UI tool cards stay "in flight" forever.
                 # Emit a synthetic paused ToolResultEvent first so the card
                 # closes cleanly.
+                #
+                # The ``arguments`` payload carries the surface-agnostic
+                # schema protocol (PR5 ``clarify_schema.schema_to_protocol``)
+                # so Web/CLI/IM surfaces can render a clickable form. The
+                # ``paused`` flag remains the cheap signal for surfaces that
+                # don't render forms.
                 paused_use_id = f"meta_step_{item.step_id}"
                 paused_tool_name = f"meta-step:{item.step_id}"
+                from opensquilla.skills.meta.clarify_schema import schema_to_protocol
+                clarify_protocol = schema_to_protocol(
+                    item.schema, intro_override=item.intro,
+                )
                 yield ToolResultEvent(
                     tool_use_id=paused_use_id,
                     tool_name=paused_tool_name,
@@ -504,6 +514,8 @@ async def run_dag(
                         "kind": "user_input",
                         "paused": True,
                         "step": item.step_id,
+                        "run_id": item.run_id,
+                        "clarify_schema": clarify_protocol,
                     },
                 )
                 # Cancel all in-flight sibling tasks.
