@@ -75,6 +75,7 @@ from opensquilla.result_budget import (
     compact_tool_result_content,
     resolve_budget_class,
 )
+from opensquilla.router_control import router_control_replay_event_from_payload
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
@@ -3102,6 +3103,7 @@ class Agent:
                 for tc in tool_calls:
                     result = results_by_id[tc.tool_use_id]
                     result_tool_call = tc
+                    replay_event = router_control_replay_event_from_payload(result.content)
                     pending_approval = _pending_approval_payload(result.content)
                     if pending_approval is not None and not tc.arguments.get("approval_id"):
                         for artifact in result.artifacts:
@@ -3129,6 +3131,7 @@ class Agent:
                         )
                         result = await _run_one(retry_call)
                         result_tool_call = retry_call
+                        replay_event = router_control_replay_event_from_payload(result.content)
 
                     result = await self._canonicalize_tool_result(
                         result,
@@ -3144,6 +3147,8 @@ class Agent:
                         arguments=result_tool_call.arguments,
                         execution_status=result.execution_status,
                     )
+                    if replay_event is not None:
+                        yield replay_event
                     executed_results.append(result)
                     while self._pending_warnings:
                         yield self._pending_warnings.pop(0)
