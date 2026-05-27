@@ -451,6 +451,7 @@ async def apply_context_overflow_policy(
     # ContextOverflowPolicy.AUTO_SUMMARIZE
     if session_manager is not None:
         flush_status = "not_required"
+        checkpoint_failed = False
         try:
             marker_has = getattr(compaction_marker, "has_compacted_this_turn", None)
             if callable(marker_has) and marker_has(session_key):
@@ -484,13 +485,17 @@ async def apply_context_overflow_policy(
                     COMPACTION_TRIGGERED_EVENT,
                 ),
             )
-            await _record_checkpoint_before_compaction(
-                session_manager,
-                session_key,
-                list(transcript or []),
-                turn_id=compaction_id,
-                source="gateway_auto_summarize",
-            )
+            try:
+                await _record_checkpoint_before_compaction(
+                    session_manager,
+                    session_key,
+                    list(transcript or []),
+                    turn_id=compaction_id,
+                    source="gateway_auto_summarize",
+                )
+            except Exception:
+                checkpoint_failed = True
+                raise
             outcome.flush_receipt = await _await_auto_summarize_flush_grace(
                 config=config,
                 transcript=transcript,
@@ -717,6 +722,8 @@ async def apply_context_overflow_policy(
                 **compaction_lifecycle_payload(compaction_id, COMPACTION_REPLAYED_EVENT),
             )
         except Exception as exc:  # noqa: BLE001 — best-effort
+            if checkpoint_failed:
+                raise
             trimmed = list(transcript or [])
             while trimmed and _estimate_payload_tokens(message, trimmed) > budget:
                 trimmed.pop(0)

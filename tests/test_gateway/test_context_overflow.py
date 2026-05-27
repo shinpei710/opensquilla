@@ -107,6 +107,17 @@ class _CheckpointingSessionManager(_FakeSessionManager):
         return await super().compact(session_key, budget, config)
 
 
+class _FailingCheckpointSessionManager(_CheckpointingSessionManager):
+    async def record_memory_checkpoint(
+        self,
+        session_key: str,
+        transcript: list[_FakeEntry],
+        **kwargs,
+    ) -> None:
+        self.calls.append("checkpoint")
+        raise RuntimeError("checkpoint write failed")
+
+
 class _SummaryReadFailureSessionManager(_FakeSessionManager):
     async def get_summaries(self, session_key: str) -> list[Any]:
         raise RuntimeError(f"summary store unavailable for {session_key}")
@@ -385,6 +396,23 @@ async def test_auto_summarize_checkpoint_runs_before_compact() -> None:
     assert outcome.summarized is True
     assert sm.calls[0] == "checkpoint"
     assert "compact" in sm.calls
+
+
+@pytest.mark.asyncio
+async def test_auto_summarize_checkpoint_failure_propagates_without_ephemeral_fallback() -> None:
+    sm = _FailingCheckpointSessionManager(_history(6, 40))
+
+    with pytest.raises(RuntimeError, match="checkpoint write failed"):
+        await apply_context_overflow_policy(
+            config=_cfg(ContextOverflowPolicy.AUTO_SUMMARIZE, budget=10),
+            message="m",
+            transcript=sm._transcript,
+            session_key="s-checkpoint-fails",
+            session_manager=sm,
+        )
+
+    assert sm.calls == ["checkpoint"]
+    assert sm.compact_calls == []
 
 
 @pytest.mark.asyncio
