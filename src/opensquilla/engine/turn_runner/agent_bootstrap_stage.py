@@ -127,7 +127,7 @@ class ModelCatalogPort(Protocol):
 
     Mirrors the inline three-call sequence with the fallback
     semantics: when ``self._model_catalog is None`` the inline body
-    computes ``max_tokens=user_override or 8192`` and
+    computes ``max_tokens=user_override or 16384`` and
     ``context_window=200_000`` and ``model_caps=None``. The adapter folds
     those defaults into the port so the stage body has no branching on
     catalog presence.
@@ -382,6 +382,16 @@ class AgentBootstrapStage:
         agent_metadata["agent_max_iterations_source"] = budgets.max_iterations_source
 
         # 4. Construct AgentConfig (declarative, single call site)
+        #
+        # ``workspace_dir`` is sourced from the per-turn metadata key
+        # ``bootstrap_workspace_dir`` (written by ``_run_pipeline`` from
+        # the call-site's ToolContext/agent-resolved value — see
+        # runtime.py initial_metadata). This makes AgentConfig.workspace_dir
+        # the single authoritative source for downstream code (meta_invoke
+        # handler, sub-Agent factory, etc.). Without this, the bootstrap
+        # stage left workspace_dir=None, the meta_invoke fallback chain
+        # collapsed to ContextVar lookups, and sub-Agents ended up using
+        # ``default_workspace_dir()`` (``/root/.opensquilla/workspace``).
         agent_config = AgentConfig(
             max_iterations=budgets.max_iterations,
             system_prompt=inp.final_prompt,
@@ -390,6 +400,7 @@ class AgentBootstrapStage:
             cache_mode=inp.turn.metadata.get("cache_mode", "off"),
             skills_context_prompt=inp.turn.metadata.get("skills_context_prompt"),
             model_id=inp.resolved_model,
+            workspace_dir=inp.turn.metadata.get("bootstrap_workspace_dir") or None,
             timeout=budgets.runtime_timeout,
             iteration_timeout=budgets.iteration_timeout,
             tool_timeout=budgets.tool_timeout,

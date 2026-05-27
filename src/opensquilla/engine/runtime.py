@@ -3603,6 +3603,28 @@ class TurnRunner:
             # has ``nl_extract: true``. None disables the LLM fallback.
             "meta_llm_chat": self._make_meta_llm_chat(provider, session_key),
             "router_control_hold_store": self._router_control_hold_store,
+            # Surface the resolved per-agent workspace so the meta_invoke
+            # handler in Agent._run_one_streaming (agent.py ~L4724) can
+            # find it without falling through to default_workspace_dir().
+            # Prefer tool_context.workspace_dir (already resolved with
+            # the gateway config in rpc_sessions / channel_dispatch /
+            # scheduler); fall back to resolving from agent_id on the
+            # tool_context, then to an empty string. When this key was
+            # absent the meta_invoke handler dropped to
+            # default_workspace_dir() and exec_command sandbox blocked
+            # paths under ``/root/`` instead of the gateway workspace.
+            "bootstrap_workspace_dir": (
+                getattr(tool_context, "workspace_dir", None)
+                or (
+                    str(
+                        self._resolve_bootstrap_workspace_dir(
+                            getattr(tool_context, "agent_id", "main") or "main"
+                        )
+                    )
+                    if tool_context is not None
+                    else ""
+                )
+            ),
         }
         if ingress_pipeline_steps:
             initial_metadata["pipeline_steps"] = list(ingress_pipeline_steps)

@@ -426,7 +426,7 @@ _CORPUS: list[tuple[str, dict[str, Any]]] = [
     _case(
         "no_model_catalog",
         model_catalog_present=False,
-        catalog_max_tokens=8192,
+        catalog_max_tokens=16384,
         catalog_context_window=200_000,
     ),
     _case(

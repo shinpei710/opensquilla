@@ -259,7 +259,7 @@ class AgentConfig:
     # Upper bound for same-turn safe tool execution. Safe tools can overlap, but
     # unbounded fan-out can overload local/network resources.
     max_safe_tool_concurrency: int = 6
-    max_tokens: int = 8192
+    max_tokens: int = 16384
     # Optional per-turn operator budgets. 0 disables the corresponding budget.
     max_turn_llm_calls: int = 0
     max_turn_input_tokens: int = 0

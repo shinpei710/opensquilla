@@ -389,7 +389,7 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
                 model_id, provider_name=provider_name, base_url=base_url
             )
         else:
-            max_tokens = user_max_tokens if user_max_tokens > 0 else 8192
+            max_tokens = user_max_tokens if user_max_tokens > 0 else 16384
             context_window = 200_000
             capabilities = None
         return _ResolvedCatalog(
@@ -565,6 +565,7 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
             turn_call_logger=turn_call_logger,
             memory_sync_manager=memory_sync_manager,
             session_flush_service=self._runner._session_flush_service,
+            tool_registry=self._runner._tool_registry,
         )
 
 
