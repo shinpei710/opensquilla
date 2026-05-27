@@ -22,16 +22,43 @@ Behaviour (post-hard-takeover-removal)
 
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 
 import structlog
 
 from opensquilla.engine.pipeline import TurnContext
+from opensquilla.engine.steps.clarify_reply_parser_stub import parse_clarify_reply
 from opensquilla.skills.meta.inputs import make_meta_inputs
 from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
 from opensquilla.skills.meta.types import MetaMatch
 
 log = structlog.get_logger(__name__)
+
+
+def _hits_cancel_keywords(message: str, keywords: tuple[str, ...]) -> bool:
+    if not keywords:
+        return False
+    lower = (message or "").lower()
+    for kw in keywords:
+        if kw and kw in lower:
+            return True
+    return False
+
+
+def _deserialize_awaiting_schema(schema_json: str):
+    """Re-create a ClarifyStepConfig from the awaiting_schema_json column."""
+    import json as _json  # noqa: PLC0415
+
+    from opensquilla.skills.meta.plan_serde import clarify_config_from_jsonable  # noqa: PLC0415
+
+    try:
+        raw = _json.loads(schema_json or "{}")
+    except Exception:  # noqa: BLE001
+        return clarify_config_from_jsonable({"mode": "form", "fields": []})
+    return clarify_config_from_jsonable(raw)
+
 
 _META_SKILL_EXPLANATION_RE = re.compile(
     r"\b(how|what|why|explain|describe)\b.*\bmeta-skill\b"
@@ -129,6 +156,13 @@ def _build_hint(
         f'that workflow end-to-end matches the user\'s intent, call '
         f'`meta_invoke(name="{skill_name}")`; the framework will drive the '
         f'multi-step DAG and the deliverable becomes the assistant reply.',
+        "For a concrete deliverable request that matches this trigger, call "
+        "`meta_invoke` as the first action. Do not answer directly and do not "
+        "call search, web, file, or ordinary skill tools in the outer turn; "
+        "the meta-skill DAG will call any required sub-skills internally.",
+        "Do not call `skill_view` for this meta-skill; `skill_view` is for "
+        "ordinary skills, while this workflow should be started with "
+        "`meta_invoke` directly.",
     ]
     if candidates and len(candidates) > 1:
         lines.append("")
@@ -157,6 +191,65 @@ def _build_hint(
 async def meta_resolution(ctx: TurnContext) -> TurnContext:
     """Resolve a Meta-Skill trigger, stash a MetaMatch, and inject a soft hint."""
 
+    writer = ctx.metadata.get("meta_run_writer")
+    # TurnContext field is `session_key`; DAO interface alias is `session_id`.
+    session_id = getattr(ctx, "session_key", "") or ""
+
+    # ── Leading awaiting branch (PR3, design §8.2) ─────────────────
+    if writer is not None and session_id:
+        try:
+            awaiting = writer.peek_awaiting(session_id=session_id)
+        except Exception as exc:  # noqa: BLE001 — fail-open
+            log.warning("meta_resolution.peek_awaiting_failed", error=str(exc))
+            awaiting = None
+
+        if awaiting is not None:
+            schema = _deserialize_awaiting_schema(awaiting.awaiting_schema_json)
+            now = time.time()
+
+            if now - awaiting.awaiting_since > schema.timeout_hours * 3600:
+                writer.mark_expired(run_id=awaiting.run_id)
+                ctx.metadata["meta_clarify_expired"] = awaiting
+                return ctx
+
+            if _hits_cancel_keywords(ctx.message, schema.cancel_keywords):
+                writer.mark_cancelled(
+                    run_id=awaiting.run_id, reason="user_cancel",
+                )
+                ctx.metadata["meta_clarify_cancelled"] = awaiting
+                return ctx
+
+            parsed, errors = parse_clarify_reply(
+                ctx.message, schema,
+                surface=getattr(ctx, "surface_kind", "unknown"),
+            )
+            if errors:
+                failure_count = writer.increment_parse_failures(
+                    run_id=awaiting.run_id,
+                )
+                if failure_count >= 3:
+                    writer.mark_cancelled(
+                        run_id=awaiting.run_id, reason="parse_failure_limit",
+                    )
+                    ctx.metadata["meta_clarify_cancelled"] = awaiting
+                    return ctx
+                ctx.metadata["meta_clarify_errors"] = errors
+                ctx.metadata["meta_clarify_reprompt"] = awaiting
+                return ctx
+
+            # Parse-success path (codex P0 #3: CAS lives here, not in PR4).
+            claim = await asyncio.to_thread(
+                writer.try_claim_resume,
+                run_id=awaiting.run_id,
+                session_id=session_id,
+            )
+            if claim is None:
+                ctx.metadata["meta_clarify_race_lost"] = awaiting.run_id
+                return ctx
+            ctx.metadata["meta_resume"] = (claim, parsed)
+            return ctx
+
+    # ── Original trigger-matching path (unchanged) ────────────────
     loader = ctx.metadata.get("skill_loader")
     if loader is None:
         return ctx
