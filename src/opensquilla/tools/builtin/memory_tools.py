@@ -700,7 +700,8 @@ def create_memory_tools(
         results = [
             result
             for result in await r.retriever.search(query, opts, intent=SearchIntent.TOOL)
-            if is_searchable_source_path(result.source, str(result.path))
+            if (source_filter is None or result.source == source_filter)
+            and is_searchable_source_path(result.source, str(result.path))
             and not _is_checkpoint_sidecar_path(str(result.path))
         ]
         if not results:

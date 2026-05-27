@@ -417,7 +417,7 @@ async def test_memory_search_tool_filters_checkpoint_sidecars_after_source_gate(
 
 
 @pytest.mark.asyncio
-async def test_memory_search_tool_keeps_sessions_source_from_retriever(tmp_path):
+async def test_memory_search_tool_default_source_rejects_sessions_results(tmp_path):
     registry = ToolRegistry()
     retriever = _FakeRetriever(
         [
@@ -443,6 +443,38 @@ async def test_memory_search_tool_keeps_sessions_source_from_retriever(tmp_path)
     registered = registry.get("memory_search")
     assert registered is not None
     output = await registered.handler(query="alpha")
+
+    assert output == "No results found."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["sessions", "all"])
+async def test_memory_search_tool_allows_sessions_source_results(tmp_path, source):
+    registry = ToolRegistry()
+    retriever = _FakeRetriever(
+        [
+            MemorySearchResult(
+                chunk_id="session",
+                path="sessions/main/session-1.md",
+                source=MemorySource.sessions,
+                start_line=1,
+                end_line=1,
+                snippet="session alpha",
+                score=0.9,
+                text="session alpha",
+            )
+        ]
+    )
+    create_memory_tools(
+        stores=SimpleNamespace(),
+        retrievers=retriever,
+        memory_dir=str(tmp_path),
+        registry=registry,
+    )
+
+    registered = registry.get("memory_search")
+    assert registered is not None
+    output = await registered.handler(query="alpha", source=source)
 
     assert "source: sessions" in output
     assert "sessions/main/session-1.md" in output
