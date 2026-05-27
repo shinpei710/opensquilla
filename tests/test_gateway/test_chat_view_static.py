@@ -185,6 +185,21 @@ def test_chat_live_tool_result_provider_badge_is_web_search_only() -> None:
     assert "_injectProviderBadge" in guarded_block
 
 
+def test_chat_tool_result_can_retitle_coerced_tool_cards() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    live_start = source.index("function _appendToolResult(payload)")
+    live_end = source.index("    // Only show result preview", live_start)
+    live_body = source[live_start:live_end]
+    history_start = source.index("function _reconstructToolCalls(bubbleDiv, segments)")
+    history_end = source.index("  function _renderMessageTags", history_start)
+    history_body = source[history_start:history_end]
+
+    assert "function _retitleToolCallDOM(details, name, input)" in source
+    assert "_retitleToolCallDOM(details, toolName, payload.arguments || payload.input || '')" in live_body
+    assert "const resultToolName = seg.name || _toolNameById[toolId] || '';" in history_body
+    assert "_retitleToolCallDOM(details, resultToolName, seg.input || '')" in history_body
+
+
 def test_chat_search_provider_badge_updates_running_web_search_cards() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
 
@@ -207,6 +222,16 @@ def test_chat_url_agent_query_resolves_default_webchat_session() -> None:
     assert "const urlAgent = _readAgentFromUrl();" in source
     assert "urlSession || (urlAgent ? _webchatSessionKey(urlAgent) : storedSession)" in source
     assert "url.searchParams.delete('agent');" in source
+
+
+def test_chat_subscribe_does_not_advance_cursor_before_replayed_events() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    start = source.index("async function _subscribeSession()")
+    end = source.index("  async function _unsubscribeSession()", start)
+    body = source[start:end]
+
+    assert "Number(res.replayed_count || 0) <= 0" in body
+    assert "replayed_count" in body
 
 
 def test_chat_new_session_uses_current_agent_namespace() -> None:

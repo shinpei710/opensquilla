@@ -2279,7 +2279,11 @@ const ChatView = (() => {
           : _lastStreamSeq;
         UI.toast('Session stream gap detected; reloading transcript.', 'warn', 5000);
         _loadHistory();
-      } else if (res && typeof res.current_stream_seq === 'number') {
+      } else if (
+        res
+        && typeof res.current_stream_seq === 'number'
+        && Number(res.replayed_count || 0) <= 0
+      ) {
         _lastStreamSeq = Math.max(_lastStreamSeq, res.current_stream_seq);
       }
       if (_isStreaming) _resetStreamIdleTimer();
