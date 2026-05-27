@@ -21,7 +21,8 @@ internals unless the detail is needed to help users operate the product.
 ## How to Edit
 
 1. If the problem is small, open the affected Markdown page on GitHub and use
-   the pencil edit flow.
+the pencil edit flow to propose a change. Contributors without repository
+write access will submit this through a fork and pull request.
 2. If you are not sure of the fix, open a
    [documentation issue](https://github.com/opensquilla/opensquilla/issues/new?template=docs_report.yml)
    with the affected page and expected outcome.
