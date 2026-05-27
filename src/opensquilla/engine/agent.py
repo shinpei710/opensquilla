@@ -1642,6 +1642,17 @@ class Agent:
         # ------ IDLE → THINKING ------
         yield self._transition(AgentState.THINKING)
 
+        # PR7 E2E fix: when meta_resolution claimed a paused run via
+        # try_claim_resume + parsed the reply, the runtime already holds
+        # everything needed to advance the DAG. Skip the LLM call entirely
+        # and stream the resume's events through the normal event
+        # pipeline.
+        meta_resume = (self.config.metadata or {}).get("meta_resume")
+        if meta_resume is not None:
+            async for ev in self._run_meta_resume(meta_resume):
+                yield ev
+            return
+
         # Use the system prompt from config (wired by gateway via identity.prompt)
         if self._context is None:
             self._context = ContextAssembly(
@@ -4905,6 +4916,149 @@ class Agent:
                 _meta_invoke_depth.reset(depth_token)
             except ValueError:
                 _meta_invoke_depth.set(current_depth)
+
+    async def _run_meta_resume(self, meta_resume: Any) -> AsyncIterator[Any]:
+        """Stream a meta-skill resume's events as a single turn.
+
+        ``meta_resume`` is the tuple ``(claim, parsed_fields)`` that
+        ``meta_resolution`` stashes on ctx.metadata after a successful
+        try_claim_resume CAS. We build a MetaOrchestrator with the same
+        wiring ``_run_one_streaming`` uses, then yield every event from
+        ``iter_resume_events`` followed by a synthetic DoneEvent so the
+        outer stream pipeline can finalize the turn.
+        """
+        from opensquilla.engine.types import DoneEvent
+        from opensquilla.skills.meta.orchestrator import (
+            MetaOrchestrator,
+            make_agent_runner_from_parent,
+            make_llm_chat_from_provider,
+            make_tool_invoker_from_handler,
+        )
+        from opensquilla.skills.meta.types import MetaResult
+        from opensquilla.tools.types import current_tool_context
+
+        try:
+            claim, parsed = meta_resume
+        except (TypeError, ValueError):
+            logger.warning("agent.meta_resume_malformed", extra={"value": str(meta_resume)})
+            return
+
+        metadata = self.config.metadata or {}
+        skill_loader = metadata.get("skill_loader")
+        if skill_loader is None or self._meta_run_writer is None:
+            logger.warning(
+                "agent.meta_resume_missing_deps",
+                extra={
+                    "has_loader": skill_loader is not None,
+                    "has_writer": self._meta_run_writer is not None,
+                },
+            )
+            return
+
+        # Drop the marker so a re-enter through this turn cannot re-resume.
+        if isinstance(metadata, dict):
+            metadata.pop("meta_resume", None)
+
+        effective_ctx = current_tool_context.get() or None
+        workspace_dir = (
+            (getattr(effective_ctx, "workspace_dir", None) if effective_ctx else None)
+            or metadata.get("bootstrap_workspace_dir")
+            or getattr(self.config, "workspace_dir", None)
+        )
+
+        runner = make_agent_runner_from_parent(
+            provider=self.provider,
+            base_config=self.config,
+            tool_definitions=self.tool_definitions,
+            tool_handler=self.tool_handler,
+            agent_factory=type(self),
+            workspace_dir=str(workspace_dir) if workspace_dir else None,
+            usage_tracker=self._usage_tracker,
+            session_key=self._session_key,
+        )
+        llm_chat = (
+            getattr(self, "_test_llm_chat_override", None)
+            or (
+                make_llm_chat_from_provider(
+                    provider=self.provider,
+                    base_config=self.config,
+                    usage_tracker=self._usage_tracker,
+                    session_key=self._session_key,
+                )
+                if self.provider is not None
+                else None
+            )
+        )
+        tool_invoker = (
+            make_tool_invoker_from_handler(tool_handler=self.tool_handler)
+            if self.tool_handler is not None
+            else None
+        )
+
+        orch = MetaOrchestrator(
+            agent_runner=runner,
+            skill_loader=skill_loader,
+            llm_chat=llm_chat,
+            tool_invoker=tool_invoker,
+            workspace_dir=str(workspace_dir) if workspace_dir else None,
+            run_writer=self._meta_run_writer,
+            triggered_by="resume",
+            session_key=getattr(self, "_session_key", None),
+            turn_id=getattr(self, "_turn_id", None),
+            memory_persist_enabled=True,
+            usage_tracker=self._usage_tracker,
+        )
+
+        result: Any = None
+        final_text_parts: list[str] = []
+        try:
+            async for ev in orch.iter_resume_events(
+                payload=claim,
+                filled_fields=parsed,
+            ):
+                if isinstance(ev, MetaResult):
+                    result = ev
+                    continue
+                # Stream nested AgentEvents through (TextDelta, ToolUseStart,
+                # ToolResult). Capture text deltas so we can render the
+                # final assistant text for the transcript / Done event.
+                from opensquilla.engine.types import TextDeltaEvent
+                if isinstance(ev, TextDeltaEvent) and ev.text:
+                    final_text_parts.append(ev.text)
+                yield ev
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent.meta_resume_failed", extra={"error": str(exc)})
+            yield DoneEvent(text="", input_tokens=0, output_tokens=0, iterations=0)
+            return
+
+        # Build the final assistant text. If the DAG re-paused, use the
+        # rendered form text; otherwise use the orchestrator's final_text.
+        if result is not None:
+            if result.paused:
+                from opensquilla.engine.turn_runner.turn_finalizer_stage import (
+                    render_paused_outcome,
+                )
+                final_text = render_paused_outcome(result)
+            else:
+                final_text = result.final_text or "".join(final_text_parts)
+            # Emit one synthetic TextDelta for any text not already streamed
+            # (re-pause path) so the transcript / surface sees it.
+            already_streamed = "".join(final_text_parts)
+            if final_text and final_text != already_streamed:
+                from opensquilla.engine.types import TextDeltaEvent
+                yield TextDeltaEvent(text=final_text)
+        else:
+            final_text = "".join(final_text_parts)
+
+        yield DoneEvent(
+            text=final_text,
+            input_tokens=0,
+            output_tokens=0,
+            iterations=1,
+            cost_usd=0.0,
+            cost_source="none",
+            model=self.config.model_id or "",
+        )
 
     def _format_meta_invoke_failure(
         self,

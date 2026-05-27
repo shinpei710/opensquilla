@@ -401,11 +401,11 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
     send_params: dict = {
         "message": text,
         "sessionKey": session_key,
-        # Tag the submission so observers can distinguish a form submit
-        # from a typed reply if they care; meta_resolution itself does
-        # not branch on this — the awaiting peek + parse logic is the
-        # same code path.
-        "intent": "clarify_submit",
+        # meta_resolution's awaiting branch keys off session_key, not
+        # intent — so we deliberately stay on the default "continue"
+        # intent (SessionIntent enum rejects unknown values). The
+        # provenance tag is the observability hook for distinguishing
+        # form submits from typed replies downstream.
         "inputProvenance": "clarify_form",
     }
     run_id = params.get("run_id")

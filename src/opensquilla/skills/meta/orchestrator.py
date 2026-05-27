@@ -140,6 +140,11 @@ class MetaOrchestrator:
         # production callers that only set ``run_writer`` also get resume
         # capability without any changes.
         self._dao: MetaRunWriter | None = dao if dao is not None else run_writer
+        # Tracks the run_id currently in flight so _dispatch_step_stream
+        # can route user_input steps to the executor without changing
+        # run_dag's signature. Set inside iter_events / resume, cleared
+        # in the finally block. None when no run is active.
+        self._current_run_id: str | None = None
         self._triggered_by = triggered_by
         self._session_key = session_key
         self._turn_id = turn_id
@@ -274,6 +279,8 @@ class MetaOrchestrator:
 
         final_result: MetaResult | None = None
         cancelled = False
+        previous_run_id = self._current_run_id
+        self._current_run_id = run_id
         try:
             async for item in run_dag(
                 match,
@@ -308,9 +315,19 @@ class MetaOrchestrator:
             cancelled = True
             raise
         finally:
+            self._current_run_id = previous_run_id
             if run_id is not None and self._run_writer is not None:
                 try:
-                    if cancelled:
+                    # A paused MetaResult means a user_input step
+                    # successfully claimed awaiting_user state — do NOT
+                    # overwrite that with status='failed' / 'cancelled'.
+                    # The next user message will resume via try_claim_resume.
+                    if (
+                        final_result is not None
+                        and getattr(final_result, "paused", False)
+                    ):
+                        pass
+                    elif cancelled:
                         await _to_thread(
                             self._run_writer.finish_run_sync,
                             run_id=run_id,
@@ -436,6 +453,30 @@ class MetaOrchestrator:
             )
             yield _StepDone(text=text)
             return
+        if step.kind == "user_input":
+            from opensquilla.skills.meta.executors.user_input import (
+                run_user_input_step,
+            )
+            run_id = self._current_run_id
+            if self._dao is None or not run_id:
+                raise RuntimeError(
+                    f"user_input step {step.id!r} requires a DAO and a "
+                    f"run_id; construct MetaOrchestrator with dao= / "
+                    f"run_writer= and ensure begin_run_sync succeeded",
+                )
+            text = await run_user_input_step(
+                step,
+                inputs=inputs,
+                outputs=outputs,
+                run_id=run_id,
+                session_id=self._session_key,
+                dao=self._dao,
+                now=time.time,
+            )
+            # Skip path only — pause path raises MetaPaused, which the
+            # scheduler catches before we get here.
+            yield _StepDone(text=text)
+            return
         # agent kind: forward sub-Agent events as they arrive.
         async for item in run_step_with_skill_stream(
             step,
@@ -537,12 +578,6 @@ class MetaOrchestrator:
         a clarify-summary markdown, then reenters run_dag with seed_outputs.
         Calls finish_run_sync to finalize unless the DAG re-pauses.
         """
-        from opensquilla.skills.meta.clarify_summary import render_clarify_summary
-        from opensquilla.skills.meta.plan_serde import (
-            clarify_config_from_jsonable,
-            from_jsonable,
-        )
-
         if self._dao is None:
             return MetaResult(
                 ok=False,
@@ -560,6 +595,40 @@ class MetaOrchestrator:
                 error=f"resume failed: run {run_id!r} not found or race lost",
             )
 
+        return await self.resume_with_payload(
+            payload=payload,
+            filled_fields=filled_fields,
+            dispatch_step_stream=dispatch_step_stream,
+            yield_skill_view_preface=yield_skill_view_preface,
+        )
+
+    async def resume_with_payload(
+        self,
+        *,
+        payload: Any,
+        filled_fields: dict[str, Any],
+        dispatch_step_stream: Any,
+        yield_skill_view_preface: Any,
+    ) -> MetaResult:
+        """Resume from an already-claimed ResumePayload (skips the CAS).
+
+        Used by the runtime when ``meta_resolution`` performs the CAS
+        itself before stashing the payload on ``ctx.metadata['meta_resume']``.
+        Doing the CAS twice would always race-lose the second attempt.
+        """
+        from opensquilla.skills.meta.clarify_summary import render_clarify_summary
+        from opensquilla.skills.meta.plan_serde import (
+            clarify_config_from_jsonable,
+            from_jsonable,
+        )
+
+        if self._dao is None:
+            return MetaResult(
+                ok=False,
+                error="MetaOrchestrator has no DAO; resume requires PR2",
+            )
+
+        run_id = payload.run_id
         plan = from_jsonable(json.loads(payload.plan_snapshot_json))
         inputs = json.loads(payload.inputs_json or "{}")
         outputs = json.loads(payload.step_outputs_json or "{}")
@@ -579,14 +648,19 @@ class MetaOrchestrator:
         match = MetaMatch(plan=plan, inputs=inputs)
 
         final: MetaResult | None = None
-        async for ev in run_dag(
-            match,
-            dispatch_step_stream=dispatch_step_stream,
-            yield_skill_view_preface=yield_skill_view_preface,
-            seed_outputs=outputs,
-        ):
-            if isinstance(ev, MetaResult):
-                final = ev
+        previous_run_id = self._current_run_id
+        self._current_run_id = run_id
+        try:
+            async for ev in run_dag(
+                match,
+                dispatch_step_stream=dispatch_step_stream,
+                yield_skill_view_preface=yield_skill_view_preface,
+                seed_outputs=outputs,
+            ):
+                if isinstance(ev, MetaResult):
+                    final = ev
+        finally:
+            self._current_run_id = previous_run_id
         if final is None:
             final = MetaResult(ok=False, error="resume run_dag yielded no MetaResult")
 
@@ -605,6 +679,97 @@ class MetaOrchestrator:
                 status=finish_status,
             )
         return final
+
+    async def iter_resume_events(
+        self,
+        *,
+        payload: Any,
+        filled_fields: dict[str, Any],
+    ) -> AsyncIterator[Any]:
+        """Stream events from a resume just like ``iter_events`` does for a
+        fresh run.
+
+        Yields nested AgentEvents (TextDeltaEvent / ToolUseStartEvent /
+        ToolResultEvent — including the synthetic paused tool_result if
+        the DAG re-pauses) followed by the terminal MetaResult.
+
+        The runtime consumes this from ``_turn_generator`` when
+        ``ctx.metadata["meta_resume"]`` is set, threading every event
+        through the normal stream_consumer pipeline so surfaces see the
+        same shape they would for any other meta-skill turn.
+        """
+        from opensquilla.skills.meta.clarify_summary import render_clarify_summary
+        from opensquilla.skills.meta.plan_serde import (
+            clarify_config_from_jsonable,
+            from_jsonable,
+        )
+
+        if self._dao is None:
+            yield MetaResult(
+                ok=False,
+                error="MetaOrchestrator has no DAO; resume requires PR2",
+            )
+            return
+
+        run_id = payload.run_id
+        plan = from_jsonable(json.loads(payload.plan_snapshot_json))
+        inputs = json.loads(payload.inputs_json or "{}")
+        outputs = json.loads(payload.step_outputs_json or "{}")
+
+        schema_dict = json.loads(payload.awaiting_schema_json or "{}")
+        allowed = {f["name"] for f in schema_dict.get("fields", []) or []}
+        filled_clean = {k: v for k, v in filled_fields.items() if k in allowed}
+
+        inputs.setdefault("collected", {})
+        inputs["collected"][payload.awaiting_step_id] = filled_clean
+
+        cfg = clarify_config_from_jsonable(schema_dict)
+        outputs[payload.awaiting_step_id] = render_clarify_summary(
+            schema=cfg, filled=filled_clean,
+        )
+
+        match = MetaMatch(plan=plan, inputs=inputs)
+
+        previous_run_id = self._current_run_id
+        self._current_run_id = run_id
+        final: MetaResult | None = None
+        try:
+            async for ev in run_dag(
+                match,
+                dispatch_step_stream=self._dispatch_step_stream,
+                yield_skill_view_preface=self._yield_skill_view_preface,
+                seed_outputs=outputs,
+                max_parallelism=self._max_parallelism,
+                usage_tracker=self._usage_tracker,
+                session_key=self._session_key,
+                usage_scope_prefix=run_id,
+            ):
+                if isinstance(ev, MetaResult):
+                    if ev.ok:
+                        ev.final_text = await self._resolve_final_text(
+                            plan=plan,
+                            current_final_text=ev.final_text,
+                            step_outputs=ev.step_outputs,
+                        )
+                    final = ev
+                yield ev
+        finally:
+            self._current_run_id = previous_run_id
+
+        # Finalize the run lifecycle unless re-paused. If re-paused,
+        # try_claim_awaiting has already moved the row back to
+        # 'awaiting_user' — calling finish_run_sync would corrupt state.
+        if final is not None and not final.paused:
+            from typing import Literal
+            finish_status: Literal["ok", "failed", "cancelled"] = (
+                "ok" if final.ok else "failed"
+            )
+            await asyncio.to_thread(
+                self._dao.finish_run_sync,
+                run_id=run_id,
+                result=final,
+                status=finish_status,
+            )
 
     async def _resolve_final_text(
         self,

@@ -155,7 +155,10 @@ async def test_clarify_submit_forwards_to_chat_send(monkeypatch):
     sp = captured["send_params"]
     assert "destination: Tokyo" in sp["message"]
     assert "days: 5" in sp["message"]
-    assert sp["intent"] == "clarify_submit"
+    # PR7 E2E fix: intent is no longer forwarded — SessionIntent enum
+    # rejects unknown values, and meta_resolution's awaiting branch keys
+    # off session_key + provenance tag, not intent.
+    assert "intent" not in sp
     assert sp["inputProvenance"] == "clarify_form"
     src = sp["_source"]
     assert src["channel_kind"] == "webchat"
