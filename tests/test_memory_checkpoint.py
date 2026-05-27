@@ -10,6 +10,33 @@ from opensquilla.memory.checkpoint import (
 )
 
 
+def _checkpoint_event(
+    *,
+    session_key: str = "agent:main:webchat:abc",
+    turn_id: str = "turn-1",
+) -> CheckpointEvent:
+    return CheckpointEvent(
+        schema_version=1,
+        event_id="evt-1",
+        session_key=session_key,
+        session_id="session-1",
+        turn_id=turn_id,
+        sequence=1,
+        timestamp_ms=123,
+        role="user",
+        content_type="text",
+        content="hello",
+        summary=None,
+        tool_name=None,
+        tool_call_id=None,
+        status="ok",
+        token_estimate=1,
+        source="turn_runner",
+        attachments=[],
+        content_hash="",
+    )
+
+
 def test_checkpoint_event_serializes_required_fields() -> None:
     event = CheckpointEvent(
         schema_version=1,
@@ -50,26 +77,7 @@ def test_checkpoint_hash_is_stable_for_normalized_content() -> None:
 
 
 async def test_append_checkpoint_events_writes_jsonl_once(tmp_path):
-    event = CheckpointEvent(
-        schema_version=1,
-        event_id="evt-1",
-        session_key="agent:main:webchat:abc",
-        session_id="session-1",
-        turn_id="turn-1",
-        sequence=1,
-        timestamp_ms=123,
-        role="user",
-        content_type="text",
-        content="hello",
-        summary=None,
-        tool_name=None,
-        tool_call_id=None,
-        status="ok",
-        token_estimate=1,
-        source="turn_runner",
-        attachments=[],
-        content_hash="",
-    )
+    event = _checkpoint_event()
 
     result = append_checkpoint_events(tmp_path, [event])
     second = append_checkpoint_events(tmp_path, [event])
@@ -79,6 +87,18 @@ async def test_append_checkpoint_events_writes_jsonl_once(tmp_path):
     assert result.content_hash == second.content_hash
     lines = (tmp_path / result.relative_path).read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        _checkpoint_event(session_key="agent:main:webchat:other"),
+        _checkpoint_event(turn_id="turn-2"),
+    ],
+)
+def test_append_checkpoint_events_rejects_mixed_turn_batches(tmp_path, event):
+    with pytest.raises(ValueError, match="share session_key and turn_id"):
+        append_checkpoint_events(tmp_path, [_checkpoint_event(), event])
 
 
 def test_checkpoint_relative_path_is_sidecar_only() -> None:

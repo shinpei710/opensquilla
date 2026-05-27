@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
@@ -84,12 +85,26 @@ def append_checkpoint_events(
     workspace: Path,
     events: list[CheckpointEvent],
 ) -> CheckpointWriteResult:
+    """Write one complete turn checkpoint JSONL snapshot.
+
+    Rewriting the same serialized body is idempotent: if the target already has
+    the same body hash, this returns the existing result without duplicating
+    lines.
+    """
     if not events:
         raise ValueError("checkpoint events cannot be empty")
 
+    first_event = events[0]
+    if any(
+        event.session_key != first_event.session_key
+        or event.turn_id != first_event.turn_id
+        for event in events
+    ):
+        raise ValueError("checkpoint events must share session_key and turn_id")
+
     relative_path = checkpoint_relative_path(
-        session_key=events[0].session_key,
-        turn_id=events[0].turn_id,
+        session_key=first_event.session_key,
+        turn_id=first_event.turn_id,
     )
     body = "".join(f"{serialize_checkpoint_event(event)}\n" for event in events)
     body_bytes = body.encode("utf-8")
@@ -108,7 +123,21 @@ def append_checkpoint_events(
         return result
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = target_path.with_name(f".{target_path.name}.tmp")
-    temp_path.write_bytes(body_bytes)
-    os.replace(temp_path, target_path)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            dir=target_path.parent,
+            prefix=f".{target_path.name}.",
+            suffix=".tmp",
+            mode="w",
+            encoding="utf-8",
+        ) as temp_file:
+            temp_file.write(body)
+            temp_path = Path(temp_file.name)
+        os.replace(temp_path, target_path)
+    except Exception:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+        raise
     return result
