@@ -518,27 +518,66 @@ composition:
           Bibliography (cite keys MUST come from here):
           {{ outputs.refbib | truncate(8000) }}
 
-          Return exactly, in this order:
-          MANUSCRIPT_PLAN:
-          - <section-by-section plan with target pages and contribution>
+          CRITICAL OUTPUT CONTRACT (load-bearing — the downstream
+          compile_pdf step parses these markers literally):
 
-          EXPANSION_PLAN_10_PLUS_PAGES:
-          - <concrete section-by-section expansion plan to reach 10+ pages>
+          - The MANUSCRIPT_TEX section is MANDATORY and MUST come first.
+            It MUST start with the literal token `MANUSCRIPT_TEX:` on its
+            own line, immediately followed by `\documentclass{article}`
+            and end with `\end{document}`. Do NOT wrap in ```latex
+            fences. Do NOT prefix with markdown headings.
+          - If you find yourself running out of tokens, shorten section
+            bodies — DO NOT omit MANUSCRIPT_TEX. A short complete
+            \documentclass…\end{document} block is FAR more useful than
+            a long MANUSCRIPT_PLAN with no LaTeX.
+          - REFERENCES_BIB is the second mandatory section. Use
+            `REFERENCES_BIB:` on its own line followed by BibTeX entries.
+            If the bibliography is empty, output `REFERENCES_BIB:`
+            followed by a single line `% no verified references` (the
+            \cite{} keys in MANUSCRIPT_TEX should then be visible
+            placeholders, not BibTeX-keyed cites).
 
-          REFERENCE_PLACEHOLDERS:
-          - <at least 20 placeholder references if REFERENCES_BIB is empty or sparse>
+          Return EXACTLY in this order (no preamble, no markdown headings):
 
           MANUSCRIPT_TEX:
-          <complete minimal LaTeX document with \documentclass,
-          \begin{document}, \begin{abstract}, Introduction, Related Work,
-          Method, Evaluation Design, Expected Results, Limitations and
-          Threats to Validity, Ethics, Conclusion, and \end{document};
-          inline placeholders and use TODO/reference placeholders when
-          verified BibTeX is unavailable>
+          \documentclass{article}
+          \usepackage{xeCJK}
+          \usepackage{graphicx}
+          \usepackage{booktabs}
+          \usepackage{amsmath}
+          \usepackage{hyperref}
+          \title{...}
+          \author{...}
+          \date{\today}
+          \begin{document}
+          \maketitle
+          \begin{abstract}...\end{abstract}
+          \section{Introduction}...
+          \section{Related Work}...
+          \section{Method}...
+          \section{Experiments}...
+          (inline the figure_placeholders, table_placeholders, and
+          analysis_outline blocks verbatim where appropriate)
+          \section{Discussion}...
+          \section{Limitations}...
+          \section{Conclusion}...
+          \bibliographystyle{plain}
+          \bibliography{references}
+          \end{document}
 
           REFERENCES_BIB:
           <BibTeX entries copied verbatim from the provided bibliography —
-          only the entries actually cited in MANUSCRIPT_TEX>
+          only the entries actually cited in MANUSCRIPT_TEX. If empty,
+          output a single `% no verified references` line.>
+
+          MANUSCRIPT_PLAN:
+          - (optional) section-by-section plan with target pages and
+            contribution. Skip this section if MANUSCRIPT_TEX is already
+            tight on tokens.
+
+          REFERENCE_PLACEHOLDERS:
+          - (optional) placeholder reference notes if REFERENCES_BIB is
+            empty or sparse.
 
           COMPILE_NOTES:
           - <short note about figure/reference assumptions>
@@ -707,19 +746,78 @@ composition:
         # contract (passed via env var to dodge shell-escape hell).
         command: |
           python3 - <<'PY'
-          import os, re, subprocess
+          import os, re, subprocess, sys
           from pathlib import Path
+
           pkg = os.environ.get('MANUSCRIPT_PKG', '')
-          # Extract MANUSCRIPT_TEX (drop optional ```latex fences).
-          m = re.search(r'MANUSCRIPT_TEX:\s*(.+?)(?:REFERENCES_BIB:|\Z)', pkg, re.DOTALL)
-          tex = m.group(1).strip() if m else ''
-          tex = re.sub(r'^```(?:latex|tex)?\s*\n', '', tex)
-          tex = re.sub(r'\n```\s*$', '', tex)
-          m = re.search(r'REFERENCES_BIB:\s*(.+?)(?:COMPILE_NOTES:|\Z)', pkg, re.DOTALL)
-          bib = m.group(1).strip() if m else ''
+
+          # 1. Try MANUSCRIPT_TEX: / REFERENCES_BIB: contract markers first.
+          m = re.search(r'MANUSCRIPT_TEX:\s*(.+?)(?:REFERENCES_BIB:|COMPILE_NOTES:|\Z)', pkg, re.DOTALL)
+          tex_body = m.group(1).strip() if m else ''
+          mb = re.search(r'REFERENCES_BIB:\s*(.+?)(?:COMPILE_NOTES:|\Z)', pkg, re.DOTALL)
+          bib = mb.group(1).strip() if mb else ''
+
+          # 2. Fallback A: maybe LLM wrapped LaTeX in ```latex fences without the marker.
+          if not tex_body:
+              fenced = re.search(r'```(?:latex|tex)?\s*(\\documentclass[\s\S]+?\\end\{document\})', pkg)
+              if fenced:
+                  tex_body = fenced.group(1).strip()
+
+          # 3. Fallback B: maybe there's a raw \documentclass…\end{document} block.
+          if not tex_body:
+              raw = re.search(r'(\\documentclass[\s\S]+?\\end\{document\})', pkg)
+              if raw:
+                  tex_body = raw.group(1).strip()
+
+          # 4. Strip any leftover markdown fences from extracted bodies.
+          tex_body = re.sub(r'^```(?:latex|tex)?\s*\n', '', tex_body)
+          tex_body = re.sub(r'\n```\s*$', '', tex_body)
+
+          # 5. If still empty, wrap whatever we got as a degraded skeleton so
+          #    the user sees SOMETHING (and an explicit warning in the PDF).
+          if not tex_body:
+              snippet = pkg[:4000].replace('\\', r'\textbackslash{}')
+              for ch in '{}#$%_&^~':
+                  snippet = snippet.replace(ch, '\\' + ch)
+              tex_body = (
+                  r"\documentclass{article}" "\n"
+                  r"\usepackage{xeCJK}" "\n"
+                  r"\usepackage{geometry}\geometry{margin=2.5cm}" "\n"
+                  r"\title{Degraded Output: MANUSCRIPT\_TEX block not provided by LLM}" "\n"
+                  r"\author{meta-paper-write}" "\n"
+                  r"\begin{document}\maketitle" "\n"
+                  r"\section*{Warning}" "\n"
+                  r"The LLM did not emit a \texttt{MANUSCRIPT\_TEX:} section. "
+                  r"Raw output captured below for inspection." "\n\n"
+                  r"\begin{verbatim}" "\n" + pkg[:4000] + "\n" r"\end{verbatim}" "\n"
+                  r"\end{document}" "\n"
+              )
+
+          # 6. Auto-wrap if the LLM gave a body fragment but no \documentclass.
+          if '\\documentclass' not in tex_body:
+              tex_body = (
+                  r"\documentclass{article}" "\n"
+                  r"\usepackage{xeCJK}" "\n"
+                  r"\usepackage{graphicx}\usepackage{booktabs}\usepackage{amsmath}\usepackage{hyperref}" "\n"
+                  r"\begin{document}" "\n"
+                  + tex_body + "\n"
+                  r"\bibliographystyle{plain}" "\n"
+                  r"\bibliography{references}" "\n"
+                  r"\end{document}" "\n"
+              )
+
+          # 7. Auto-add xeCJK if the body contains CJK chars but doesn't load it.
+          if re.search(r'[一-鿿]', tex_body) and 'xeCJK' not in tex_body:
+              tex_body = tex_body.replace(
+                  r'\documentclass{article}',
+                  r'\documentclass{article}' + '\n' + r'\usepackage{xeCJK}',
+                  1,
+              )
+
           paper = Path('paper'); paper.mkdir(exist_ok=True)
-          (paper / 'paper.tex').write_text(tex, encoding='utf-8')
+          (paper / 'paper.tex').write_text(tex_body, encoding='utf-8')
           (paper / 'references.bib').write_text(bib, encoding='utf-8')
+
           logs = []
           for cmd in (
               ['xelatex','-interaction=nonstopmode','paper.tex'],
@@ -729,19 +827,23 @@ composition:
           ):
               r = subprocess.run(cmd, cwd='paper', capture_output=True, text=True)
               logs.append(f"--- {' '.join(cmd)} (rc={r.returncode}) ---")
+
           pdf = (paper / 'paper.pdf').resolve()
           if pdf.is_file():
-              # Page count from xelatex log if available.
               log_text = (paper / 'paper.log').read_text(encoding='utf-8', errors='ignore') if (paper / 'paper.log').is_file() else ''
               pm = re.search(r'Output written on .+?\((\d+) pages?', log_text)
               pages = pm.group(1) if pm else '?'
               print(f'PDF_PATH: {pdf}')
               print(f'PDF_PAGES: {pages}')
               print(f'PDF_BYTES: {pdf.stat().st_size}')
+              print(f'TEX_BYTES: {(paper / "paper.tex").stat().st_size}')
+              print(f'BIB_BYTES: {(paper / "references.bib").stat().st_size}')
           else:
               tail = '\n'.join(logs[-3:])
-              print(f'COMPILE_FAILED:\n{tail}')
-              import sys
+              # Dump the last 80 lines of paper.log so the failure mode is visible.
+              log_text = (paper / 'paper.log').read_text(encoding='utf-8', errors='ignore') if (paper / 'paper.log').is_file() else ''
+              log_tail = '\n'.join(log_text.splitlines()[-80:])
+              print(f'COMPILE_FAILED:\n{tail}\n\n=== paper.log tail ===\n{log_tail}')
               sys.exit(1)
           PY
         workdir: "{{ inputs.workspace_dir }}"
