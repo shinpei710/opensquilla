@@ -26,37 +26,47 @@ metadata:
 composition:
   steps:
     - id: paper_collect
-      kind: llm_chat
-      with:
-        system: "You extract paper-drafting requirements from the same user turn. Do NOT ask follow-up questions."
-        task: |
-          Extract the paper-drafting contract from the user request. This
-          step must complete inline; never ask the user to fill a form.
-
-          User request:
-          {{ inputs.user_message | xml_escape | truncate(1800) }}
-
-          Rules:
-          - If the user asks for a finished/long paper, choose FULL_MANUSCRIPT.
-          - If the user asks for a concise skeleton, outline, or benchmark
-            response that must fit inline, choose COMPACT_SKELETON.
-          - If the user asks to repair an existing manuscript, choose REPAIR_EXISTING.
-          - If the user asks only to compile/check LaTeX, choose COMPILE_ONLY.
-          - Infer language from the request; default to en.
-          - Infer target pages when explicit; default to 10 for FULL_MANUSCRIPT,
-            6 for COMPACT_SKELETON, and 1 for COMPILE_ONLY.
-          - Keep assumptions visible instead of pausing for clarification.
-
-          Return exactly:
-          TOPIC: <paper topic>
-          PAPER_MODE: <FULL_MANUSCRIPT|COMPACT_SKELETON|REPAIR_EXISTING|COMPILE_ONLY>
-          LANGUAGE: <en|zh|ja|other>
-          TARGET_PAGES: <integer>
-          AUDIENCE: <academic|technical|business|general>
-          MIN_REFERENCES: <integer, default 20 unless compile-only>
-          SEARCH_QUERY: <concise English academic search query, <=12 words>
-          ASSUMPTIONS:
-            - <assumption or none>
+      kind: user_input
+      clarify:
+        mode: form
+        intro: |
+          开始之前，请确认 5 件事 —— 我会用它生成完整论文 / Before drafting,
+          please confirm 5 items — I'll use them to generate the manuscript.
+        skip_if: "inputs.collected.paper_collect is defined"
+        nl_extract: true
+        fields:
+          - name: topic
+            type: string
+            required: true
+            prompt: "论文主题 / Paper topic"
+            max_chars: 200
+          - name: paper_mode
+            type: enum
+            required: true
+            choices:
+              - FULL_MANUSCRIPT
+              - COMPACT_SKELETON
+              - REPAIR_EXISTING
+              - COMPILE_ONLY
+            prompt: "类型 / Mode (FULL_MANUSCRIPT=10+页完整稿; COMPACT_SKELETON=骨架; REPAIR_EXISTING=修复; COMPILE_ONLY=只编译)"
+          - name: language
+            type: enum
+            choices: [en, zh, ja, other]
+            default: en
+            prompt: "语言 / Language"
+          - name: target_length_pages
+            type: int
+            min: 1
+            max: 50
+            default: 10
+            prompt: "目标页数 / Target pages (1–50)"
+          - name: audience
+            type: enum
+            choices: [academic, technical, business, general]
+            default: academic
+            prompt: "受众 / Audience"
+        cancel_keywords: ["算了", "取消", "cancel", "stop", "abort"]
+        timeout_hours: 24
     - id: paper_preferences
       kind: llm_chat
       depends_on: [paper_collect]
@@ -66,7 +76,7 @@ composition:
           Expand the extracted paper facts into a full planning contract.
 
           Extracted paper contract (DO NOT override these):
-          {{ outputs.paper_collect | xml_escape | truncate(1600) }}
+          TOPIC: {{ inputs.collected.paper_collect.topic | xml_escape }}, MODE: {{ inputs.collected.paper_collect.paper_mode }}, PAGES: {{ inputs.collected.paper_collect.target_length_pages }}
 
           Original user request (context only, do NOT override confirmed facts):
           {{ inputs.user_message | xml_escape | truncate(1200) }}
@@ -86,7 +96,7 @@ composition:
     - id: search_query_translation
       kind: llm_chat
       depends_on: [paper_collect]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_collect"
+      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
       with:
         system: "You translate paper topics into concise English academic search queries. Output only the query text."
         task: |
@@ -106,12 +116,12 @@ composition:
             (clean up only obvious typos / extraneous words).
 
           Topic (may be Chinese, Japanese, or English):
-          {{ outputs.paper_collect | xml_escape | truncate(1200) }}
+          TOPIC: {{ inputs.collected.paper_collect.topic | xml_escape }}, MODE: {{ inputs.collected.paper_collect.paper_mode }}, PAGES: {{ inputs.collected.paper_collect.target_length_pages }}
     - id: search_papers
       kind: skill_exec
       skill: multi-search-engine
       depends_on: [paper_preferences, search_query_translation]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_collect"
+      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
       with:
         # search_query_translation returns ONLY the English query text
         # (no labels / no preamble), so we can inline it directly.
@@ -123,13 +133,13 @@ composition:
       kind: skill_exec
       skill: paper-refbib-stub
       depends_on: [search_papers]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_collect"
+      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
       with:
         search_results: "{{ outputs.search_papers | truncate(8000) }}"
     - id: source_pack
       kind: llm_chat
       depends_on: [search_papers, refbib]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_collect"
+      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
       with:
         system: "You curate paper sources and enforce citation coverage."
         task: |
@@ -157,7 +167,7 @@ composition:
     - id: experiment_design
       kind: llm_chat
       depends_on: [paper_preferences, source_pack]
-      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_collect or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_collect"
+      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
       with:
         system: "You design rigorous, falsifiable experiments. You also decide how many figures and tables the paper needs based on the target page budget, the research questions, and the analysis dimensions — do not over- or under-provision."
         task: |
@@ -167,7 +177,7 @@ composition:
           straight from your output.
 
           Paper facts:
-          {{ outputs.paper_collect | xml_escape | truncate(1600) }}
+          TOPIC: {{ inputs.collected.paper_collect.topic | xml_escape }}, MODE: {{ inputs.collected.paper_collect.paper_mode }}, PAGES: {{ inputs.collected.paper_collect.target_length_pages }}
 
           Preferences:
           {{ outputs.paper_preferences | truncate(2000) }}
@@ -247,7 +257,7 @@ composition:
     - id: figure_placeholders
       kind: llm_chat
       depends_on: [experiment_design]
-      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_collect or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_collect"
+      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
       with:
         system: "You render LaTeX placeholder figure environments from a structured figure plan. Output is pure LaTeX, ready to inline into a manuscript."
         task: |
@@ -296,7 +306,7 @@ composition:
     - id: table_placeholders
       kind: llm_chat
       depends_on: [experiment_design]
-      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_collect or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_collect"
+      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
       with:
         system: "You render LaTeX placeholder table environments from a structured table plan. Output is pure LaTeX, ready to inline into a manuscript."
         task: |
@@ -337,7 +347,7 @@ composition:
     - id: analysis_outline
       kind: llm_chat
       depends_on: [experiment_design, figure_placeholders, table_placeholders]
-      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_collect or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_collect"
+      when: "inputs.collected.paper_collect.paper_mode in ('FULL_MANUSCRIPT', 'COMPACT_SKELETON')"
       with:
         system: "You design analysis-chapter outlines that bind every figure/table to a claim and an analysis dimension."
         task: |
@@ -384,7 +394,7 @@ composition:
     - id: outline
       kind: llm_chat
       depends_on: [source_pack, experiment_design]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_collect"
+      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
       with:
         system: "You design long-form LaTeX paper outlines with citation plans."
         task: |
@@ -409,7 +419,7 @@ composition:
     - id: citation_plan
       kind: llm_chat
       depends_on: [outline, source_pack, refbib]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_collect"
+      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
       with:
         system: "You plan citation placement for clean BibTeX/LaTeX manuscripts. You ONLY use cite keys that exist in the provided bibliography — never invent keys."
         task: |
@@ -420,7 +430,7 @@ composition:
           not paragraphs in bulk.
 
           Topic and mode:
-          {{ outputs.paper_collect | xml_escape | truncate(1600) }}
+          TOPIC: {{ inputs.collected.paper_collect.topic | xml_escape }}, MODE: {{ inputs.collected.paper_collect.paper_mode }}, PAGES: {{ inputs.collected.paper_collect.target_length_pages }}
 
           Outline:
           {{ outputs.outline | truncate(6000) }}
@@ -441,7 +451,7 @@ composition:
           fences, chat commentary, progress notes, or tool logs.
 
           Paper mode:
-          {{ outputs.paper_collect | xml_escape | truncate(1600) }}
+          TOPIC: {{ inputs.collected.paper_collect.topic | xml_escape }}, MODE: {{ inputs.collected.paper_collect.paper_mode }}, PAGES: {{ inputs.collected.paper_collect.target_length_pages }}
 
           Mode behavior:
           - FULL_MANUSCRIPT: produce enough substance for
@@ -535,7 +545,7 @@ composition:
     - id: citation_map
       kind: llm_chat
       depends_on: [final_manuscript_package, refbib]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_collect"
+      when: "inputs.collected.paper_collect.paper_mode != 'COMPILE_ONLY'"
       with:
         system: "You audit citation provenance. You read manuscript LaTeX and a BibTeX file and emit a strict markdown table. NEVER invent titles or URLs — copy fields verbatim from the BibTeX block."
         task: |
@@ -582,7 +592,7 @@ composition:
     - id: paper_length_gate
       kind: llm_chat
       depends_on: [final_manuscript_package, citation_plan, refbib]
-      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_collect"
+      when: "inputs.collected.paper_collect.paper_mode == 'FULL_MANUSCRIPT'"
       with:
         system: "You verify manuscript length requirements without rewriting the paper."
         task: |
@@ -668,7 +678,7 @@ composition:
     - id: compile_latex
       kind: llm_chat
       depends_on: [latex_sanitizer]
-      when: "'PAPER_MODE: COMPILE_ONLY' in outputs.paper_collect"
+      when: "inputs.collected.paper_collect.paper_mode == 'COMPILE_ONLY'"
       with:
         system: "You prepare compile handoff notes without invoking LaTeX in the default path."
         task: |
