@@ -182,6 +182,21 @@ def _without_shell_null_redirections(command: str) -> str:
     return _SHELL_NULL_REDIRECT_RE.sub(" ", command)
 
 
+def _workdir_is_configured_workspace(workdir: str | None) -> bool:
+    if not workdir:
+        return False
+    ctx = current_tool_context.get()
+    workspace_dir = getattr(ctx, "workspace_dir", None) if ctx is not None else None
+    if not workspace_dir:
+        return False
+    try:
+        cwd = Path(workdir).expanduser().resolve(strict=False)
+        workspace = Path(workspace_dir).expanduser().resolve(strict=False)
+        return cwd == workspace or workspace in cwd.parents
+    except (OSError, RuntimeError):
+        return False
+
+
 def _sensitive_shell_block(
     tool_name: str,
     command: str,
@@ -194,7 +209,8 @@ def _sensitive_shell_block(
     from opensquilla.sandbox.sensitive_paths import build_block_envelope, sensitive_path_in_text
 
     checked_command = _without_shell_null_redirections(command)
-    checked_text = f"{workdir} {checked_command}" if workdir else checked_command
+    include_workdir = bool(workdir) and not _workdir_is_configured_workspace(workdir)
+    checked_text = f"{workdir} {checked_command}" if include_workdir else checked_command
     marker = sensitive_path_in_text(checked_text)
     if marker is not None:
         return json.dumps(
