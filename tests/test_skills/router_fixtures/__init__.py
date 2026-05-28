@@ -57,12 +57,11 @@ class RouterCase:
 
 # Deferred import: child modules import ``RouterCase`` from this package
 # so we must define it before they load.
-from router_fixtures import knowledge_base_bootstrap, migration_assistant  # noqa: E402
+from router_fixtures import migration_assistant  # noqa: E402
 
 ALL_CASES: list[RouterCase] = [
     *migration_assistant.CASES,
-    *knowledge_base_bootstrap.CASES,
 ]
 
 
-__all__ = ["ALL_CASES", "RouterCase", "knowledge_base_bootstrap", "migration_assistant"]
+__all__ = ["ALL_CASES", "RouterCase", "migration_assistant"]

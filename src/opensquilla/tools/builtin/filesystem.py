@@ -71,10 +71,23 @@ def _resolve_path(path: str) -> Path:
 
     Reads are always allowed; any workspace enforcement for writes happens in
     :func:`_gate_out_of_workspace_write` via the approval queue, not here.
+
+    Sandbox-visible alias paths (``/workspace/...`` from ``execute_code``
+    stdout, ``default_workspace_dir()/...`` from LLM training priors)
+    are translated back to the active host workspace before any
+    sensitive-path / workspace-strict enforcement runs. Without this,
+    model-guessed default-workspace paths are hard-blocked by the
+    sensitive_path check even though the same file written under the
+    gateway-configured workspace would be valid.
     """
+    from opensquilla.tools.path_aliases import resolve_workspace_alias
+
     raw = Path(path).expanduser()
     root = _workspace_root()
     reject_foreign_host_path(str(path), platform=os.name, workspace=root)
+    alias = resolve_workspace_alias(raw, root)
+    if alias is not None:
+        return alias
     if root is not None and not raw.is_absolute():
         return (root / raw).resolve(strict=False)
     return raw.resolve(strict=False) if raw.is_absolute() else raw

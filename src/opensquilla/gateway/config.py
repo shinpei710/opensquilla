@@ -409,7 +409,6 @@ class MemoryEmbeddingRemoteConfig(BaseModel):
     """OpenAI-compatible remote memory embedding settings."""
 
     api_key: str | None = None
-    api_key_env: str | None = None
     base_url: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
     model: str | None = None
@@ -947,6 +946,9 @@ class AgentTokenSavingConfig(BaseSettings):
 
     # Tokenjuice projection is the default tool-result path.
     tool_result_projection_max_inline_chars: int = Field(default=60_000, ge=1000)
+    tool_result_store_max_bytes: int = Field(default=8 * 1024 * 1024, ge=0)
+    tool_result_store_disk_budget_bytes: int = Field(default=256 * 1024 * 1024, ge=0)
+    tool_result_store_retention_seconds: int = Field(default=7 * 24 * 60 * 60, ge=0)
 
 
 class CompactionLlmConfig(BaseSettings):
@@ -1770,10 +1772,7 @@ class GatewayConfig(BaseSettings):
                 cfg.config_path = str(path)
                 return cfg
 
-        cfg = cls()
-        if config_path:
-            cfg.config_path = str(Path(config_path))
-        return cfg
+        return cls()
 
 
 # --- bind-address resolution ----------------------------------------------

@@ -14,7 +14,7 @@ from .types import ModelCapabilities, ModelInfo
 
 log = structlog.get_logger(__name__)
 
-DEFAULT_MAX_TOKENS = 8192
+DEFAULT_MAX_TOKENS = 16384
 DEFAULT_CONTEXT_WINDOW = 200_000
 
 # Static fallback for squilla-router tier models + default model.
@@ -55,7 +55,7 @@ class ModelCatalog:
       1. User config override (>0)
       2. API-fetched catalog value
       3. Static fallback table
-      4. DEFAULT_MAX_TOKENS (8192)
+      4. DEFAULT_MAX_TOKENS (16384)
       → then clamp to min(value, context_window)
     """
 

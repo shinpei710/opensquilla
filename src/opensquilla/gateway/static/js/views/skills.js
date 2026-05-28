@@ -718,7 +718,9 @@ const SkillsView = (() => {
 
     const dotTitle = skill.status_detail || (skill.eligible ? 'Ready' : 'Needs setup');
     const emoji = skill.emoji ? `<span class="sk-card__emoji">${_esc(skill.emoji)}</span>` : '';
-    const desc = skill.description || '';
+    const desc = skill.description
+      ? (skill.description.length > 100 ? skill.description.slice(0, 100) + '…' : skill.description)
+      : '';
     // Meta-skill card adds a "uses:" chip strip showing the sub-skills its
     // composition references. Limit to 6 visible chips + "+N" overflow so
     // the card height stays bounded for large DAGs.
@@ -742,14 +744,14 @@ const SkillsView = (() => {
     const kindBadge = isMeta
       ? `<span class="sk-card__kind-badge" title="${_esc(skill.kind)}">${skill.kind === 'meta_sop' ? 'SOP' : 'META'}</span>`
       : '';
-    return `<button type="button" class="sk-card${isMeta ? ' sk-card--meta' : ''}" data-skill-card="${_esc(skill.name)}" title="${_esc(skill.name + (desc ? ': ' + desc : ''))}">
+    return `<button type="button" class="sk-card${isMeta ? ' sk-card--meta' : ''}" data-skill-card="${_esc(skill.name)}">
       <div class="sk-card__head">
         <span class="sk-card__dot ${dotCls}" title="${_esc(dotTitle)}"></span>
         ${emoji}
-        <span class="sk-card__name" title="${_esc(skill.name)}">${_esc(skill.name)}</span>
+        <span class="sk-card__name">${_esc(skill.name)}</span>
         ${kindBadge}
       </div>
-      <p class="sk-card__desc" title="${_esc(desc)}">${_esc(desc)}</p>
+      <p class="sk-card__desc">${_esc(desc)}</p>
       ${subSkillsHtml}
     </button>`;
   }
@@ -851,7 +853,7 @@ const SkillsView = (() => {
         <button type="button" class="sk-iconbtn" id="skill-dialog-close" aria-label="Close">${icons.x()}</button>
       </header>
       <section class="sk-dialog__body">
-        <p class="sk-dialog__desc">${_esc(skill.description || '')}</p>
+        <p class="sk-dialog__desc">${_esc(_truncDesc(skill.description))}</p>
         ${triggersHtml}
         ${compositionHtml}
         ${missingHtml}
@@ -972,6 +974,13 @@ const SkillsView = (() => {
 
   function _esc(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function _truncDesc(s, n = 220) {
+    if (!s) return '';
+    const firstSent = s.split(/(?<=\.)\s+(?=[A-Z])/)[0] || s;
+    const base = firstSent.length <= n ? firstSent : firstSent.slice(0, n).replace(/\s+\S*$/, '') + '…';
+    return base;
   }
 
   function _layerLabel(layer) {

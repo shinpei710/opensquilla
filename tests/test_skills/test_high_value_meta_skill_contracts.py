@@ -111,6 +111,11 @@ def test_report_meta_skill_uses_fast_final_report_path(tmp_path: Path) -> None:
     }
     assert steps["research"].when == "outputs.report_mode in ('DEEP_REPORT', 'EXPORT_DOCX')"
     assert steps["export"].when == "outputs.report_mode == 'EXPORT_DOCX'"
+    assert set(steps["final_report"].depends_on) == {
+        "quality_gate",
+        "source_quality",
+        "source_to_claim",
+    }
     for step_id in (
         "preferences",
         "source_quality",
@@ -120,8 +125,42 @@ def test_report_meta_skill_uses_fast_final_report_path(tmp_path: Path) -> None:
     ):
         assert steps[step_id].kind == "llm_chat"
     assert steps["search"].skill == "multi-search-engine"
+    assert set(steps["search"].depends_on) == {"preferences", "report_mode"}
     assert steps["research"].skill == "deep-research"
     assert steps["export"].skill == "docx"
+    final_prompt = str(steps["final_report"].with_args)
+    quality_prompt = str(steps["quality_gate"].with_args)
+    source_prompt = str(steps["source_quality"].with_args)
+    preferences_prompt = str(steps["preferences"].with_args)
+    search_args = str(steps["search"].with_args)
+    assert "SEARCH_QUERY:" in preferences_prompt
+    assert "inputs.user_message" not in search_args
+    assert "outputs.preferences" in search_args
+    assert "Source list" in final_prompt
+    assert "Assumptions / Decision Context" in final_prompt
+    assert "audience, decision being made, scope" in final_prompt
+    assert "under 900 words" in final_prompt
+    assert "exactly five numbered" in final_prompt
+    assert "Source pack below as authoritative evidence input" in final_prompt
+    assert "Never output \"No sources were provided\"" in final_prompt
+    assert "copy title + URL entries from the Source pack" in final_prompt
+    assert "Five Key Findings" in final_prompt
+    assert "Do not cite [S#]" in final_prompt
+    assert "Remove invented cost, latency" in final_prompt
+    assert "Evidence limits" in final_prompt
+    assert "not directly" in final_prompt
+    assert "Do not use Reddit" in final_prompt
+    assert "visible \"Sources\"" in quality_prompt
+    assert "INDIRECT or INFERENCE" in quality_prompt
+    assert "Source" in quality_prompt and "list" in quality_prompt
+    assert "[S#] Title" in source_prompt
+    assert "best 5-8 sources" in source_prompt
+    assert "Avoid Reddit" in source_prompt
+    assert "Evidence type: <direct|indirect|background>" in source_prompt
+    assert "indirect/background" in source_prompt
+    report_mode_prompt = str(steps["report_mode"].with_args)
+    assert "Prefer this even when the phrase" in report_mode_prompt
+    assert "planning-meeting memo" in report_mode_prompt
 
 
 def test_paper_meta_skill_has_pre_compile_quality_gates(tmp_path: Path) -> None:
@@ -129,46 +168,145 @@ def test_paper_meta_skill_has_pre_compile_quality_gates(tmp_path: Path) -> None:
 
     assert {
         "final_manuscript_package",
-        "paper_length_gate",
+        "persist_sections",
+        "assemble_manuscript_tex",
+        "citation_map",
         "citation_integrity_gate",
         "latex_sanitizer",
         "compile_latex",
     } <= ids
 
 
-def test_paper_meta_skill_uses_compact_default_manuscript_path(
+def test_paper_meta_skill_uses_full_pdf_default_with_clarification(
     tmp_path: Path,
 ) -> None:
     loader = _loader(tmp_path)
     _assert_composes_at_least_two_skills(loader, "meta-paper-write")
     steps, plan = _steps_by_id(loader, "meta-paper-write")
 
-    assert plan.final_text_mode == "step:final_manuscript_package"
-    assert steps["paper_mode"].kind == "llm_classify"
-    assert set(steps["paper_mode"].output_choices) == {
-        "FULL_MANUSCRIPT",
-        "COMPACT_SKELETON",
-        "REPAIR_EXISTING",
-        "COMPILE_ONLY",
-    }
-    assert steps["experiment"].when == "outputs.paper_mode == 'FULL_MANUSCRIPT'"
-    assert steps["plot"].when == "outputs.paper_mode == 'FULL_MANUSCRIPT'"
-    assert steps["compile_latex"].when == "outputs.paper_mode == 'COMPILE_ONLY'"
+    assert plan.final_text_mode == "step:deliver_paper"
+    assert steps["paper_collect"].kind == "llm_chat"
+    assert steps["paper_collect"].clarify_config is None
+    assert steps["paper_clarify"].kind == "user_input"
+    assert steps["paper_clarify"].when == (
+        "'NEEDS_CLARIFICATION: yes' in outputs.paper_collect"
+    )
+    assert steps["paper_contract"].kind == "llm_chat"
+    assert steps["paper_contract"].depends_on == ("paper_collect", "paper_clarify")
+    paper_collect_prompt = str(steps["paper_collect"].with_args)
+    assert "NEEDS_CLARIFICATION" in paper_collect_prompt
+    assert "FULL_MANUSCRIPT by default" in paper_collect_prompt
+    assert "TARGET_PAGES" in paper_collect_prompt
+    assert "CITATION_TARGET" in paper_collect_prompt
+    assert "MISSING_FIELDS" in paper_collect_prompt
+    raw = str(loader.get_by_name("meta-paper-write").composition_raw)
+    assert "inputs.collected.paper_collect" not in raw
+    # Pipeline rewrite: experiment/plot (skill_exec stubs producing fake
+    # CSV + matplotlib chart) replaced with 4 LLM steps that design the
+    # experiments and emit LaTeX placeholder figures/tables/analysis.
+    assert "experiment" not in steps
+    assert "plot" not in steps
+    assert steps["experiment_design"].when == (
+        "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or "
+        "'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
+    )
+    assert steps["figure_placeholders"].when == steps["experiment_design"].when
+    assert steps["table_placeholders"].when == steps["experiment_design"].when
+    assert steps["analysis_outline"].when == steps["experiment_design"].when
+    assert steps["compile_latex"].when == (
+        "'PAPER_MODE: COMPILE_ONLY' in outputs.paper_contract"
+    )
+    assert steps["writing_plan"].when == (
+        "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
+    )
+    assert steps["compile_pdf"].when == (
+        "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or "
+        "'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or "
+        "'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
+    )
+    assert steps["publish_pdf"].when == steps["compile_pdf"].when
+    assert steps["deliver_paper"].when == steps["compile_pdf"].when
+    compile_prompt = str(steps["compile_pdf"].tool_args)
+    assert "refusing to create degraded PDF" in compile_prompt
     for step_id in (
+        "paper_contract",
         "paper_preferences",
         "source_pack",
+        "experiment_design",
+        "figure_placeholders",
+        "table_placeholders",
+        "analysis_outline",
         "outline",
         "citation_plan",
         "final_manuscript_package",
-        "paper_length_gate",
         "citation_integrity_gate",
         "latex_sanitizer",
         "compile_latex",
     ):
-        assert steps[step_id].kind == "llm_chat"
-    for step_id in ("search_papers", "experiment", "refbib", "plot"):
+        assert steps[step_id].kind == "llm_chat", step_id
+    for step_id in (
+        "persist_sections",
+        "assemble_manuscript_tex",
+        "citation_map",
+        "compile_pdf",
+    ):
+        assert steps[step_id].kind == "tool_call", step_id
+    for step_id in (
+        "section_abstract",
+        "section_introduction",
+        "section_related_work",
+        "section_method",
+        "section_experiments",
+        "section_discussion",
+        "section_conclusion",
+    ):
+        assert steps[step_id].kind == "agent", step_id
+        assert steps[step_id].skill == "paper-section-author", step_id
+    for step_id in ("search_papers", "refbib"):
         assert steps[step_id].kind == "skill_exec"
+    assert steps["persist_sections"].depends_on == (
+        "section_abstract",
+        "section_introduction",
+        "section_related_work",
+        "section_method",
+        "section_experiments",
+        "section_discussion",
+        "section_conclusion",
+    )
+    assert steps["assemble_manuscript_tex"].depends_on == (
+        "writing_plan", "persist_sections", "refbib",
+    )
     assert steps["compile_latex"].depends_on == ("latex_sanitizer",)
+    # New citation-provenance contract — the manuscript prompt must
+    # carry the strict "do not invent cite keys" instructions.
+    final_prompt = str(steps["final_manuscript_package"].with_args)
+    assert "DO NOT invent cite keys" in final_prompt
+    assert "verbatim in REFERENCES_BIB" in final_prompt
+    assert "MANUSCRIPT_PLAN" in final_prompt
+    assert "REFERENCE_PLACEHOLDERS" in final_prompt
+    assert "TARGET_LENGTH_EXPANSION_PLAN" in final_prompt
+    assert "Limitations" in final_prompt
+    assert "Threats to Validity" in final_prompt
+    assert "references are safer than fabricated BibTeX" in final_prompt
+    assert "put the plan and expansion plan before the LaTeX skeleton" in final_prompt
+    assert "keep MANUSCRIPT_TEX under 2,500 words" in final_prompt
+    assert "\\documentclass" in final_prompt
+    assert "\\begin{document}" in final_prompt
+    assert "figure_placeholders" in final_prompt
+    assert "table_placeholders" in final_prompt
+    assert "analysis_outline" in final_prompt
+    assert "CITATION_STRATEGY" in final_prompt
+    # citation_map step exposes the per-key audit table.
+    persist_prompt = str(steps["persist_sections"].tool_args)
+    assert "SECTION_ARTIFACTS" in persist_prompt
+    assert "CONTEXT_POLICY" in persist_prompt
+    assemble_prompt = str(steps["assemble_manuscript_tex"].tool_args)
+    assert "MANUSCRIPT_PATH" in assemble_prompt
+    assert "full manuscript persisted on disk" in assemble_prompt
+    citation_map_prompt = str(steps["citation_map"].tool_args)
+    assert "Source Quality" in citation_map_prompt
+    assert "INVALID" in citation_map_prompt
+    assert "STRONG" in citation_map_prompt
 
 
 def test_pdf_intelligence_preserves_traceable_multi_document_structure(
@@ -195,11 +333,32 @@ def test_pdf_intelligence_has_inline_fallback_and_final_synthesis(
 
     assert plan.final_text_mode == "step:cross_document_synthesis"
     assert steps["extract"].on_failure == "inline_excerpt_extract"
+    assert "inline_excerpts_only" in steps["extract"].when
+    assert "reference_without_content" in steps["extract"].when
+    assert "pdf upload handy" in steps["extract"].when
+    assert "page " in steps["extract"].when
+    assert " says " in steps["extract"].when
     assert steps["inline_excerpt_extract"].kind == "llm_chat"
     for step_id in ("intake", "cross_document_synthesis", "traceable_index"):
         assert steps[step_id].kind == "llm_chat"
     assert steps["extract"].skill == "pdf-toolkit"
     assert steps["per_document_digest"].skill == "summarize"
+    synthesis_prompt = str(steps["cross_document_synthesis"].with_args)
+    assert "Evidence Matrix" in synthesis_prompt
+    assert "Direct Evidence" in synthesis_prompt
+    assert "Inferences" in synthesis_prompt
+    assert "EXCERPT-ONLY" in synthesis_prompt
+    assert "Source Excerpts table" in synthesis_prompt
+    assert "source hierarchy" in synthesis_prompt
+    assert "extraction anomaly" in synthesis_prompt
+    assert "page 3 says" in synthesis_prompt
+    assert "never claim page count" in synthesis_prompt
+    assert "Reusable Memory Index" in synthesis_prompt
+    assert "evidence_ids" in synthesis_prompt
+    intake_prompt = str(steps["intake"].with_args)
+    assert "SOURCE_STATUS" in intake_prompt
+    assert "USER_EXCERPTS" in intake_prompt
+    assert "inline_excerpts_only" in intake_prompt
 
 
 def test_stack_trace_investigator_supports_language_routing_and_degraded_output(
@@ -211,7 +370,15 @@ def test_stack_trace_investigator_supports_language_routing_and_degraded_output(
     assert spec is not None
     raw = str(spec.composition_raw)
 
-    assert {"classify_language", "repro_suggestion", "degraded_summary"} <= ids
+    assert {"trace_collect", "repro_suggestion", "degraded_summary"} <= ids
+    steps = {step["id"]: step for step in spec.composition_raw["steps"]}
+    assert steps["trace_collect"]["kind"] == "llm_chat"
+    trace_collect = str(steps["trace_collect"]["with"])
+    assert "Do NOT ask the user to confirm" in trace_collect
+    assert "ASSUMED" in trace_collect
+    assert "PRIMARY_EXCEPTION" in trace_collect
+    assert "inputs.collected.trace_collect" not in raw
+    assert "outputs.trace_collect" in raw
     assert "javascript" in raw
     assert "typescript" in raw
     assert "go" in raw
@@ -228,6 +395,60 @@ def test_stack_trace_final_report_requires_patch_target_checklist(
     raw = str(spec.composition_raw)
 
     assert "## Patch Target Checklist" in raw
+    assert "## Exception Semantics" in raw
+    assert "## Trace Facts" in raw
+    assert "First line must be exactly: ## Trace Facts" in raw
+    assert "## Ranked Root Cause Matrix" in raw
+    assert "Reject payload shapes" in raw
+    assert "json.loads(raw) succeeded" in raw
+    assert "top-level key \"result\" was absent" in raw
+    assert "Use the same language as the original user request" in raw
+    assert "raw errors from repository/history tools as private diagnostic" in raw
+    assert "Do not quote raw lookup errors" in raw
+    assert "list/string/null payloads would cause" in raw
+    assert "REPO_GREP: DEGRADED" in raw
+    assert "ISSUE_SEARCH: DEGRADED" in raw
+    assert "GIT_HISTORY: DEGRADED" in raw
+    assert "MEMORY_RECALL: DEGRADED" in raw
+    assert "static sweeps" in raw
+    assert "producer/wrappers, runtime/streaming" in raw
+    assert "streaming/control frames" in raw
+    assert "provider/transport rewraps" in raw
+    assert "at least seven ranked hypotheses" in raw
+    assert "schema/version drift" in raw
+    assert "exception serialized as tool output" in raw
+    assert "## Related Checks" in raw
+    assert "non-authoritative search hint" in raw
+    assert "Prior incident" in raw
+    assert "memory path" in raw
+    assert "hypothesis-driven reproducer matrix" in raw
+    assert "tool identity / tool_call_id" in raw
+    assert "streaming/control-frame path" in raw
+    assert "git log/blame" in raw
+    assert "rg -nF \"parse_tool_result\"" in raw
+    assert "result|data|output|content|error|status|message" in raw
+    assert "json.loads" in raw
+    assert "repo-wide commands first" in raw
+    assert "Verification Commands must contain only commands/checks" in raw
+    assert "Never include file-creation or file-edit commands" in raw
+    assert "no `cat >`" in raw
+    assert "no `tee`" in raw
+    assert "no `python - <<`" in raw
+    assert "no `/tmp`" in raw
+    assert "inline snippet" in raw
+    assert "Use only read-only searches/history/log commands" in raw
+    assert "cap root-cause" in raw and "matrix rows at 8" in raw
+    assert "Patch Direction must complete before Related Checks" in raw
+    assert "do not recommend returning a default" in raw
+    assert "typed" in raw and "protocol/execution errors" in raw
+    assert "fixture-driven contract tests" in raw
+    assert "exact import-path" in raw and "reproducer" in raw
+    assert "targeted pytest command" in raw
+    assert "producer-adapter checks and contract tests" in raw
+    assert "parser boundary: decode, type check, error-envelope branch" in raw
+    assert "Explicitly" in raw and "silent default-return behavior" in raw
+    assert "Do not include the words \"meta-skill\"" in raw
+    assert "not executed" in raw
     assert "Assumptions / Constraints" in raw
     assert "git-diff" in _orchestrated_skill_names(loader, "meta-stack-trace-investigator")
     assert "history-explorer" in _orchestrated_skill_names(
@@ -238,7 +459,10 @@ def test_stack_trace_final_report_requires_patch_target_checklist(
 def test_travel_planner_collects_preferences_constraints_and_variants(
     tmp_path: Path,
 ) -> None:
-    ids = _step_ids(_loader(tmp_path), "meta-travel-planner")
+    loader = _loader(tmp_path)
+    spec = loader.get_by_name("meta-travel-planner")
+    assert spec is not None
+    ids = _step_ids(loader, "meta-travel-planner")
 
     assert {
         "trip_preferences",
@@ -249,6 +473,10 @@ def test_travel_planner_collects_preferences_constraints_and_variants(
         "final_plan",
     } <= ids
     assert "export" not in ids
+    triggers = {trigger.lower() for trigger in spec.triggers}
+    assert "days in" in triggers
+    assert "plan a trip" in triggers
+    assert "itinerary for" in triggers
 
 
 def test_travel_planner_uses_fast_final_itinerary_path(tmp_path: Path) -> None:
@@ -257,7 +485,10 @@ def test_travel_planner_uses_fast_final_itinerary_path(tmp_path: Path) -> None:
     steps, plan = _steps_by_id(loader, "meta-travel-planner")
 
     assert plan.final_text_mode == "step:final_plan"
+    assert steps["trip_collect"].kind == "llm_chat"
+    assert steps["trip_collect"].clarify_config is None
     for step_id in (
+        "trip_collect",
         "trip_preferences",
         "constraints",
         "itinerary",
@@ -269,11 +500,34 @@ def test_travel_planner_uses_fast_final_itinerary_path(tmp_path: Path) -> None:
     assert steps["poi"].skill == "multi-search-engine"
     assert steps["poi"].kind == "skill_exec"
     assert steps["final_plan"].depends_on == ("itinerary", "constraints", "weather", "poi")
-    assert "Primary 3-day itinerary" in str(steps["final_plan"].with_args)
+    collect_prompt = str(steps["trip_collect"].with_args)
+    preference_prompt = str(steps["trip_preferences"].with_args)
+    constraint_prompt = str(steps["constraints"].with_args)
+    final_plan_prompt = str(steps["final_plan"].with_args)
+    assert "Do NOT ask the user to confirm details" in collect_prompt
+    assert "safely inferable" in collect_prompt
+    assert "Do not invent exact calendar dates" in collect_prompt
+    assert "outputs.trip_collect" in preference_prompt
+    assert "Never return a clarification question" in preference_prompt
+    assert "short-range/current forecasts" in constraint_prompt
+    assert "seasonal risk language" in constraint_prompt
+    assert "mobility, dietary, fixed-booking" in constraint_prompt
+    assert "Primary 3-day itinerary" not in final_plan_prompt
+    assert "requested or inferred trip length" in final_plan_prompt
     assert "Variants" in str(steps["final_plan"].with_args)
     assert "Evidence and source notes" in str(steps["final_plan"].with_args)
     assert "Next steps" in str(steps["final_plan"].with_args)
-    assert "explicitly asks for a file" in str(steps["final_plan"].with_args)
+    assert "artifact or file" in final_plan_prompt
+    assert "Route spine" in final_plan_prompt
+    assert "Do not open with" in final_plan_prompt
+    assert "Do not invent exact trip calendar dates" in final_plan_prompt
+    assert "seasonal planning assumption" in final_plan_prompt
+    assert "one rest block or pacing reset per day" in final_plan_prompt
+    assert "weather switch points" in final_plan_prompt
+    assert "verify before booking" in final_plan_prompt
+    assert "avoid cross-city zigzags" in final_plan_prompt
+    assert "ranges and flex levers" in final_plan_prompt
+    assert "omit artifact generation suggestions" in final_plan_prompt
     assert "ARTIFACT_READY" not in str(plan.steps)
 
 
@@ -289,6 +543,7 @@ def test_meta_skill_creator_has_intent_collision_risk_and_preview_gates(
         "risk_classify",
         "single_model_baseline",
         "acceptance_compare",
+        "runtime_e2e",
         "preview",
         "persist",
     } <= ids
@@ -306,6 +561,11 @@ def test_meta_skill_creator_supports_preview_only_branch(tmp_path: Path) -> None
         "PERSISTED_PROPOSAL",
         "FULL_GATED",
     }
+    creator_mode_text = str(steps["creator_mode"].with_args)
+    assert "inputs.system_prompt" in creator_mode_text
+    assert "unattended auto-propose" in creator_mode_text
+    assert "dream" in creator_mode_text
+    assert "cron" in creator_mode_text
     assert steps["smoke"].when == "outputs.creator_mode != 'PREVIEW_ONLY'"
     assert steps["persist"].when == "outputs.creator_mode != 'PREVIEW_ONLY'"
 
@@ -334,8 +594,19 @@ def test_meta_skill_creator_acceptance_compares_against_highest_tier_baseline(
     assert "orchestrated candidate" in str(compare.with_args).lower()
     assert "single-model baseline" in str(compare.with_args).lower()
     assert "winner" in str(compare.with_args).lower()
+    assert "runtime_e2e" in steps
+    assert steps["runtime_e2e"].kind == "tool_call"
+    assert steps["runtime_e2e"].tool == "meta_skill_runtime_e2e_run"
+    assert steps["runtime_e2e"].when == "outputs.creator_mode == 'FULL_GATED'"
+    assert set(steps["runtime_e2e"].depends_on) == {"assemble", "smoke"}
     assert "acceptance_compare" in str(steps["preview"].depends_on)
+    assert "runtime_e2e" in str(steps["preview"].depends_on)
     assert "Baseline comparison" in str(steps["preview"].with_args)
+    assert "acceptance_result" in str(steps["persist"].tool_args)
+    assert "outputs.acceptance_compare" in str(steps["persist"].tool_args)
+    assert "runtime_e2e_result" in str(steps["persist"].tool_args)
+    assert "outputs.runtime_e2e" in str(steps["persist"].tool_args)
+    assert "creator_mode" in str(steps["persist"].tool_args)
 
 
 def test_migration_assistant_routes_guides_and_optional_repo_context(
@@ -352,9 +623,62 @@ def test_migration_assistant_routes_guides_and_optional_repo_context(
         "multi-search-engine",
     ]
     assert steps["repo_context"].skill == "git-diff"
-    assert "current repo" in steps["repo_context"].when
+    assert "current diff" in steps["repo_context"].when
+    assert "current branch" in steps["repo_context"].when
+    assert "'pr' in" not in steps["repo_context"].when
+    assert "pull request" in steps["repo_context"].when
     assert set(steps["write_plan"].depends_on) == {
         "classify",
         "fetch_guide",
         "repo_context",
     }
+    assert steps["write_plan"].kind == "llm_chat"
+    classify_prompt = str(steps["classify"].with_args)
+    fetch_prompt = str(steps["fetch_guide"].with_args)
+    write_plan_prompt = str(steps["write_plan"].with_args)
+    assert "Ignore benchmark wrappers" in classify_prompt
+    assert "truncate(1400)" in classify_prompt
+    assert "after benchmark constraints" in classify_prompt
+    assert "CommonJS" in classify_prompt and "native ESM" in classify_prompt
+    assert "return exactly" in classify_prompt and "CJS_TO_ESM" in classify_prompt
+    assert "Ignore benchmark preambles" in fetch_prompt
+    assert "package.json type/exports" in fetch_prompt
+    assert "directory imports" in fetch_prompt
+    assert "Answer the user's requested" in write_plan_prompt
+    assert "EFFECTIVE_KIND=CJS_TO_ESM" in write_plan_prompt
+    assert "CommonJS to native ES Modules" in write_plan_prompt
+    assert "do not wrap the entire answer in a fenced code block" in write_plan_prompt
+    assert "## Evidence boundary" in write_plan_prompt
+    assert "## Repository discovery checklist" in write_plan_prompt
+    assert "## Rollout and rollback" in write_plan_prompt
+    assert "requested migration kind is authoritative" in write_plan_prompt
+    assert "final-layer classifier override" in write_plan_prompt
+    assert "Do not expose classifier labels" in write_plan_prompt
+    assert "Do not invent repo-specific files" in write_plan_prompt
+    assert "Do not use unverified concrete entrypoint paths" in write_plan_prompt
+    assert "`git commit`" in write_plan_prompt
+    assert "CJS_TO_ESM" in write_plan_prompt
+    assert "npm pkg get type main exports scripts" in write_plan_prompt
+    assert "hypothesis-driven" in write_plan_prompt
+    assert "npm pack --dry-run" in write_plan_prompt
+    assert "npx publint" in write_plan_prompt
+    assert "arethetypeswrong" in write_plan_prompt
+    assert "semver-major trigger" in write_plan_prompt
+    assert "canary/internal" in write_plan_prompt
+    assert "Avoid file-creation" in write_plan_prompt
+    assert "Benchmark/no-write constraint" in write_plan_prompt
+    assert "`cat >`" in write_plan_prompt
+    assert "`tee`" in write_plan_prompt
+    assert "`node -e` snippets that write files" in write_plan_prompt
+    assert "Never ask the user to create `tmp-smoke.*` files" in write_plan_prompt
+    assert "JSON-module/import-attributes support" in write_plan_prompt
+    assert "Avoid invented loader placeholders" in write_plan_prompt
+    assert "exports` takes precedence" in write_plan_prompt
+    assert "1,200-1,800 words" in write_plan_prompt
+    assert "directory `index.js` imports" in write_plan_prompt
+    assert "default export shape changes" in write_plan_prompt
+    assert "subpath whitelisting" in write_plan_prompt
+    assert "Do not include brittle placeholder commands" in write_plan_prompt
+    assert "dual-package hazards" in write_plan_prompt
+    assert "eslint --fix" in write_plan_prompt
+    assert "Avoid obsolete Node flags" in write_plan_prompt

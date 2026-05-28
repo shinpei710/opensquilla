@@ -35,7 +35,7 @@ from opensquilla.skills.meta.templating import (
     render_with_args,
     resolve_route,
 )
-from opensquilla.skills.meta.types import MetaMatch, MetaResult, MetaStep
+from opensquilla.skills.meta.types import MetaMatch, MetaPaused, MetaResult, MetaStep
 
 log = structlog.get_logger(__name__)
 
@@ -61,6 +61,7 @@ async def run_dag(
     usage_tracker: Any | None = None,
     session_key: str | None = None,
     usage_scope_prefix: str | None = None,
+    seed_outputs: dict[str, str] | None = None,
 ) -> AsyncIterator[AgentEvent | MetaResult]:
     """Run the plan and stream a flat sequence of events for the UI.
 
@@ -98,7 +99,7 @@ async def run_dag(
     Callback exceptions are swallowed and logged at warning level —
     observer bugs must never break the scheduler.
     """
-    outputs: dict[str, str] = {}
+    outputs: dict[str, str] = dict(seed_outputs) if seed_outputs else {}
     try:
         ordered = list(topological_order(match.plan.steps))
     except Exception as exc:  # noqa: BLE001
@@ -112,7 +113,7 @@ async def run_dag(
 
     steps_by_id: dict[str, MetaStep] = {s.id: s for s in ordered}
     pending_deps: dict[str, set[str]] = {
-        s.id: set(s.depends_on) for s in ordered
+        s.id: set(s.depends_on) - set(outputs.keys()) for s in ordered
     }
     # Steps that are *only* reachable as another step's ``on_failure``
     # substitute must not run autonomously — they exist on the DAG so
@@ -123,7 +124,9 @@ async def run_dag(
     substitute_only: set[str] = {
         s.on_failure for s in ordered if s.on_failure
     }
-    unstarted: set[str] = set(steps_by_id.keys()) - substitute_only
+    unstarted: set[str] = (
+        set(steps_by_id.keys()) - substitute_only - set(outputs.keys())
+    )
     running: dict[str, asyncio.Task[None]] = {}
     # Aliases populated when a step fails over: maps the substitute step
     # id to the original failed step id. On the substitute's ``_StepDone``
@@ -139,7 +142,7 @@ async def run_dag(
     event_queue: asyncio.Queue[
         tuple[
             str,
-            AgentEvent | MetaResult | _StepDone | _FailoverTriggered | Exception,
+            AgentEvent | MetaResult | _StepDone | _FailoverTriggered | MetaPaused | Exception,
         ]
     ] = asyncio.Queue()
     scope_prefix = usage_scope_prefix or f"meta:{match.plan.name}:{id(match)}"
@@ -320,6 +323,13 @@ async def run_dag(
                 ),
             )
             await event_queue.put((step.id, _StepDone(text=final_text)))
+        except MetaPaused as paused:
+            # Pause is not failure. Stash on the queue so the main loop
+            # can shut down siblings cleanly and emit a single terminal
+            # MetaResult(paused=True). on_failure substitute is intentionally
+            # NOT triggered (design §8.1).
+            await event_queue.put((step.id, paused))
+            return
         except asyncio.CancelledError:
             # Re-raise so gather/wait see the cancellation, but the
             # queue drain in iter_events will not see a _StepDone for
@@ -477,6 +487,50 @@ async def run_dag(
                     unstarted.add(item.substitute_step_id)
                 _spawn_ready()
                 continue
+            if isinstance(item, MetaPaused):
+                # The per-step task already emitted a ToolUseStartEvent
+                # before invoking dispatch_step_stream. Without a matching
+                # ToolResultEvent, Web UI tool cards stay "in flight" forever.
+                # Emit a synthetic paused ToolResultEvent first so the card
+                # closes cleanly.
+                #
+                # The ``arguments`` payload carries the surface-agnostic
+                # schema protocol (PR5 ``clarify_schema.schema_to_protocol``)
+                # so Web/CLI/IM surfaces can render a clickable form. The
+                # ``paused`` flag remains the cheap signal for surfaces that
+                # don't render forms.
+                paused_use_id = f"meta_step_{item.step_id}"
+                paused_tool_name = f"meta-step:{item.step_id}"
+                from opensquilla.skills.meta.clarify_schema import schema_to_protocol
+                clarify_protocol = schema_to_protocol(
+                    item.schema, intro_override=item.intro,
+                )
+                yield ToolResultEvent(
+                    tool_use_id=paused_use_id,
+                    tool_name=paused_tool_name,
+                    result=f"paused: awaiting user input (step {item.step_id!r})",
+                    is_error=False,
+                    arguments={
+                        "kind": "user_input",
+                        "paused": True,
+                        "step": item.step_id,
+                        "run_id": item.run_id,
+                        "clarify_schema": clarify_protocol,
+                    },
+                )
+                # Cancel all in-flight sibling tasks.
+                for task in running.values():
+                    if not task.done():
+                        task.cancel()
+                if running:
+                    await asyncio.gather(*running.values(), return_exceptions=True)
+                yield MetaResult(
+                    ok=False,
+                    paused=True,
+                    paused_payload=item,
+                    step_outputs=dict(outputs),
+                )
+                return
             if isinstance(item, Exception):
                 failure = item
                 failed_step_id = step_id

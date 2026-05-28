@@ -2,8 +2,6 @@ from pathlib import Path
 
 CHAT_JS = Path("src/opensquilla/gateway/static/js/views/chat.js")
 CHAT_CSS = Path("src/opensquilla/gateway/static/css/views/chat.css")
-APP_JS = Path("src/opensquilla/gateway/static/js/app.js")
-BASE_CSS = Path("src/opensquilla/gateway/static/css/base.css")
 RPC_JS = Path("src/opensquilla/gateway/static/js/rpc.js")
 SAVINGS_FX_JS = Path("src/opensquilla/gateway/static/js/components/savings-fx.js")
 TASK_RUNTIME_PY = Path("src/opensquilla/gateway/task_runtime.py")
@@ -22,39 +20,6 @@ def test_chat_toolbar_has_no_tool_compress_selector() -> None:
     assert "Tool " + "Compress" not in source
     assert "tool" + "Compress" not in source
     assert "tool-compress" not in source
-
-
-def test_chat_run_modes_keep_icon_button_shape_while_exposing_bypass_state() -> None:
-    source = CHAT_JS.read_text(encoding="utf-8")
-    css = CHAT_CSS.read_text(encoding="utf-8")
-
-    assert 'id="chat-toolbar-trigger-label"' not in source
-    assert "triggerLabel.textContent = bypassLabel;" not in source
-    assert "has-bypass-signal" not in source
-    assert "has-dot-bypass" in source
-    assert "`${bypassLabel}: Approvals bypassed`" in source
-    assert "`${bypassLabel}: Full permission mode active`" in source
-    assert ".chat-toolbar-trigger.has-bypass-signal" not in css
-    assert ".chat-toolbar-trigger-label" not in css
-
-
-def test_chat_session_chip_accessible_name_includes_visible_key() -> None:
-    source = CHAT_JS.read_text(encoding="utf-8")
-
-    assert 'aria-label="Switch chat session: ${_esc(_sessionKey)}"' in source
-    assert "chip.setAttribute('aria-label', 'Switch chat session: ' + key)" in source
-
-
-def test_chat_mobile_run_modes_keep_error_toasts_visible() -> None:
-    css = CHAT_CSS.read_text(encoding="utf-8")
-    mobile_start = css.index("@media (max-width: 480px)")
-    mobile_block = css[mobile_start : css.index("@media (max-width: 360px)", mobile_start)]
-
-    assert "body:has(.chat-toolbar-popover.is-open) .toast-stack {" in mobile_block
-    assert "body:has(.chat-toolbar-popover.is-open) .toast:not(.err)" in mobile_block
-    assert "body:has(.chat-toolbar-popover.is-open) .toast.err" in mobile_block
-    hidden_stack_rule = "body:has(.chat-toolbar-popover.is-open) .toast-stack {\n    opacity: 0;"
-    assert hidden_stack_rule not in mobile_block
 
 
 def test_chat_tool_display_map_does_not_reference_removed_wrapper_tools() -> None:
@@ -152,53 +117,6 @@ def test_chat_resets_stream_timeout_on_run_heartbeat() -> None:
     assert "webui_stream_idle_grace_ms" in source
 
 
-def test_chat_long_running_thinking_does_not_append_waiting_message() -> None:
-    source = CHAT_JS.read_text(encoding="utf-8")
-    start = source.index("function _showThinkingIndicatorNow()")
-    end = source.index("  function _hideThinkingIndicator", start)
-    body = source[start:end]
-
-    assert "Still waiting for agent response" not in body
-    assert "_addMessage('system'" not in body
-    assert '_addMessage("system"' not in body
-
-
-def test_chat_stream_idle_timeout_checks_server_run_state_before_error() -> None:
-    source = CHAT_JS.read_text(encoding="utf-8")
-    start = source.index("function _resetStreamIdleTimer()")
-    end = source.index("  function _serverRunStateIsActive", start)
-    body = source[start:end]
-
-    assert "_handleStreamIdleTimeout" in body
-    assert "_endStreaming();" not in body
-    assert "Response timed out" not in body
-
-    handler_start = source.index("async function _handleStreamIdleTimeout()")
-    handler_end = source.index("  function _applyRpcPolicy", handler_start)
-    handler = source[handler_start:handler_end]
-
-    assert "_refreshSessionRunState" in handler
-    assert "Response timed out" in handler
-    catch_start = handler.index("catch (err)")
-    retry_after_check_failure = handler.index("_resetStreamIdleTimer();", catch_start)
-    assert retry_after_check_failure < handler.index("_endStreaming();")
-
-    state_start = source.index("function _serverRunStateIsActive(payload)")
-    state_end = source.index("  async function _refreshSessionRunState()", state_start)
-    state = source[state_start:state_end]
-
-    assert "run_status" in state
-    assert "active_task" in state
-    assert "running" in state
-    assert "queued" in state
-
-    refresh_start = source.index("async function _refreshSessionRunState()")
-    refresh_end = source.index("  async function _handleStreamIdleTimeout()", refresh_start)
-    refresh = source[refresh_start:refresh_end]
-
-    assert "sessions.messages.subscribe" in refresh
-
-
 def test_chat_tool_results_use_execution_status_for_state() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
 
@@ -267,6 +185,21 @@ def test_chat_live_tool_result_provider_badge_is_web_search_only() -> None:
     assert "_injectProviderBadge" in guarded_block
 
 
+def test_chat_tool_result_can_retitle_coerced_tool_cards() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    live_start = source.index("function _appendToolResult(payload)")
+    live_end = source.index("    // Only show result preview", live_start)
+    live_body = source[live_start:live_end]
+    history_start = source.index("function _reconstructToolCalls(bubbleDiv, segments)")
+    history_end = source.index("  function _renderMessageTags", history_start)
+    history_body = source[history_start:history_end]
+
+    assert "function _retitleToolCallDOM(details, name, input)" in source
+    assert "_retitleToolCallDOM(details, toolName, payload.arguments || payload.input || '')" in live_body
+    assert "const resultToolName = seg.name || _toolNameById[toolId] || '';" in history_body
+    assert "_retitleToolCallDOM(details, resultToolName, seg.input || '')" in history_body
+
+
 def test_chat_search_provider_badge_updates_running_web_search_cards() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
 
@@ -291,136 +224,14 @@ def test_chat_url_agent_query_resolves_default_webchat_session() -> None:
     assert "url.searchParams.delete('agent');" in source
 
 
-def test_chat_mobile_session_controls_keep_touch_targets() -> None:
-    css = CHAT_CSS.read_text(encoding="utf-8")
-    mobile_start = css.index("@media (max-width: 480px)")
-    mobile_block = css[mobile_start : css.index("@media (max-width: 360px)", mobile_start)]
-    label_start = mobile_block.index(".chat-label {")
-    label_rule = mobile_block[label_start : mobile_block.index("}", label_start)]
-    popover_start = mobile_block.index(".chat-session-popover {")
-    popover_rule = mobile_block[popover_start : mobile_block.index("}", popover_start)]
-    chip_start = mobile_block.index(".chat-session-chip {")
-    chip_rule = mobile_block[chip_start : mobile_block.index("}", chip_start)]
-    copy_start = mobile_block.index(".chat-session-copy-btn {")
-    copy_rule = mobile_block[copy_start : mobile_block.index("}", copy_start)]
+def test_chat_subscribe_does_not_advance_cursor_before_replayed_events() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    start = source.index("async function _subscribeSession()")
+    end = source.index("  async function _unsubscribeSession()", start)
+    body = source[start:end]
 
-    assert ".chat-session-chip" in mobile_block
-    assert "display: none" in label_rule
-    assert "left: 12px !important" in popover_rule
-    assert "right: 12px" in popover_rule
-    assert "width: auto" in popover_rule
-    assert "min-height: 40px" in chip_rule
-    assert ".chat-session-copy-btn" in mobile_block
-    assert "width: 40px" in copy_rule
-    assert "height: 40px" in copy_rule
-
-
-def test_chat_tiny_phone_header_gives_session_key_full_row() -> None:
-    css = CHAT_CSS.read_text(encoding="utf-8")
-    tiny_start = css.index("@media (max-width: 360px)")
-    tiny_block = css[tiny_start : css.index(".chat-pill {", tiny_start)]
-    header_start = tiny_block.index(".chat-header {")
-    header_rule = tiny_block[header_start : tiny_block.index("}", header_start)]
-    left_start = tiny_block.index(".chat-header-left {")
-    left_rule = tiny_block[left_start : tiny_block.index("}", left_start)]
-    chip_start = tiny_block.index(".chat-session-chip {")
-    chip_rule = tiny_block[chip_start : tiny_block.index("}", chip_start)]
-
-    assert "flex-wrap: wrap" in header_rule
-    assert "align-items: flex-start" in header_rule
-    assert "flex: 1 1 100%" in left_rule
-    assert "gap: var(--sp-1)" in chip_rule
-    assert "padding-inline: 4px" in chip_rule
-
-
-def test_chat_mobile_composer_inlines_controls_on_a_single_row() -> None:
-    """Mobile composer keeps every control on a single inline row.
-
-    The earlier wrap-to-second-row layout pushed icon buttons above the
-    textarea, leaving dead horizontal space and breaking the messaging-app
-    convention of [controls] [textarea] [send]. The phone composer now
-    runs nowrap; the textarea shrinks (flex: 1 1 0; min-width: 0) so the
-    paperclip, run-modes, and new-chat buttons stay reachable inline,
-    with the send button at the far right.
-    """
-    css = CHAT_CSS.read_text(encoding="utf-8")
-    base_wrap_start = css.index(".chat-input-wrap {")
-    mobile_start = css.index("@media (max-width: 480px)", base_wrap_start)
-    mobile_block = css[mobile_start : css.index("/* Stop button pulse animation", mobile_start)]
-    input_start = mobile_block.index(".chat-input-bar {")
-    input_rule = mobile_block[input_start : mobile_block.index("}", input_start)]
-    wrap_start = mobile_block.index(".chat-input-wrap {")
-    wrap_rule = mobile_block[wrap_start : mobile_block.index("}", wrap_start)]
-    send_start = mobile_block.index("#chat-btn-send,")
-    send_rule = mobile_block[send_start : mobile_block.index("}", send_start)]
-
-    assert mobile_start > base_wrap_start
-    assert "flex-wrap: nowrap" in input_rule
-    assert "flex: 1 1 0" in wrap_rule
-    assert "min-width: 0" in wrap_rule
-    assert "order: 4" in send_rule
-    # Sub-360 widths drop the new-chat (+) button so the composer rail
-    # can breathe; assert the breakpoint is in place but not above 360.
-    tiny_start = css.index("@media (max-width: 360px)")
-    tiny_block = css[tiny_start:]
-    assert "#chat-btn-new { display: none" in tiny_block
-
-
-def test_chat_desktop_session_controls_keep_polished_hit_areas() -> None:
-    css = CHAT_CSS.read_text(encoding="utf-8")
-    chip_start = css.index(".chat-session-chip {")
-    copy_start = css.index(".chat-session-copy-btn {")
-    chip_rule = css[chip_start : css.index("}", chip_start)]
-    copy_rule = css[copy_start : css.index("}", copy_start)]
-
-    assert "min-height: 40px" in chip_rule
-    assert "width: 40px" in copy_rule
-    assert "height: 40px" in copy_rule
-    assert "border: 1px solid var(--border)" in copy_rule
-
-
-def test_chat_run_status_chip_aligns_with_header_controls() -> None:
-    css = CHAT_CSS.read_text(encoding="utf-8")
-    status_start = css.index("#chat-run-status {")
-    status_rule = css[status_start : css.index("}", status_start)]
-
-    assert "display: inline-flex" in status_rule
-    assert "align-items: center" in status_rule
-    assert "min-height: 28px" in status_rule
-    assert "padding-inline: 10px" in status_rule
-    assert "line-height: 1" in status_rule
-    assert "white-space: nowrap" in status_rule
-    assert "flex-shrink: 0" in status_rule
-
-
-def test_chat_run_mode_pills_keep_touch_friendly_hit_areas() -> None:
-    css = CHAT_CSS.read_text(encoding="utf-8")
-    pill_start = css.index(".chat-pill {")
-    pill_rule = css[pill_start : css.index("}", pill_start)]
-
-    assert "display: inline-flex" in pill_rule
-    assert "align-items: center" in pill_rule
-    assert "justify-content: center" in pill_rule
-    assert "min-height: 40px" in pill_rule
-
-
-def test_chat_router_toggle_keeps_touch_friendly_hit_area() -> None:
-    css = CHAT_CSS.read_text(encoding="utf-8")
-    wrap_start = css.index(".toggle-switch-wrap {")
-    switch_start = css.index(".toggle-switch {")
-    thumb_start = css.index(".toggle-thumb {")
-    checked_start = css.index(".toggle-switch input:checked + .toggle-track .toggle-thumb {")
-    wrap_rule = css[wrap_start : css.index("}", wrap_start)]
-    switch_rule = css[switch_start : css.index("}", switch_start)]
-    thumb_rule = css[thumb_start : css.index("}", thumb_start)]
-    checked_rule = css[checked_start : css.index("}", checked_start)]
-
-    assert "min-height: 40px" in wrap_rule
-    assert "width: 40px" in switch_rule
-    assert "height: 22px" in switch_rule
-    assert "width: 18px" in thumb_rule
-    assert "height: 18px" in thumb_rule
-    assert "transform: translateX(18px)" in checked_rule
+    assert "Number(res.replayed_count || 0) <= 0" in body
+    assert "replayed_count" in body
 
 
 def test_chat_new_session_uses_current_agent_namespace() -> None:
@@ -685,19 +496,6 @@ def test_chat_stream_handlers_drop_replayed_duplicate_frames() -> None:
     assert "_noteStreamSeq(payload);" not in body
 
 
-def test_chat_router_decision_handler_consumes_stream_seq() -> None:
-    source = CHAT_JS.read_text(encoding="utf-8")
-    start = source.index("_rpc.on('session.event.router_decision'")
-    end = source.index("    // Text delta:", start)
-    body = source[start:end]
-
-    assert "if (_isStaleEpoch(payload)) return;" in body
-    assert "if (!_acceptStreamSeq(payload)) return;" in body
-    assert body.index("if (!_acceptStreamSeq(payload)) return;") < body.index(
-        "_handleRouterDecision(payload);"
-    )
-
-
 def test_chat_surfaces_persisted_run_state_in_header_and_session_picker() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
     css = CHAT_CSS.read_text(encoding="utf-8")
@@ -716,8 +514,8 @@ def test_chat_surfaces_persisted_run_state_in_header_and_session_picker() -> Non
 
 def test_chat_resets_replay_cursor_after_stream_gap() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
-    start = source.index("async function _refreshSessionRunState() {")
-    end = source.index("  async function _handleStreamIdleTimeout()", start)
+    start = source.index("async function _subscribeSession() {")
+    end = source.index("  async function _unsubscribeSession()", start)
     body = source[start:end]
 
     assert "if (res && res.replay_complete === false)" in body
@@ -916,23 +714,6 @@ def test_chat_compact_blocking_failure_preserves_pending_queue() -> None:
     assert "options && options.preservePending" in settle_body
     assert "_popAllPendingIntoComposer();" in settle_body
     assert "recovered = _pendingQueue.length > 0;" in settle_body
-
-
-def test_chat_send_business_failure_ends_streaming_without_waiting_for_events() -> None:
-    source = CHAT_JS.read_text(encoding="utf-8")
-    send_start = source.index("async function _onSend()")
-    send_end = source.index("  /* ── Streaming", send_start)
-    send_body = source[send_start:send_end]
-
-    assert "function _chatSendFailureMessage(payload)" in source
-    assert "if (res && res.ok === false) {" in send_body
-    failure_idx = send_body.index("if (res && res.ok === false) {")
-    failure_block = send_body[failure_idx : send_body.index("return;", failure_idx)]
-    assert "_endStreaming();" in failure_block
-    assert "_addMessage('error', _chatSendFailureMessage(res));" in failure_block
-    assert "_applySessionRunState({ run_status: 'failed'" in failure_block
-    assert "_scheduleHistorySync();" in failure_block
-    assert "payload?.user_message" in source
 
 
 def test_chat_clears_background_task_groups_on_state_reset_paths() -> None:
@@ -1443,6 +1224,92 @@ def test_chat_usage_status_applies_current_session_context_status() -> None:
     assert "_clearContextStatus();" in body
 
 
+def test_router_fx_header_names_ai_model_router() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+
+    assert '<span class="title">AI model router</span>' in source
+    assert '<span class="title">model router</span>' not in source
+
+
+def test_router_fx_live_routes_keep_random_chase_animation() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    handler_start = source.index("async function _handleRouterDecision(payload) {")
+    handler_end = source.index("  // History-load entry point", handler_start)
+    handler_body = source[handler_start:handler_end]
+
+    assert "function _routerFxShouldAnimateIdentity" not in source
+    assert "shouldAnimate" not in handler_body
+    assert "if (observeMode)" in handler_body
+    assert "_animateRouterFx(wrap, winnerIdx)" in handler_body
+    assert handler_body.index("if (observeMode)") < handler_body.index(
+        "_animateRouterFx(wrap, winnerIdx)"
+    )
+
+
+def test_router_fx_history_reuses_settled_strip_for_same_turn_identity() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+
+    assert "el.dataset.sessionKey === (_sessionKey || '') && el.dataset.turnIndex" in source
+    assert "const routerIdentity = _routerFxUsageIdentity(savedUsage);" in source
+    assert "existingStrip.dataset.routerIdentity === routerIdentity" in source
+    assert "if (existingStrip && existingStrip.dataset.live !== 'true') existingStrip.remove();" in source
+    assert "routerStrip.dataset.turnIndex = String(_histUserIdx);" in source
+
+
+def test_router_fx_uses_fixed_model_slots_and_keeps_decoy_seed() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    builder_start = source.index("function _routerFxBuildGridCells(realEntries, seedKey) {")
+    builder_end = source.index("  function _buildRouterFxElement", builder_start)
+    builder_body = source[builder_start:builder_end]
+    live_start = source.index("async function _handleRouterDecision(payload) {")
+    live_end = source.index("  // History-load entry point", live_start)
+    live_body = source[live_start:live_end]
+
+    assert "const _ROUTER_FX_REAL_ANCHOR_CELLS = [1, 6, 8, 13, 11" in source
+    assert "function _routerFxResolveLayoutSeed(sessionKey, hintTimestamp)" in source
+    assert "const liveSeed = _routerFxResolveLayoutSeed(_sessionKey);" in live_body
+    assert "const cachedSeed = _routerFxResolveLayoutSeed(_sessionKey, hint);" in source
+    assert "const orderedRealEntries = realEntries.slice().sort" in builder_body
+    assert "const anchor = _ROUTER_FX_REAL_ANCHOR_CELLS[i];" in builder_body
+    assert "const orderedDecoys = _routerFxShuffle(decoys," in builder_body
+    assert "return _routerFxShuffle(cells, seedKey);" not in builder_body
+
+
+def test_router_fx_history_and_turn_meta_preserve_observe_rollout_state() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    history_start = source.index("function _buildRouterFxFromUsage(usage, seedKey) {")
+    history_end = source.index("  /* ── RPC Event Subscriptions", history_start)
+    history_body = source[history_start:history_end]
+    store_start = source.index("_storeTurnMeta(_sessionKey, _metaIdx")
+    store_end = source.index("          });", store_start)
+    store_body = source[store_start:store_end]
+
+    assert "routing_applied: usage.routing_applied !== false," in history_body
+    assert "rollout_phase: usage.rollout_phase || 'full'," in history_body
+    assert "const observeMode = decision && decision.routing_applied === false;" in source
+    assert "routing_applied: u.routing_applied !== false," in store_body
+    assert "rollout_phase: u.rollout_phase || 'full'," in store_body
+
+
+def test_router_fx_mobile_grid_matches_explicit_cell_count() -> None:
+    """Mobile router-fx grid rows×cols stays in lockstep with the JS cell count.
+
+    The JS constant ``_ROUTER_FX_GRID_CELLS`` is 15 (5 cols × 3 rows on desktop);
+    mobile and tiny breakpoints collapse to 3×5 so no row ends short.
+    """
+    css = CHAT_CSS.read_text(encoding="utf-8")
+    mobile_start = css.index("@media (max-width: 640px)")
+    tiny_start = css.index("@media (max-width: 380px)")
+    mobile_body = css[mobile_start:tiny_start]
+    tiny_body = css[tiny_start:]
+
+    assert "grid-template-columns: repeat(3, 1fr);" in mobile_body
+    assert "grid-template-rows: repeat(5, 28px);" in mobile_body
+    assert "grid-template-columns: repeat(3, 1fr);" in tiny_body
+    assert "grid-template-rows: repeat(5, 26px);" in tiny_body
+
+
+
 def test_combo_display_requires_current_saved_turn_but_suppressed_savings_can_count() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
     savings_source = SAVINGS_FX_JS.read_text(encoding="utf-8")
@@ -1569,105 +1436,3 @@ def test_chat_queue_drain_preserves_draft_typed_during_stream() -> None:
     assert "_pendingAttachments = draftAttachments;" in body
     assert "_pendingSessionIntent = draftIntent;" in body
     assert body.index("_onSend();") < body.index("_textarea.value = draftText;")
-
-
-# ─── Design refinement contracts (chat-refine-v2 branch) ──────────────────
-
-
-def test_chat_empty_state_carries_signal_mark_title_and_kbd_hints() -> None:
-    """The chat empty state is the user's first impression of the conversation
-    surface. It must keep the three-bar signal mark, the styled-paragraph
-    title (NOT an <h2> — see _emptyStateHTML comment for the outline reason),
-    and the three keyboard-shortcut <kbd> chips, in that order, so the row
-    stays a structured welcome and not a bare placeholder line.
-    """
-    source = CHAT_JS.read_text(encoding="utf-8")
-    css = CHAT_CSS.read_text(encoding="utf-8")
-    fn_start = source.index("function _emptyStateHTML()")
-    fn_end = source.index("\n  }", fn_start)
-    body = source[fn_start:fn_end]
-
-    # Structural markers in JS — title is <p>, not <h2>, to keep the chat
-    # surface out of the page heading outline (no <h1> exists upstream).
-    assert 'class="chat-empty" role="status"' in body
-    assert 'class="chat-empty__mark"' in body
-    assert body.count('class="chat-empty__bar"') == 3
-    assert '<p class="chat-empty__title">Start a conversation</p>' in body
-    assert '<h2 class="chat-empty__title"' not in body, (
-        "Empty-state title must be a styled <p>, not <h2>, to keep chat out "
-        "of the page heading outline."
-    )
-    assert "chat-empty__hint" in body
-    # Three kbd chips, in order: history, abort, slash.
-    kbd_block = body[body.index('class="chat-empty__hint"'):]
-    assert kbd_block.index("<kbd>↑</kbd>") < kbd_block.index("<kbd>Esc</kbd>")
-    assert kbd_block.index("<kbd>Esc</kbd>") < kbd_block.index("<kbd>/</kbd>")
-
-    # Matching CSS contract — class names referenced from JS must have rules.
-    assert ".chat-empty__mark" in css
-    assert ".chat-empty__bar" in css
-    assert ".chat-empty__title" in css
-    assert ".chat-empty__hint" in css
-    assert ".chat-empty__hint kbd" in css
-
-
-def test_sidebar_renders_brand_foot_only_when_version_is_present() -> None:
-    """The sidebar brand foot anchors product identity at the bottom of the
-    rail. The block is only emitted when the cache-buster ``data-version``
-    parses to a non-empty semver — otherwise ``v`` alone would render as a
-    broken-looking stub. The matching CSS rules must exist in base.css.
-    """
-    app = APP_JS.read_text(encoding="utf-8")
-    base = BASE_CSS.read_text(encoding="utf-8")
-
-    # Build-suffix stripping + whitelist sanitization.
-    assert "rawVersion.split('+')[0]" in app
-    assert "replace(/[^0-9A-Za-z.\\-]/g, '')" in app
-    assert ".slice(0, 32)" in app  # length cap
-
-    # Conditional emission — empty semver suppresses the whole block.
-    assert "navFootHTML = semver" in app
-    assert "? `<div class=\"nav-foot\">" in app
-    assert ': \'\'' in app  # else branch returns empty string
-
-    # CSS contract — class names referenced from JS must have rules.
-    assert ".nav-foot {" in base
-    assert ".nav-foot__dot" in base
-    assert ".nav-foot__ver" in base
-    # Footer sits at the bottom of a flex-column sidebar.
-    foot_block = base[base.index(".nav-foot {") : base.index("}", base.index(".nav-foot {"))]
-    assert "margin-top: auto" in foot_block
-    # Pulse animation is gated behind prefers-reduced-motion.
-    dot_start = base.index(".nav-foot__dot")
-    reduced_start = base.index("@media (prefers-reduced-motion: reduce)", dot_start)
-    reduced_block = base[reduced_start : reduced_start + 240]
-    assert ".nav-foot__dot { animation: none" in reduced_block
-
-
-def test_app_displayed_version_strips_build_suffix_and_unsafe_chars() -> None:
-    """Defensive contract on the version string the brand foot renders.
-
-    Three guarantees:
-    1. Cache-buster build-suffix ("0.1.0+1779915602") is split off so users
-       see a stable semver, not a unix timestamp.
-    2. Characters outside ``[0-9A-Za-z.\\-]`` are stripped before any
-       template interpolation — defense in depth against a tampered
-       ``data-version`` attribute.
-    3. Output is capped at 32 characters so a tampered attribute can't
-       blow out the sidebar layout.
-    """
-    source = APP_JS.read_text(encoding="utf-8")
-    fn_start = source.index("function _buildLayout()")
-    fn_end = source.index("\n  }", fn_start)
-    body = source[fn_start:fn_end]
-
-    # The three contracts above must all live inside _buildLayout so they
-    # cannot drift apart through partial edits.
-    assert "rawVersion.split('+')[0]" in body
-    assert "[^0-9A-Za-z.\\-]" in body
-    assert ".slice(0, 32)" in body
-
-    # And the interpolation site uses the sanitized variable, not the raw
-    # data attribute.
-    assert "${semver}" in body
-    assert "${rawVersion}" not in body

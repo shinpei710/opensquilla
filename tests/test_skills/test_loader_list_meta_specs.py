@@ -38,4 +38,4 @@ def test_list_meta_specs_includes_known_meta_bundles(loader: SkillLoader) -> Non
     names = {s.name for s in loader.list_meta_specs()}
     assert "meta-pdf-intelligence" in names
     assert "meta-travel-planner" in names
-    assert "meta-security-review-bundle" in names
+    assert "meta-web-research-to-report" in names

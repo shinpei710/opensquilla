@@ -193,7 +193,7 @@ class ModelInfo(BaseModel):
 class ChatConfig(BaseModel):
     """Runtime options for a single chat call."""
 
-    max_tokens: int = 8192
+    max_tokens: int = 16384
     temperature: float | None = None
     system: str | None = None
     stop_sequences: list[str] = []
@@ -206,6 +206,7 @@ class ChatConfig(BaseModel):
     model_capabilities: ModelCapabilities | None = None
     thinking_level: Any | None = None
     provider_request_max_chars: int = 0
+    tool_choice: Any | None = None
 
 
 # ---------------------------------------------------------------------------

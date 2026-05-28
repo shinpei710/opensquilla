@@ -70,6 +70,9 @@ def _mark_auto_enabled(home: Path, pid: str) -> None:
 def _isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Redirect ``default_opensquilla_home`` to a tmp dir so the RPC
     layer reads / writes there without touching the real ~/.opensquilla."""
+    from opensquilla.gateway.auto_propose_bridge import reset_runtime_for_test
+
+    reset_runtime_for_test()
     home = tmp_path / ".opensquilla"
     home.mkdir()
     # ``proposals_lib`` invokes ``default_opensquilla_home()`` through the

@@ -389,7 +389,7 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
                 model_id, provider_name=provider_name, base_url=base_url
             )
         else:
-            max_tokens = user_max_tokens if user_max_tokens > 0 else 8192
+            max_tokens = user_max_tokens if user_max_tokens > 0 else 16384
             context_window = 200_000
             capabilities = None
         return _ResolvedCatalog(
@@ -399,13 +399,14 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
         )
 
 class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
-    """Bind the ``TurnRunner`` helpers AgentConfig assembly needs.
+    """Bind the five ``TurnRunner`` helpers AgentConfig assembly needs.
 
     The inline body calls ``_resolve_turn_thinking(turn)``,
-    ``_resolve_memory_source_dir(agent_id)``, and reads a handful of
-    ``getattr`` values off ``_mem_cfg`` / ``_agent_token_cfg``. The adapter
-    returns a typed ``_AgentConfigAuxiliaries`` value that the stage feeds
-    straight into ``AgentConfig(...)``.
+    ``_resolve_memory_source_dir(agent_id)``, and reads
+    ``media_root_from_config(self._config) / "tool-results"`` plus a
+    handful of ``getattr`` reads off ``_mem_cfg`` / ``_agent_token_cfg``.
+    The adapter returns a typed ``_AgentConfigAuxiliaries`` value that
+    the stage feeds straight into ``AgentConfig(...)``.
     """
 
     def __init__(self, runner: TurnRunner) -> None:
@@ -419,6 +420,8 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
         session_id_for_log: str | None,
         turn: Any,
     ) -> _AgentConfigAuxiliaries:
+        from opensquilla.paths import media_root_from_config
+
         runner = self._runner
         mem_cfg = getattr(runner._config, "memory", None) if runner._config else None
         agent_token_cfg = (
@@ -430,6 +433,10 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
         return _AgentConfigAuxiliaries(
             thinking=thinking,
             flush_workspace_dir=str(runner._resolve_memory_source_dir(agent_id)),
+            tool_result_store_dir=str(
+                media_root_from_config(runner._config) / "tool-results"
+            ),
+            tool_result_store_session_id=session_id_for_log or session_key,
             flush_enabled=getattr(mem_cfg, "flush_enabled", True),
             flush_timeout_seconds=getattr(mem_cfg, "flush_timeout_seconds", 15.0),
             flush_background_timeout_seconds=getattr(
@@ -458,6 +465,21 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 agent_token_cfg,
                 "tool_result_projection_max_inline_chars",
                 60_000,
+            ),
+            tool_result_store_max_bytes=getattr(
+                agent_token_cfg,
+                "tool_result_store_max_bytes",
+                8 * 1024 * 1024,
+            ),
+            tool_result_store_disk_budget_bytes=getattr(
+                agent_token_cfg,
+                "tool_result_store_disk_budget_bytes",
+                256 * 1024 * 1024,
+            ),
+            tool_result_store_retention_seconds=getattr(
+                agent_token_cfg,
+                "tool_result_store_retention_seconds",
+                7 * 24 * 60 * 60,
             ),
         )
 
@@ -544,7 +566,6 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
             turn_call_logger=turn_call_logger,
             memory_sync_manager=memory_sync_manager,
             session_flush_service=self._runner._session_flush_service,
-            session_checkpoint_recorder=self._runner._record_checkpoint_before_compaction,
             tool_registry=self._runner._tool_registry,
             tool_context=tool_context,
         )

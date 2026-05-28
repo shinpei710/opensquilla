@@ -67,6 +67,8 @@ class _AgentConfigAuxiliaries:
 
     thinking: bool | ThinkingLevel
     flush_workspace_dir: str
+    tool_result_store_dir: str
+    tool_result_store_session_id: str
     # Memory-cfg-derived (defaults match the inline ``getattr`` defaults)
     flush_enabled: bool
     flush_timeout_seconds: float
@@ -78,6 +80,9 @@ class _AgentConfigAuxiliaries:
     flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"]
     # Agent-token-cfg-derived
     tool_result_projection_max_inline_chars: int
+    tool_result_store_max_bytes: int
+    tool_result_store_disk_budget_bytes: int
+    tool_result_store_retention_seconds: int
 
 @dataclass(frozen=True)
 class _MemorySnapshotResult:
@@ -123,7 +128,7 @@ class ModelCatalogPort(Protocol):
 
     Mirrors the inline three-call sequence with the fallback
     semantics: when ``self._model_catalog is None`` the inline body
-    computes ``max_tokens=user_override or 8192`` and
+    computes ``max_tokens=user_override or 16384`` and
     ``context_window=200_000`` and ``model_caps=None``. The adapter folds
     those defaults into the port so the stage body has no branching on
     catalog presence.
@@ -378,6 +383,16 @@ class AgentBootstrapStage:
         agent_metadata["agent_max_iterations_source"] = budgets.max_iterations_source
 
         # 4. Construct AgentConfig (declarative, single call site)
+        #
+        # ``workspace_dir`` is sourced from the per-turn metadata key
+        # ``bootstrap_workspace_dir`` (written by ``_run_pipeline`` from
+        # the call-site's ToolContext/agent-resolved value — see
+        # runtime.py initial_metadata). This makes AgentConfig.workspace_dir
+        # the single authoritative source for downstream code (meta_invoke
+        # handler, sub-Agent factory, etc.). Without this, the bootstrap
+        # stage left workspace_dir=None, the meta_invoke fallback chain
+        # collapsed to ContextVar lookups, and sub-Agents ended up using
+        # the process default workspace instead of the configured one.
         agent_config = AgentConfig(
             max_iterations=budgets.max_iterations,
             system_prompt=inp.final_prompt,
@@ -386,6 +401,7 @@ class AgentBootstrapStage:
             cache_mode=inp.turn.metadata.get("cache_mode", "off"),
             skills_context_prompt=inp.turn.metadata.get("skills_context_prompt"),
             model_id=inp.resolved_model,
+            workspace_dir=inp.turn.metadata.get("bootstrap_workspace_dir") or None,
             timeout=budgets.runtime_timeout,
             iteration_timeout=budgets.iteration_timeout,
             tool_timeout=budgets.tool_timeout,
@@ -414,6 +430,17 @@ class AgentBootstrapStage:
             thinking=aux.thinking,
             tool_result_projection_max_inline_chars=(
                 aux.tool_result_projection_max_inline_chars
+            ),
+            tool_result_store_dir=aux.tool_result_store_dir,
+            tool_result_store_session_id=aux.tool_result_store_session_id,
+            tool_result_store_session_key=inp.session_key,
+            tool_result_store_agent_id=inp.agent_id,
+            tool_result_store_max_bytes=aux.tool_result_store_max_bytes,
+            tool_result_store_disk_budget_bytes=(
+                aux.tool_result_store_disk_budget_bytes
+            ),
+            tool_result_store_retention_seconds=(
+                aux.tool_result_store_retention_seconds
             ),
             metadata=agent_metadata,
         )

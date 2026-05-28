@@ -225,7 +225,10 @@ def _synthesise_user_message(skills: list[str], freq: int, window_days: int) -> 
     msg = (
         f"auto-proposal: candidate skill chain {{{skill_list}}} observed "
         f"{freq} times in last {window_days}d. Wrap as a new bundled "
-        f"meta-skill."
+        f"meta-skill. This unattended proposal requires FULL_GATED validation: "
+        f"run acceptance comparison, runtime E2E comparison against the "
+        f"highest-tier no-meta baseline, lint, smoke, risk checks, and proposal "
+        f"persistence before any auto-enable decision."
     )
     # Loop-safety assertion — promoted to a hard check because the
     # consequence of regression is real recursion in the resolver.
@@ -727,7 +730,14 @@ async def auto_propose(
         msg = _synthesise_user_message(skills, freq, window_days)
         match = MetaMatch(
             plan=creator_plan,
-            inputs={"user_message": msg},
+            inputs={
+                "user_message": msg,
+                "system_prompt": (
+                    "Unattended meta-skill auto-propose run. Synthesize a "
+                    "low-risk reusable meta-skill from observed skill "
+                    "co-occurrence evidence and preserve all creator gates."
+                ),
+            },
         )
         before = {p.name for p in proposals_dir.iterdir()} if proposals_dir.is_dir() else set()
         try:

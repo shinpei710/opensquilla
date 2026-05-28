@@ -49,15 +49,21 @@ def get_runtime() -> AutoProposeRuntime | None:
     return _runtime
 
 
-def reset_runtime_for_test() -> None:
-    """Test helper — clears the module-level singleton between cases."""
+def reset_runtime() -> None:
+    """Clear the module-level singleton during gateway shutdown."""
     global _runtime
     _runtime = None
+
+
+def reset_runtime_for_test() -> None:
+    """Test helper — clears the module-level singleton between cases."""
+    reset_runtime()
 
 
 __all__ = [
     "AutoProposeRuntime",
     "get_runtime",
     "register_runtime",
+    "reset_runtime",
     "reset_runtime_for_test",
 ]

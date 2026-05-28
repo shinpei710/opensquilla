@@ -15,7 +15,6 @@ from opensquilla.skills.loader import SkillLoader
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLED = ROOT / "src" / "opensquilla" / "skills" / "bundled"
 DEFAULTS = {
-    "sub-agent",
     "cron",
     "deep-research",
     "docx",
@@ -26,7 +25,10 @@ DEFAULTS = {
     "http-fetch",
     "latex-compile",
     "memory",
+    "meta-arxiv-daily-digest-deck",
+    "meta-codereview-current-diff",
     "meta-compliance-audit-bundle",
+    "meta-diagram-triangulation",
     "meta-github-pr-watch-digest",
     "meta-issue-to-pr-autopilot",
     "meta-knowledge-base-bootstrap",
@@ -36,11 +38,8 @@ DEFAULTS = {
     "meta-paper-write",
     "meta-pdf-intelligence",
     "meta-pdf-reformat-pipeline",
-    "meta-scheduled-morning-digest",
-    "meta-arxiv-daily-digest-deck",
-    "meta-codereview-current-diff",
-    "meta-diagram-triangulation",
     "meta-pre-commit-quality-gate",
+    "meta-scheduled-morning-digest",
     "meta-security-review-bundle",
     "meta-skill-creator",
     "meta-spreadsheet-insight",
@@ -50,9 +49,9 @@ DEFAULTS = {
     "meta-web-to-pdf-briefing",
     "multi-search-engine",
     "nano-pdf",
-    "paper-experiment-stub",
     "paper-abstract-author",
     "paper-citation-planner",
+    "paper-experiment-stub",
     "paper-outline-author",
     "paper-plot-stub",
     "paper-preference-planner",
@@ -63,6 +62,7 @@ DEFAULTS = {
     "pdf-toolkit",
     "pptx",
     "skill-creator",
+    "sub-agent",
     "summarize",
     "tmux",
     "weather",
@@ -185,6 +185,7 @@ async def test_default_prompt_prefers_matching_meta_skills_over_direct_answers(
     prompt = ctx.system_prompt[1]
     assert "When a kind=\"meta\" entry clearly matches" in prompt
     assert "prefer `meta_invoke(name=\"<name>\")` over answering directly" in prompt
+    assert "Do not call `skill_view` for kind=\"meta\" entries" in prompt
     assert "multi-skill orchestration" in prompt
 
 

@@ -8,7 +8,6 @@ composition can rely on them.
 
 from __future__ import annotations
 
-import csv
 import json
 import shutil
 import subprocess
@@ -21,47 +20,11 @@ BUNDLED = (
 )
 
 
-def test_paper_experiment_stub_generates_csv(tmp_path: Path) -> None:
-    out = tmp_path / "results.csv"
-    script = BUNDLED / "paper-experiment-stub" / "scripts" / "gen_results.py"
-    subprocess.run(
-        [sys.executable, str(script), "--topic", "RAG benchmark", "--out", str(out)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert out.is_file()
-    rows = list(csv.reader(out.open()))
-    assert rows[0] == ["x", "y_baseline", "y_ours"]
-    assert len(rows) == 21  # header + 20 data rows
-    # y_ours must be ≥ y_baseline for every row (the stub's only invariant).
-    for row in rows[1:]:
-        assert float(row[2]) >= float(row[1])
-
-
-def test_paper_plot_stub_produces_pdf(tmp_path: Path) -> None:
-    pytest = __import__("pytest")
-    try:
-        import matplotlib  # noqa: F401
-    except ImportError:
-        pytest.skip("matplotlib not installed in this environment")
-
-    csv_path = tmp_path / "results.csv"
-    csv_path.write_text(
-        "x,y_baseline,y_ours\n1,0.50,0.60\n2,0.52,0.65\n3,0.55,0.70\n",
-        encoding="utf-8",
-    )
-    out = tmp_path / "fig.pdf"
-    script = BUNDLED / "paper-plot-stub" / "scripts" / "plot.py"
-    subprocess.run(
-        [sys.executable, str(script), str(csv_path), "--out", str(out)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    assert out.is_file()
-    # Sanity-check the PDF magic header.
-    assert out.read_bytes()[:4] == b"%PDF"
+# The paper-experiment-stub and paper-plot-stub skills were removed
+# when meta-paper-write was rewritten to design experiments at the
+# LLM level and render zero-dependency LaTeX placeholder figures /
+# tables. The unit tests that exercised those stubs (fake CSV +
+# matplotlib chart) are gone with them.
 
 
 def test_paper_refbib_stub_emits_bibtex_from_stdin_json(tmp_path: Path) -> None:
@@ -107,27 +70,85 @@ def test_meta_paper_write_declares_long_paper_generation_contract() -> None:
     assert "{{ with.max_results | default(25) }}" in search
     assert "10+ page" in outline
     assert "20+ distinct citation keys" in outline
-    assert "10+ compiled pages" in section
-    assert "at least 20 distinct citation keys" in section
+    assert "writing-plan-derived" in section
+    assert "Do not impose a fixed page count" in section
+    assert "Write only the assigned section" in section
+    assert "lower-bound delivery budget" in section
+    assert "related_work" in section
+    assert "conclusion" in section
+    assert "Do not call tools" in section
+    assert "organize by methodology or claim axis" in section
+    assert "no invented results" in section
     assert "{{ outputs.refbib | truncate(8000) }}" in meta
+
+
+def test_paper_section_author_preserves_math_delimiters() -> None:
+    section = (BUNDLED / "paper-section-author" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "Do NOT escape math delimiter dollars" in section
+    assert "\\( ... \\)" in section
 
 
 def test_meta_paper_write_declares_quality_pipeline_stages() -> None:
     meta = (BUNDLED / "meta-paper-write" / "SKILL.md").read_text(encoding="utf-8")
 
+    # Search + bibliography pipeline.
     assert "multi-search-engine" in meta
-    assert "paper-experiment-stub" in meta
     assert "paper-refbib-stub" in meta
-    assert "paper-plot-stub" in meta
-    assert "Save as `paper_preferences`" in meta
+    assert "site:arxiv.org" in meta  # academic-site bias on search query
+    # Core LLM-driven design stages.
+    assert "paper_preferences" in meta
     assert "{{ outputs.paper_preferences | truncate(2000) }}" in meta
-    assert "Save as `source_pack`" in meta
-    assert "Save as `citation_plan`" in meta
+    assert "source_pack" in meta
+    assert "experiment_design" in meta
+    assert "FIGURE_PLAN:" in meta
+    assert "TABLE_PLAN:" in meta
+    assert "ANALYSIS_DIMENSIONS:" in meta
+    assert "figure_placeholders" in meta
+    assert "table_placeholders" in meta
+    assert "analysis_outline" in meta
+    assert "citation_plan" in meta
     assert "final_manuscript_package" in meta
-    assert "10+ compiled pages" in meta
-    assert "20 distinct citation keys" in meta
-    assert "Do not run xelatex in the" in meta
-    assert "default meta-skill path" in meta
+    # Citation provenance audit + strict citation contract.
+    assert "citation_map" in meta
+    assert "DO NOT invent cite keys" in meta
+    assert "Source Quality" in meta
+    # Quality bar / mode behavior.
+    assert "CITATION_TARGET" in meta
+    assert "LENGTH_STRATEGY" in meta
+    assert "do not enforce a fixed count" in meta
+    assert "default FULL_MANUSCRIPT" in meta
+    assert "compiled PDF" in meta
+    assert "refuses to create degraded PDF" in meta
+
+
+def test_meta_paper_write_plans_user_requested_page_target_up_front() -> None:
+    meta = (BUNDLED / "meta-paper-write" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "TARGET_PAGES:" in meta
+    assert "This writing plan is the length-control point" in meta
+    assert "allocating enough section scope" in meta
+    assert "minimum total target_words" in meta
+    assert "PER_SECTION_BLUEPRINT.*.target_words" in meta
+    assert "target_words from writing_plan" in meta
+    assert "PDF_PAGE_TARGET_NOT_MET" not in meta
+    assert "LENGTH_GATE: fail" not in meta
+
+
+def test_meta_paper_write_pushes_length_into_plan_and_section_prompts() -> None:
+    meta = (BUNDLED / "meta-paper-write" / "SKILL.md").read_text(encoding="utf-8")
+    section = (BUNDLED / "paper-section-author" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "TARGET_PAGES × 820" in meta
+    assert "TARGET_PAGES × 760" in meta
+    assert "target_words is a lower-bound writing budget" in meta
+    assert "at least 90% of target_words" in meta
+    assert "Do not return an undersized section" in meta
+    assert "lower-bound delivery budget" in section
+    assert "below 90% of target_words" in section
+    assert "Expand before replying" in section
+    assert "short, complete, well-cited section" not in section
+    assert "repeated context compaction" not in section
 
 
 def test_paper_preference_planner_declares_two_generation_modes() -> None:

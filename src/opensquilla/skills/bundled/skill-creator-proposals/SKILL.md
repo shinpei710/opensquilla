@@ -20,6 +20,12 @@ entrypoint:
     - "{{ with.lint_result | default('{}') }}"
     - --smoke-result
     - "{{ with.smoke_result | default('{}') }}"
+    - --creator-mode
+    - "{{ with.creator_mode | default('') }}"
+    - --acceptance-result
+    - "{{ with.acceptance_result | default('') }}"
+    - --runtime-e2e-result
+    - "{{ with.runtime_e2e_result | default('') }}"
   parse: json
   timeout: 30
 ---
@@ -30,7 +36,7 @@ CRUD for meta-skill proposal candidates at `~/.opensquilla/proposals/<id>/`.
 
 ## Actions
 
-- `write_proposal --skill-md path --lint-result json --smoke-result json` — atomic write to `~/.opensquilla/proposals/<uuid8>/{SKILL.md,gates.json}`. Returns `{proposal_id, auto_enable_eligible}`.
+- `write_proposal --skill-md path --lint-result json --smoke-result json [--creator-mode FULL_GATED --acceptance-result text --runtime-e2e-result json]` — atomic write to `~/.opensquilla/proposals/<uuid8>/{SKILL.md,gates.json}`. Returns `{proposal_id, auto_enable_eligible}`. In `FULL_GATED` mode runtime E2E must show the meta-skill route wins or ties against the no-meta highest-tier baseline with no regressions.
 - `list` — enumerate proposals with their eligibility flag
 - `accept --proposal-id <id> [--force]` — move proposal to `~/.opensquilla/skills/<name>/` so it gets loaded by MANAGED layer; refuses if any gate failed (unless `--force`)
 

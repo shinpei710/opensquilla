@@ -794,6 +794,8 @@ class OpenAIProvider:
             payload["stop"] = cfg.stop_sequences
         if tools:
             payload["tools"] = [_build_openai_tool(t) for t in tools]
+            if cfg.tool_choice is not None:
+                payload["tool_choice"] = cfg.tool_choice
         if self._provider_kind == "openrouter":
             pinned_provider = self._provider_routing.get(self._model)
             if pinned_provider:
@@ -962,12 +964,27 @@ class OpenAIProvider:
                             response.status_code,
                             body,
                         )
+                        # Diagnostic: dump payload head (no auth headers)
+                        # so 400s from picky upstreams are debuggable. Truncated
+                        # to keep memory low.
+                        _body_text = (
+                            body.decode("utf-8", errors="replace")
+                            if isinstance(body, bytes) else str(body)
+                        )
+                        try:
+                            _payload_head = json.dumps(
+                                payload, ensure_ascii=False,
+                            )[:4000]
+                        except Exception:  # noqa: BLE001
+                            _payload_head = repr(payload)[:4000]
                         log.warning(
                             "provider.chat_http_error",
                             provider=self._provider_kind,
                             model=self._model,
                             status_code=response.status_code,
                             message=message,
+                            response_body=_body_text[:2000],
+                            request_payload_head=_payload_head,
                         )
                         yield ErrorEvent(
                             message=message,

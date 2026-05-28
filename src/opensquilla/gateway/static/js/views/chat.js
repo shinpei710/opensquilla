@@ -151,6 +151,7 @@ const ChatView = (() => {
   let _thinkingTimerInterval = null;
   let _thinkingDelayTimer = null;
   const _THINKING_DELAY_MS = 400;  // don't show for fast responses
+  const _THINKING_TTL_MS = 60000;  // 60s auto-hide
   // kept in sync with stream.py WaitingIndicator._verbs
   const SQUILLA_VERBS = ['Watching','Tracking','Sensing','Pulsing','Thinking','Drafting','Polishing'];
   const SQUILLA_DWELL_MS = 2500;
@@ -289,6 +290,7 @@ const ChatView = (() => {
     memory_store: '\uD83E\uDDE0', // 🧠
   };
   function _toolEmoji(name) {
+    if (name && name.startsWith('meta-step:')) return '⚙️'; // ⚙️ meta-skill step
     return _TOOL_EMOJI[name] || '\u26A1'; // ⚡ default
   }
 
@@ -447,30 +449,10 @@ const ChatView = (() => {
 
   /* ── Welcome / empty-state card ──────────────────────────────────────── */
 
-  // Empty state — structured but quiet: a small signal-bar mark + a one-line
-  // title + a hint row of keyboard shortcuts. The textarea below remains the
-  // primary entry point, so this card uses subdued contrast and no actions.
-  // Outer `.chat-empty` class is preserved because chat.js elsewhere selects
-  // and removes it when the first message arrives.
+  // Empty state — a single muted line, no interactive elements. The textarea
+  // below is the entry point; the empty thread shouldn't compete with it.
   function _emptyStateHTML() {
-    // Title is a styled <p>, not <h2>, so it stays out of the page's heading
-    // outline — the chat surface has no <h1> and other views reserve <h2> for
-    // content sections; using <h2> here would imply a structural section that
-    // isn't there. .chat-empty stays as the outer class so existing
-    // remove-on-first-message selectors still find this node.
-    return ''
-      + '<div class="chat-empty" role="status">'
-      +   '<div class="chat-empty__mark" aria-hidden="true">'
-      +     '<span class="chat-empty__bar"></span>'
-      +     '<span class="chat-empty__bar"></span>'
-      +     '<span class="chat-empty__bar"></span>'
-      +   '</div>'
-      +   '<p class="chat-empty__title">Start a conversation</p>'
-      +   '<p class="chat-empty__hint">Type below, or paste an image or file. '
-      +     '<kbd>↑</kbd> recalls history · <kbd>Esc</kbd> aborts a running turn · '
-      +     '<kbd>/</kbd> opens slash commands.'
-      +   '</p>'
-      + '</div>';
+    return '<div class="chat-empty">No messages yet.</div>';
   }
 
   /* ── Per-bubble hover action row (Copy / Regenerate / Edit) ───────── */
@@ -967,7 +949,7 @@ const ChatView = (() => {
           <div class="chat-header-left">
             <label class="chat-label">Chat session</label>
             <button type="button" class="chat-session-chip" id="chat-session-chip"
-                    aria-label="Switch chat session: ${_esc(_sessionKey)}" aria-haspopup="dialog" aria-expanded="false">
+                    aria-label="Switch chat session" aria-haspopup="dialog" aria-expanded="false">
               <span class="chat-session-chip-key" id="chat-session-chip-key" title="${_esc(_sessionKey)}">${_esc(_sessionKey)}</span>
               <span class="chat-session-chip-caret" aria-hidden="true">${_iconChevronDown()}</span>
             </button>
@@ -1237,13 +1219,11 @@ const ChatView = (() => {
     const previousKey = _sessionKey;
     _sessionKey = key;
     const chipKey = _el && _el.querySelector('#chat-session-chip-key');
-    const chip = _el && _el.querySelector('#chat-session-chip');
     const copyBtn = _el && _el.querySelector('#chat-session-copy');
     if (chipKey) {
       chipKey.textContent = key;
       chipKey.title = key;
     }
-    if (chip) chip.setAttribute('aria-label', 'Switch chat session: ' + key);
     if (copyBtn) copyBtn.title = 'Copy session key: ' + key;
     // Drop every router strip that belonged to the previous session
     // the moment the chip flips, even before the new session's
@@ -1697,22 +1677,10 @@ const ChatView = (() => {
     trigger.classList.toggle('is-glowing', _toolbarTriggerActive());
     // Per-toggle status dots — each lights independently so a glance at the
     // composer reveals which mode is non-default, not just that something is.
-    const effectiveMode = _effectiveElevatedMode();
-    const bypass = _isApprovalBypassMode(effectiveMode);
+    const bypass = !!_toolbarState.bypass;
     const routerOff = _toolbarState.router === false;
     trigger.classList.toggle('has-dot-bypass', bypass);
     trigger.classList.toggle('has-dot-router', routerOff);
-    const bypassLabel = effectiveMode === 'full' ? 'FULL' : 'BYPASS';
-    const signalParts = [];
-    if (effectiveMode === 'full') {
-      signalParts.push(`${bypassLabel}: Full permission mode active`);
-    } else if (bypass) {
-      signalParts.push(`${bypassLabel}: Approvals bypassed`);
-    }
-    if (routerOff) signalParts.push('router off');
-    const statusLabel = signalParts.length ? `Run modes: ${signalParts.join(', ')}` : 'Run modes';
-    trigger.setAttribute('aria-label', statusLabel);
-    trigger.title = statusLabel;
   }
 
   function _bindToolbarTrigger() {
@@ -2393,7 +2361,25 @@ const ChatView = (() => {
   async function _subscribeSession() {
     if (!_rpc || !_sessionKey) return;
     try {
-      await _refreshSessionRunState();
+      await _rpc.waitForConnection();
+      const params = { key: _sessionKey };
+      params.since_stream_seq = _lastStreamSeq;
+      const res = await _rpc.call('sessions.messages.subscribe', params);
+      if (res && res.subscribed === false) throw new Error('No subscription manager available');
+      _applySessionRunState(res);
+      if (res && res.replay_complete === false) {
+        _lastStreamSeq = typeof res.current_stream_seq === 'number'
+          ? Math.max(_lastStreamSeq, res.current_stream_seq)
+          : _lastStreamSeq;
+        UI.toast('Session stream gap detected; reloading transcript.', 'warn', 5000);
+        _loadHistory();
+      } else if (
+        res
+        && typeof res.current_stream_seq === 'number'
+        && Number(res.replayed_count || 0) <= 0
+      ) {
+        _lastStreamSeq = Math.max(_lastStreamSeq, res.current_stream_seq);
+      }
       if (_isStreaming) _resetStreamIdleTimer();
     } catch (err) {
       UI.toast('Session stream subscription failed: ' + (err?.message || err), 'err', 6000);
@@ -2612,7 +2598,6 @@ const ChatView = (() => {
       4500,
     );
   }
-
 
   /* ── Router slider — arcade-brutalist whac-a-mole grid ─────────────
    * Fires once per user message when session.event.router_decision
@@ -3305,16 +3290,6 @@ const ChatView = (() => {
     window.addEventListener('opensquilla:approvals-pending', approvalsPendingListener);
     _unsubs.push(() => window.removeEventListener('opensquilla:approvals-pending', approvalsPendingListener));
 
-    // Router decision: fires once per user message, right after the
-    // pre-turn pipeline picks a tier and before the first text_delta.
-    // Drops a per-turn inline slider above where the assistant bubble
-    // will appear and sweeps the selector onto the routed tier.
-    _unsubs.push(_rpc.on('session.event.router_decision', (payload) => {
-      if (_isStaleEpoch(payload)) return;
-      if (!_acceptStreamSeq(payload)) return;
-      _handleRouterDecision(payload);
-    }));
-
     // Text delta: accumulate into streaming bubble
     _unsubs.push(_rpc.on('session.event.text_delta', (payload) => {
       if (_isStaleEpoch(payload)) return;
@@ -3561,16 +3536,8 @@ const ChatView = (() => {
         // replays the terminal done frame.
         const _finishedBubble = _streamBubble;
         const _doneWasAborted = payload?.reason === 'aborted';
-        // Promote any live router strip to a persisted strip: data-live
-        // is cleared so the next live decision's cleanup doesn't see
-        // it as a stale in-progress strip. The strip stays in DOM
-        // until the next history sync, which will replace it with a
-        // freshly built strip carrying the SAME seed (resolved from
-        // localStorage), so the swap is visually invisible.
         const settledStrip = _routerFxFindAttachedStrip(_finishedBubble);
-        if (settledStrip) {
-          delete settledStrip.dataset.live;
-        }
+        if (settledStrip) delete settledStrip.dataset.live;
         _endStreaming(_doneWasAborted ? { reason: 'aborted' } : undefined);
 
         // Populate savings indicator if data exists
@@ -3799,13 +3766,9 @@ const ChatView = (() => {
       const empty = _thread.querySelector('.chat-empty');
       if (empty) empty.remove();
       _thread.querySelectorAll('.chat-day-sep').forEach((el) => el.remove());
-      // Drop EVERY router strip that isn't currently being animated.
-      // The rebuild loop re-inserts each turn's strip with a seed
-      // resolved from localStorage, so the recreated DOM has the
-      // exact same cell layout — no visible reorder, but every
-      // stale strip (cross-session leftovers, tier-id strips built
-      // before config loaded, half-rebuilt duplicates) is guaranteed
-      // gone. Only the in-flight live animation is preserved.
+      // Drop every stale router strip that isn't currently being animated or
+      // already anchored for this session/turn. The rebuild loop reuses
+      // settled strips so live → history sync does not replay the animation.
       _thread.querySelectorAll('.router-fx').forEach((el) => {
         if (el.dataset.live === 'true') return;
         if (el.dataset.sessionKey === (_sessionKey || '') && el.dataset.turnIndex) return;
@@ -3820,8 +3783,7 @@ const ChatView = (() => {
       // 1-indexed running count of user messages seen so far during
       // this rebuild. The router strip's localStorage seed cache is
       // keyed by (sessionKey, userMsgIndex, tier); using this counter
-      // (instead of msg.timestamp) means live + history rebuilds for
-      // the same turn always hit the same cache entry.
+      // means live + history rebuilds for the same turn reuse the same layout.
       let _histUserIdx = 0;
       const consumedHistoryElements = new Set();
       messages.forEach((msg) => {
@@ -3949,16 +3911,11 @@ const ChatView = (() => {
         if (_isStreaming && el === _streamBubble) return;
         if (!consumedHistoryElements.has(el)) el.remove();
       });
-      // Orphan sweep — a router strip is only valid when its
-      // immediate previous sibling is a user message. Anything else
-      // is leftover (WS replay before history loaded, mistimed event,
-      // dangling DOM from a partial render) and gets removed.
       _thread.querySelectorAll('.router-fx').forEach((el) => {
-        const prev = el.previousElementSibling;
-        const isAnchored = prev && prev.classList
-          && (prev.classList.contains('user')
-              || prev.getAttribute('data-history-role') === 'user');
-        if (!isAnchored) el.remove();
+        if (el.dataset.live === 'true') return;
+        const turnIndex = el.dataset.turnIndex || '';
+        if (el.dataset.sessionKey === (_sessionKey || '') && turnIndex) return;
+        el.remove();
       });
       _lastSavingsPopupIdentity = historySavingsIdentity;
       _scrollToBottom();
@@ -4160,7 +4117,6 @@ const ChatView = (() => {
     const now = new Date().toISOString();
     const userText = text;
     const providerText = text || 'Describe these attachments';
-    const sentAttachments = _pendingAttachments.slice();
     _messages.push({ role: 'user', text: userText, ts: now });
 
     // Show user message
@@ -4210,21 +4166,6 @@ const ChatView = (() => {
 
     // Send
     _rpc.call('chat.send', params).then((res) => {
-      if (res && res.ok === false) {
-        _endStreaming();
-        if (!_textarea.value.trim() && userText) {
-          _textarea.value = userText;
-          _autoResizeTextarea();
-        }
-        if (_pendingAttachments.length === 0 && sentAttachments.length > 0) {
-          _pendingAttachments = sentAttachments;
-          _renderAttachmentPreview();
-        }
-        _addMessage('error', _chatSendFailureMessage(res));
-        _applySessionRunState({ run_status: 'failed', last_task: { ...(res || {}), status: 'failed' } });
-        _scheduleHistorySync();
-        return;
-      }
       if (res && res.sessionKey && res.sessionKey !== _sessionKey) _persistSession(res.sessionKey);
     }).catch((err) => {
       _endStreaming();
@@ -4254,57 +4195,12 @@ const ChatView = (() => {
     _clearStreamIdleTimer();
     if (!_isStreaming || _streamIdlePausedForApproval) return;
     _streamIdleTimer = setTimeout(() => {
-      void _handleStreamIdleTimeout();
-    }, _streamIdleTimeoutMs);
-  }
-
-  function _serverRunStateIsActive(payload) {
-    const runStatus = String(payload?.run_status || '').toLowerCase();
-    const taskStatus = String(payload?.active_task?.status || '').toLowerCase();
-    return runStatus === 'running'
-      || runStatus === 'queued'
-      || taskStatus === 'running'
-      || taskStatus === 'queued';
-  }
-
-  async function _refreshSessionRunState() {
-    if (!_rpc || !_sessionKey) return null;
-    await _rpc.waitForConnection();
-    const params = { key: _sessionKey };
-    params.since_stream_seq = _lastStreamSeq;
-    const res = await _rpc.call('sessions.messages.subscribe', params);
-    if (res && res.subscribed === false) throw new Error('No subscription manager available');
-    _applySessionRunState(res);
-    if (res && res.replay_complete === false) {
-      _lastStreamSeq = typeof res.current_stream_seq === 'number'
-        ? Math.max(_lastStreamSeq, res.current_stream_seq)
-        : _lastStreamSeq;
-      UI.toast('Session stream gap detected; reloading transcript.', 'warn', 5000);
-      _loadHistory();
-    } else if (res && typeof res.current_stream_seq === 'number') {
-      _lastStreamSeq = Math.max(_lastStreamSeq, res.current_stream_seq);
-    }
-    return res;
-  }
-
-  async function _handleStreamIdleTimeout() {
-    if (!_isStreaming || _streamIdlePausedForApproval) return;
-    try {
-      const res = await _refreshSessionRunState();
-      if (!_isStreaming || _streamIdlePausedForApproval) return;
-      if (_serverRunStateIsActive(res)) {
-        _resetStreamIdleTimer();
-        return;
+      if (_isStreaming && !_streamIdlePausedForApproval) {
+        _endStreaming();
+        const seconds = Math.round(_streamIdleTimeoutMs / 1000);
+        _addMessage('error', `Response timed out — no events received for ${seconds}s`);
       }
-    } catch (err) {
-      UI.toast('Session stream status check failed: ' + (err?.message || err), 'warn', 5000);
-      if (!_isStreaming || _streamIdlePausedForApproval) return;
-      _resetStreamIdleTimer();
-      return;
-    }
-    _endStreaming();
-    const seconds = Math.round(_streamIdleTimeoutMs / 1000);
-    _addMessage('error', `Response timed out — no events received for ${seconds}s`);
+    }, _streamIdleTimeoutMs);
   }
 
   function _applyRpcPolicy(policy) {
@@ -4405,34 +4301,6 @@ const ChatView = (() => {
     return 'Agent error';
   }
 
-  function _chatSendFailureMessage(payload) {
-    if (typeof payload?.user_message === 'string' && payload.user_message.trim()) {
-      return payload.user_message.trim();
-    }
-    if (typeof payload?.message === 'string' && payload.message.trim()) {
-      return payload.message.trim();
-    }
-    const error = payload?.error;
-    if (error && typeof error === 'object') {
-      if (typeof error.message === 'string' && error.message.trim()) {
-        return error.message.trim();
-      }
-      if (typeof error.reason === 'string' && error.reason.trim()) {
-        return error.reason.trim();
-      }
-      if (typeof error.code === 'string' && error.code.trim()) {
-        return error.code.trim();
-      }
-    }
-    if (typeof payload?.reason === 'string' && payload.reason.trim()) {
-      return payload.reason.trim();
-    }
-    if (typeof payload?.error_class === 'string' && payload.error_class.trim()) {
-      return payload.error_class.trim();
-    }
-    return 'Send failed before the agent task started.';
-  }
-
   function _acceptStreamSeq(payload) {
     const seq = payload && payload.stream_seq;
     if (typeof seq !== 'number' || !Number.isFinite(seq)) return true;
@@ -4519,6 +4387,11 @@ const ChatView = (() => {
       const v = SQUILLA_VERBS[Math.floor(eMs / SQUILLA_DWELL_MS) % SQUILLA_VERBS.length];
       const label = _thinkingEl.querySelector('.thinking-elapsed');
       if (label) label.textContent = `${v} (${s}s)`;
+
+      if (s >= _THINKING_TTL_MS / 1000) {
+        _hideThinkingIndicator();
+        _addMessage('system', 'Still waiting for agent response\u2026');
+      }
     }, 1000);
   }
 
@@ -4799,6 +4672,12 @@ const ChatView = (() => {
       const target = _publishArtifactTargetName(input);
       if (target) return `${name} - ${target}`;
     }
+    // Meta-skill step: render as a clean step name (drop the 'meta-step:'
+    // prefix and replace underscores with spaces).
+    if (name && name.startsWith('meta-step:')) {
+      const stepId = name.slice('meta-step:'.length);
+      return 'Step · ' + stepId.replace(/_/g, ' ');
+    }
     return name || 'tool';
   }
 
@@ -4811,6 +4690,10 @@ const ChatView = (() => {
 
     const details = document.createElement('details');
     details.className = 'chat-tools-collapse' + (isRunning ? ' chat-tools-collapse--running' : '');
+    // Auto-open meta-skill step cards so the spinner border + body are
+    // visible while the step is running. (Generic tools stay collapsed
+    // by default to keep the chat tidy.)
+    if (name && name.startsWith('meta-step:')) details.setAttribute('open', '');
     if (toolId) details.setAttribute('data-tool-id', toolId);
     details.setAttribute('data-tool-name', name || 'tool');
 
@@ -4841,6 +4724,24 @@ const ChatView = (() => {
     details.appendChild(summary);
     details.appendChild(toolsBody);
     return details;
+  }
+
+  function _retitleToolCallDOM(details, name, input) {
+    if (!details || !name) return;
+    const current = details.getAttribute('data-tool-name') || '';
+    if (current === name) return;
+    details.setAttribute('data-tool-name', name);
+    const summary = details.querySelector('.chat-tools-summary');
+    if (!summary) return;
+    const providerBadge = summary.querySelector('.chat-tool-provider');
+    if (providerBadge) providerBadge.remove();
+    summary.textContent = '';
+    const iconSpan = document.createElement('span');
+    iconSpan.className = 'chat-tools-icon';
+    iconSpan.textContent = _toolEmoji(name);
+    summary.appendChild(iconSpan);
+    summary.appendChild(document.createTextNode(' ' + _toolDisplayName(name, input)));
+    if (providerBadge) summary.appendChild(providerBadge);
   }
 
   function _findToolDetailsById(root, toolId) {
@@ -4961,6 +4862,7 @@ const ChatView = (() => {
   function _appendToolCall(payload) {
     if (!payload) return;
     const name = payload.name || payload.tool_name || 'tool';
+    try { if (name && name.startsWith('meta-step:')) console.log('[meta-step] start', name); } catch (e) {}
     const input = typeof payload.input === 'string'
       ? payload.input
       : JSON.stringify(payload.input || payload.arguments || '', null, 2);
@@ -4993,6 +4895,34 @@ const ChatView = (() => {
 
   function _appendToolResult(payload) {
     if (!payload) return;
+
+    // PR5: meta-skill user_input paused signal — render a clickable form
+    // instead of a plain tool-result card. The scheduler emits this with
+    // arguments.kind === 'user_input' and arguments.clarify_schema as the
+    // surface protocol payload (see clarify_schema.schema_to_protocol).
+    const _args = payload && payload.arguments;
+    // Diagnostic: log every tool_result event so the form-card branch
+    // can be debugged from the browser console.
+    try {
+      console.log('[clarify-debug] tool_result', {
+        tool_name: payload && payload.tool_name,
+        args_kind: _args && _args.kind,
+        args_paused: _args && _args.paused,
+        has_schema: !!(_args && _args.clarify_schema),
+        payload: payload,
+      });
+    } catch (e) {}
+    if (
+      _args
+      && _args.kind === 'user_input'
+      && _args.paused === true
+      && _args.clarify_schema
+    ) {
+      try { console.log('[clarify-debug] firing _appendClarifyForm'); } catch (e) {}
+      _appendClarifyForm(payload, _args);
+      return;
+    }
+
     const raw = payload.result || payload.content || payload.output || '';
     const content = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
     const isError = _toolResultIsError(payload);
@@ -5007,6 +4937,7 @@ const ChatView = (() => {
     if (toolId) {
       const details = _findToolDetailsById(body, toolId);
       if (details) {
+        if (toolName) _retitleToolCallDOM(details, toolName, payload.arguments || payload.input || '');
         toolName = toolName || details.getAttribute('data-tool-name') || '';
         details.classList.remove('chat-tools-collapse--running');
         details.classList.add(_toolResultStateClass(payload));
@@ -5045,6 +4976,197 @@ const ChatView = (() => {
     if (toolId) resultDiv.setAttribute('data-tool-result-for', toolId);
     resultTarget.appendChild(resultDiv);
     if (_autoScroll) _scrollToBottom();
+  }
+
+  // ── PR5: meta-skill user_input form rendering ──
+
+  function _appendClarifyForm(payload, args) {
+    // The scheduler payload carries:
+    //   args.clarify_schema = { mode, intro, fields, cancel_keywords,
+    //                            timeout_hours, nl_extract }
+    //   args.run_id         = awaiting run identifier
+    //   args.step           = user_input step id
+    const schema = args.clarify_schema || {};
+    const runId = args.run_id || '';
+    const fields = Array.isArray(schema.fields) ? schema.fields : [];
+
+    const bubble = _ensureStreamBubble();
+    const body = bubble.querySelector('.msg-body');
+
+    const card = document.createElement('div');
+    card.className = 'clarify-form chat-tools-collapse';
+    card.setAttribute('data-clarify-step', args.step || '');
+    card.setAttribute('data-clarify-run', runId);
+
+    const header = document.createElement('div');
+    header.className = 'clarify-form-header';
+    header.textContent = '请确认以下信息';
+    card.appendChild(header);
+
+    if (schema.intro) {
+      const intro = document.createElement('div');
+      intro.className = 'clarify-form-intro';
+      // schema.intro is xml_escape'd server-side; safe as textContent.
+      intro.textContent = schema.intro;
+      card.appendChild(intro);
+    }
+
+    const form = document.createElement('form');
+    form.className = 'clarify-form-fields';
+    form.setAttribute('novalidate', '');
+
+    fields.forEach((field) => {
+      const row = document.createElement('div');
+      row.className = 'clarify-form-row';
+
+      const label = document.createElement('label');
+      label.className = 'clarify-form-label';
+      const requiredFlag = field.required ? ' *' : '';
+      label.textContent = (field.prompt || field.name) + requiredFlag;
+      label.setAttribute('for', 'clarify-' + field.name);
+      row.appendChild(label);
+
+      let input;
+      if (field.type === 'enum' && Array.isArray(field.choices)) {
+        input = document.createElement('select');
+        if (!field.required) {
+          const blank = document.createElement('option');
+          blank.value = '';
+          blank.textContent = field.default ? '(默认: ' + field.default + ')' : '(可选)';
+          input.appendChild(blank);
+        }
+        field.choices.forEach((choice) => {
+          const opt = document.createElement('option');
+          opt.value = choice;
+          opt.textContent = choice;
+          if (field.default === choice) opt.selected = true;
+          input.appendChild(opt);
+        });
+      } else if (field.type === 'bool') {
+        input = document.createElement('select');
+        ['', 'true', 'false'].forEach((v) => {
+          const opt = document.createElement('option');
+          opt.value = v;
+          opt.textContent = v === '' ? '(未选)' : v;
+          if (field.default === (v === 'true')) opt.selected = true;
+          input.appendChild(opt);
+        });
+      } else if (field.type === 'int') {
+        input = document.createElement('input');
+        input.type = 'number';
+        if (field.min !== undefined && field.min !== null) input.min = String(field.min);
+        if (field.max !== undefined && field.max !== null) input.max = String(field.max);
+        if (field.default !== undefined && field.default !== null) {
+          input.value = String(field.default);
+        }
+      } else {
+        input = document.createElement('input');
+        input.type = 'text';
+        if (field.max_chars) input.maxLength = field.max_chars;
+        if (field.default) input.value = String(field.default);
+      }
+      input.className = 'clarify-form-input';
+      input.id = 'clarify-' + field.name;
+      input.setAttribute('data-clarify-field', field.name);
+      input.setAttribute('data-clarify-type', field.type);
+      if (field.required) input.setAttribute('data-clarify-required', '1');
+      row.appendChild(input);
+      form.appendChild(row);
+    });
+
+    const actions = document.createElement('div');
+    actions.className = 'clarify-form-actions';
+
+    const submitBtn = document.createElement('button');
+    submitBtn.type = 'submit';
+    submitBtn.className = 'clarify-form-submit';
+    submitBtn.textContent = '提交';
+    actions.appendChild(submitBtn);
+
+    const cancelKeyword = (
+      Array.isArray(schema.cancel_keywords) && schema.cancel_keywords.length > 0
+        ? schema.cancel_keywords[0]
+        : ''
+    );
+    if (cancelKeyword) {
+      const cancelBtn = document.createElement('button');
+      cancelBtn.type = 'button';
+      cancelBtn.className = 'clarify-form-cancel';
+      cancelBtn.textContent = '取消';
+      cancelBtn.addEventListener('click', () => {
+        const sessionKey = _currentSessionKey();
+        _rpc.call('chat.send', {
+          message: cancelKeyword,
+          sessionKey: sessionKey,
+          intent: 'clarify_cancel',
+        }).catch((err) => {
+          UI.toast('取消失败: ' + (err && err.message || err), 'error');
+        });
+        submitBtn.disabled = true;
+        cancelBtn.disabled = true;
+      });
+      actions.appendChild(cancelBtn);
+    }
+    form.appendChild(actions);
+
+    form.addEventListener('submit', (evt) => {
+      evt.preventDefault();
+      const collected = {};
+      let firstErrorEl = null;
+      form.querySelectorAll('[data-clarify-field]').forEach((el) => {
+        const name = el.getAttribute('data-clarify-field');
+        const type = el.getAttribute('data-clarify-type');
+        const required = el.getAttribute('data-clarify-required') === '1';
+        let value = el.value;
+        if (typeof value === 'string') value = value.trim();
+        if (value === '' || value === null) {
+          if (required && !firstErrorEl) firstErrorEl = el;
+          return; // omit empty (RPC handler skips empties)
+        }
+        if (type === 'int') {
+          const parsed = parseInt(value, 10);
+          if (Number.isNaN(parsed)) {
+            if (!firstErrorEl) firstErrorEl = el;
+            return;
+          }
+          collected[name] = parsed;
+        } else if (type === 'bool') {
+          collected[name] = (value === 'true');
+        } else {
+          collected[name] = value;
+        }
+      });
+      if (firstErrorEl) {
+        firstErrorEl.focus();
+        UI.toast('请检查必填字段', 'warn');
+        return;
+      }
+      if (Object.keys(collected).length === 0) {
+        UI.toast('请至少填写一个字段', 'warn');
+        return;
+      }
+      submitBtn.disabled = true;
+      const sessionKey = _currentSessionKey();
+      _rpc.call('chat.clarify_submit', {
+        sessionKey: sessionKey,
+        run_id: runId,
+        fields: collected,
+      }).catch((err) => {
+        submitBtn.disabled = false;
+        UI.toast('提交失败: ' + (err && err.message || err), 'error');
+      });
+    });
+
+    card.appendChild(form);
+    body.appendChild(card);
+    if (_autoScroll) _scrollToBottom();
+  }
+
+  function _currentSessionKey() {
+    // Read the module-private _sessionKey populated at chat init / nav
+    // (see ~line 12, 890, 933). Fallback to the documented WebChat
+    // default if not yet set (rare race during very first paint).
+    return _sessionKey || 'default';
   }
 
   function _appendArtifact(payload) {
@@ -5269,10 +5391,12 @@ const ChatView = (() => {
           const toolId = seg.tool_use_id || '';
           const isError = _toolResultIsError(seg);
           const content = seg.result || '';
+          const resultToolName = seg.name || _toolNameById[toolId] || '';
 
           if (toolId) {
             const details = _findToolDetailsById(body, toolId);
             if (details) {
+              _retitleToolCallDOM(details, resultToolName, seg.input || '');
               details.classList.remove('chat-tools-collapse--running');
               details.classList.add(_toolResultStateClass(seg));
               const toolsBody = details.querySelector('.chat-tools-body');
@@ -5282,7 +5406,7 @@ const ChatView = (() => {
                 content,
                 isError,
                 _toolResultIsTruncated(seg),
-                _toolNameById[toolId] || ''
+                resultToolName
               );
               if (resultDiv) {
                 resultDiv.setAttribute('data-tool-result-for', toolId);
@@ -5290,7 +5414,7 @@ const ChatView = (() => {
               }
 
               // web_search: inject provider badge and seed _searchProvider from persisted result
-              if (_toolNameById[toolId] === 'web_search' && content) {
+              if (resultToolName === 'web_search' && content) {
                 const provider = _toolResultProvider(seg, content);
                 if (provider) {
                   _setSearchProvider(provider, { refreshRunning: false });

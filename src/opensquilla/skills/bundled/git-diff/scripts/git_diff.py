@@ -5,9 +5,8 @@ Returns the diff text on stdout, the literal ``NO_DIFF`` when the
 diff is empty, and exits non-zero with the git error on stderr when
 git itself fails (not a repo, missing binary, etc.).
 
-Used by ``meta-codereview-current-diff`` and
-``meta-pre-commit-quality-gate`` to skip a full sub-Agent loop just
-to call ``git diff``.
+Used by workflows that need repository diffs while skipping a full
+sub-Agent loop just to call ``git diff``.
 """
 
 from __future__ import annotations

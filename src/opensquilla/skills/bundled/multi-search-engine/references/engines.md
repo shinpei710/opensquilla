@@ -34,7 +34,8 @@ Use when: query is in Chinese or topic is China-specific.
 
 ### Brave Search API
 
-`BRAVE_API_KEY` from <https://brave.com/search/api/>. 2k queries/month
+`BRAVE_SEARCH_API_KEY` from <https://brave.com/search/api/>. Legacy
+`BRAVE_API_KEY` is also accepted for migrated OpenClaw setups. 2k queries/month
 free tier. Returns clean JSON with title, URL, description, and recency
 hints.
 
@@ -67,7 +68,7 @@ Does the query contain CJK characters?
 Is the topic time-sensitive (last 24h)?
   yes → brave or tavily
    no → continue
-Is BRAVE_API_KEY set?
+Is BRAVE_SEARCH_API_KEY or BRAVE_API_KEY set?
   yes → brave + duckduckgo
    no → duckduckgo + bing
 ```

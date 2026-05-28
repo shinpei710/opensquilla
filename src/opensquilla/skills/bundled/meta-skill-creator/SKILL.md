@@ -49,6 +49,9 @@ composition:
           User request:
           {{ inputs.user_message | xml_escape | truncate(1200) }}
 
+          Outer system / activation context:
+          {{ inputs.system_prompt | default("") | xml_escape | truncate(1200) }}
+
           Clarified intent:
           {{ outputs.clarify_intent | truncate(1200) }}
 
@@ -59,6 +62,9 @@ composition:
             meta-skill but does not ask for exhaustive smoke testing.
           - FULL_GATED: user asks for a production-ready, accepted, tested,
             validated, or fully gated meta-skill.
+          - FULL_GATED: unattended auto-propose, dream, or cron activation
+            requires preserving all creator gates before any auto-enable
+            decision.
 
     - id: harvest
       kind: skill_exec
@@ -83,7 +89,12 @@ composition:
       output_choices: [p1_sequential, p2_fan_out_merge]
       with:
         history_summary: "{{ outputs.harvest | truncate(2000) }}"
-        user_intent: "{{ outputs.clarify_intent | truncate(1000) }}"
+        user_intent: |
+          Raw user request:
+          {{ inputs.user_message | xml_escape | truncate(1200) }}
+
+          Clarified intent:
+          {{ outputs.clarify_intent | truncate(1000) }}
 
     - id: fill_slots
       kind: tool_call
@@ -92,7 +103,12 @@ composition:
       tool_args:
         pattern_id: "{{ outputs.pick_pattern }}"
         history_summary: "{{ outputs.harvest | truncate(2000) }}"
-        user_intent: "{{ outputs.clarify_intent | truncate(1000) }}"
+        user_intent: |
+          Raw user request:
+          {{ inputs.user_message | xml_escape | truncate(1200) }}
+
+          Clarified intent:
+          {{ outputs.clarify_intent | truncate(1000) }}
 
     - id: assemble
       kind: tool_call
@@ -206,7 +222,13 @@ composition:
           REGRESSIONS:
           - <what the orchestrated candidate lacks versus the baseline>
           REQUIRED_IMPROVEMENTS:
-          - <concrete edit before acceptance, or "none">
+          - <blocking edit required before acceptance, or "none">
+
+          Treat REQUIRED_IMPROVEMENTS as a hard acceptance gate. Do not list
+          optional nice-to-have enhancements there. If the orchestrated
+          candidate is production-acceptable and any baseline advantages are
+          non-blocking, put those advantages under REGRESSIONS and set
+          REQUIRED_IMPROVEMENTS to "none".
 
     - id: smoke
       kind: tool_call
@@ -218,10 +240,22 @@ composition:
         fixture_gen_model: openai/gpt-4o-mini
         classifier_model: anthropic/claude-3.5-haiku
 
+    - id: runtime_e2e
+      kind: tool_call
+      depends_on: [assemble, smoke]
+      when: "outputs.creator_mode == 'FULL_GATED'"
+      tool: meta_skill_runtime_e2e_run
+      tool_args:
+        skill_md: "{{ outputs.assemble }}"
+        eval_prompts: |
+          [
+            {{ inputs.user_message | xml_escape | tojson }}
+          ]
+
     - id: preview
       kind: agent
       skill: sub-agent
-      depends_on: [smoke, acceptance_compare]
+      depends_on: [smoke, acceptance_compare, runtime_e2e]
       with:
         task: |
           Produce a concise proposal preview for the user/operator before
@@ -251,6 +285,9 @@ composition:
           Baseline comparison:
           {{ outputs.acceptance_compare | truncate(2000) }}
 
+          Runtime E2E:
+          {{ outputs.runtime_e2e | truncate(2000) }}
+
     - id: persist
       kind: tool_call
       depends_on: [preview]
@@ -260,6 +297,9 @@ composition:
         skill_md: "{{ outputs.assemble }}"
         lint_result: "{{ outputs.lint }}"
         smoke_result: "{{ outputs.smoke }}"
+        creator_mode: "{{ outputs.creator_mode }}"
+        acceptance_result: "{{ outputs.acceptance_compare }}"
+        runtime_e2e_result: "{{ outputs.runtime_e2e }}"
 ---
 
 # Meta-Skill Creator

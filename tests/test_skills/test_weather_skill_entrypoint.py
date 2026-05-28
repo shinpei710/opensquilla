@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 
+
 SCRIPT = (
     Path(__file__).resolve().parents[2]
     / "src"

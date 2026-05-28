@@ -94,11 +94,6 @@ class _Selector:
 @pytest.mark.asyncio
 async def test_router_control_replay_event_replays_turn_once(monkeypatch) -> None:
     monkeypatch.setattr(squilla_router_step, "_get_strategy", lambda _cfg: _Strategy())
-    monkeypatch.setattr(
-        squilla_router_step,
-        "lookup_price",
-        lambda _model: SimpleNamespace(input_per_m=0.0, output_per_m=0.0),
-    )
     provider = _ReplayProvider()
     cfg = GatewayConfig(
         squilla_router=SquillaRouterConfig(

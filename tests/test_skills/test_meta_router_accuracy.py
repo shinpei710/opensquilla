@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from router_fixtures import ALL_CASES, RouterCase, knowledge_base_bootstrap, migration_assistant
+from router_fixtures import ALL_CASES, RouterCase, migration_assistant
 
 from opensquilla.engine.types import AgentEvent
 from opensquilla.skills.loader import SkillLoader
@@ -62,7 +62,6 @@ def _classify_step_of(loader: SkillLoader, skill_name: str) -> MetaStep:
     "skill_name, fixture_choices",
     [
         (migration_assistant.SKILL_NAME, migration_assistant.OUTPUT_CHOICES),
-        (knowledge_base_bootstrap.SKILL_NAME, knowledge_base_bootstrap.OUTPUT_CHOICES),
     ],
 )
 def test_fixture_output_choices_match_bundled_skill(
@@ -141,8 +140,6 @@ async def test_routing_pipeline_propagates_expected_label(
     [
         (migration_assistant.SKILL_NAME, "Answer: **VUE2_TO_VUE3**.", "VUE2_TO_VUE3"),
         (migration_assistant.SKILL_NAME, "我认为是 vue2_to_vue3 因为...", "VUE2_TO_VUE3"),
-        (knowledge_base_bootstrap.SKILL_NAME, "the answer is GIT here", "GIT"),
-        (knowledge_base_bootstrap.SKILL_NAME, '"PDF".', "PDF"),
     ],
 )
 async def test_noisy_llm_reply_still_coerces_to_choice(

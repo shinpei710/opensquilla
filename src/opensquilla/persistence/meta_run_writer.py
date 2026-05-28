@@ -15,7 +15,6 @@ so a writer failure cannot fail a meta-skill turn.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -96,6 +95,44 @@ class RunRecord:
     error: str | None
     truncated_fields: tuple[str, ...]
     steps: tuple[StepRecord, ...] = ()
+
+
+@dataclass
+class AwaitingPeek:
+    """Read-only view of a single `awaiting_user` row.
+
+    Returned by `MetaRunWriter.peek_awaiting`. The schema field is the
+    deserialized `ClarifyStepConfig`; the `_json` strings are exposed
+    raw so callers that just want to forward them (e.g. the surface
+    renderers) don't pay a JSON parse cost.
+    """
+
+    run_id: str
+    step_id: str
+    awaiting_since: float
+    awaiting_session_id: str
+    awaiting_schema_json: str
+    awaiting_filled_json: str
+    step_outputs_json: str
+    inputs_json: str
+    parse_failure_count: int
+
+
+@dataclass
+class ResumePayload:
+    """Full payload required to call MetaOrchestrator.resume.
+
+    Returned by `MetaRunWriter.try_claim_resume` only on rowcount==1
+    (the caller has won the CAS for this run).
+    """
+
+    run_id: str
+    plan_snapshot_json: str
+    inputs_json: str
+    step_outputs_json: str
+    awaiting_step_id: str
+    awaiting_schema_json: str
+    awaiting_filled_json: str
 
 
 # ---------------------------------------------------------------------------
@@ -195,30 +232,19 @@ def _redact_inputs_json(raw: Mapping[str, Any], *, max_bytes: int) -> str:
 
 
 def _serialize_plan(plan: MetaPlan) -> tuple[str, str]:
-    """Returns (plan_snapshot_json, meta_skill_digest)."""
-    snapshot = {
-        "name": plan.name,
-        "triggers": list(plan.triggers),
-        "priority": plan.priority,
-        "steps": [
-            {
-                "id": s.id,
-                "skill": s.skill,
-                "kind": s.kind,
-                "with_args": dict(s.with_args),
-                "depends_on": list(s.depends_on),
-                "route": [{"when": r.when, "to": r.to} for r in s.route],
-                "output_choices": list(s.output_choices),
-                "tool": s.tool,
-                "tool_args": dict(s.tool_args),
-                "tool_allowlist": list(s.tool_allowlist),
-                "on_failure": s.on_failure,
-            }
-            for s in plan.steps
-        ],
-    }
+    """Returns (plan_snapshot_json, meta_skill_digest).
+
+    Thin wrapper over opensquilla.skills.meta.plan_serde; this preserves the
+    versioned user-input plan snapshot contract.
+    The snapshot JSON is the *envelope* (with ``"v": 1``); the digest is
+    over the same canonical JSON. Existing rows' digests will change on
+    next write — this is a one-time churn at the V013 cut-over.
+    """
+    from opensquilla.skills.meta.plan_serde import plan_digest, to_jsonable
+
+    snapshot = to_jsonable(plan)
     snapshot_json = json.dumps(snapshot, sort_keys=True, ensure_ascii=False)
-    digest = hashlib.sha256(snapshot_json.encode("utf-8")).hexdigest()
+    digest = plan_digest(plan)
     return snapshot_json, digest
 
 
@@ -489,6 +515,249 @@ class MetaRunWriter:
         return self.list_runs(
             name=name, status="failed", since_ms=since_ms, limit=limit,
         )
+
+    def peek_awaiting(self, *, session_id: str) -> AwaitingPeek | None:
+        """Read the single awaiting_user record for this session, if any.
+
+        Read-only: does NOT transition state. The partial unique index on
+        session_key WHERE status='awaiting_user' guarantees at most one row.
+        """
+        if not session_id:
+            return None
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT * FROM meta_skill_runs "
+                    "WHERE session_key=? AND status='awaiting_user' LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("meta_run_writer.peek_awaiting_failed: %s", exc)
+            return None
+        if row is None:
+            return None
+        return AwaitingPeek(
+            run_id=row["run_id"],
+            step_id=row["awaiting_step_id"] or "",
+            awaiting_since=float(row["awaiting_since"] or 0.0),
+            awaiting_session_id=row["session_key"] or "",
+            awaiting_schema_json=row["awaiting_schema_json"] or "{}",
+            awaiting_filled_json=row["awaiting_filled_json"] or "{}",
+            step_outputs_json=row["step_outputs_json"] or "{}",
+            inputs_json=row["inputs_json"] or "{}",
+            parse_failure_count=int(row["parse_failure_count"] or 0),
+        )
+
+    def try_claim_awaiting(
+        self,
+        *,
+        run_id: str,
+        step_id: str,
+        schema_json: str,
+        session_id: str,
+        inputs_json: str,
+        step_outputs_json: str,
+        awaiting_since: float,
+    ) -> bool:
+        """Atomically transition status running → awaiting_user.
+
+        Returns True on success (rowcount == 1).
+        Returns False if either:
+          (a) the run is no longer 'running' (lost a race to finalize); or
+          (b) another run in the same session is already awaiting_user
+              (partial unique index rejects the write with IntegrityError).
+
+        Callers MUST NOT raise MetaPaused on False — the user_input
+        executor treats False as a normal step failure (design §10).
+        """
+        try:
+            with self._lock:
+                try:
+                    cur = self._conn.execute(
+                        """
+                        UPDATE meta_skill_runs
+                           SET status='awaiting_user',
+                               awaiting_step_id=?,
+                               awaiting_schema_json=?,
+                               awaiting_since=?,
+                               session_key=?,
+                               inputs_json=?,
+                               step_outputs_json=?,
+                               awaiting_filled_json='{}',
+                               parse_failure_count=0
+                         WHERE run_id=? AND status='running'
+                        """,
+                        (
+                            step_id, schema_json, awaiting_since,
+                            session_id, inputs_json, step_outputs_json,
+                            run_id,
+                        ),
+                    )
+                    if cur.rowcount == 0:
+                        self._conn.rollback()
+                        return False
+                    self._conn.commit()
+                    return True
+                except sqlite3.IntegrityError as exc:
+                    try:
+                        self._conn.rollback()
+                    except Exception:
+                        pass
+                    log.info(
+                        "meta_run_writer.try_claim_awaiting.race_lost run=%s session=%s err=%s",
+                        run_id, session_id, exc,
+                    )
+                    return False
+        except Exception as exc:  # noqa: BLE001
+            log.warning("meta_run_writer.try_claim_awaiting_failed: %s", exc)
+            return False
+
+    def try_claim_resume(
+        self,
+        *,
+        run_id: str,
+        session_id: str,
+    ) -> ResumePayload | None:
+        """Atomically transition awaiting_user → running, scoped by session.
+
+        On rowcount==1, returns the full payload for MetaOrchestrator.resume.
+        On rowcount==0, returns None (race lost, or cancelled/expired).
+        """
+        try:
+            with self._lock:
+                row = self._conn.execute(
+                    "SELECT plan_snapshot_json, inputs_json, step_outputs_json, "
+                    "       awaiting_step_id, awaiting_schema_json, "
+                    "       awaiting_filled_json "
+                    "  FROM meta_skill_runs "
+                    " WHERE run_id=? AND session_key=? AND status='awaiting_user' "
+                    "LIMIT 1",
+                    (run_id, session_id),
+                ).fetchone()
+                if row is None:
+                    return None
+                cur = self._conn.execute(
+                    """
+                    UPDATE meta_skill_runs
+                       SET status='running',
+                           awaiting_step_id=NULL,
+                           awaiting_schema_json=NULL,
+                           awaiting_since=NULL
+                     WHERE run_id=? AND session_key=? AND status='awaiting_user'
+                    """,
+                    (run_id, session_id),
+                )
+                if cur.rowcount == 0:
+                    self._conn.rollback()
+                    return None
+                self._conn.commit()
+                return ResumePayload(
+                    run_id=run_id,
+                    plan_snapshot_json=row["plan_snapshot_json"] or "{}",
+                    inputs_json=row["inputs_json"] or "{}",
+                    step_outputs_json=row["step_outputs_json"] or "{}",
+                    awaiting_step_id=row["awaiting_step_id"] or "",
+                    awaiting_schema_json=row["awaiting_schema_json"] or "{}",
+                    awaiting_filled_json=row["awaiting_filled_json"] or "{}",
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("meta_run_writer.try_claim_resume_failed: %s", exc)
+            return None
+
+    def mark_expired(self, *, run_id: str) -> None:
+        """Transition an awaiting_user run to 'expired'.
+
+        Idempotent: a row already in 'expired' is left untouched.
+        """
+        try:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    UPDATE meta_skill_runs
+                       SET status='expired', ended_at_ms=?
+                     WHERE run_id=? AND status='awaiting_user'
+                    """,
+                    (self._clock(), run_id),
+                )
+                self._conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("meta_run_writer.mark_expired_failed: %s", exc)
+
+    def mark_cancelled(self, *, run_id: str, reason: str) -> None:
+        """Transition an awaiting_user run to 'cancelled' with a recorded reason.
+
+        Reason is stored in the existing `error` column (with `cancelled:`
+        prefix); callers must check `status` before interpreting `error`.
+        """
+        try:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    UPDATE meta_skill_runs
+                       SET status='cancelled', ended_at_ms=?, error=?
+                     WHERE run_id=? AND status='awaiting_user'
+                    """,
+                    (self._clock(), f"cancelled:{reason}", run_id),
+                )
+                self._conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("meta_run_writer.mark_cancelled_failed: %s", exc)
+
+    def increment_parse_failures(self, *, run_id: str) -> int:
+        """Atomically increment parse_failure_count; return new value.
+
+        Returns 0 if the row is not in 'awaiting_user' (no-op sentinel).
+        Uses UPDATE ... RETURNING for atomicity across multiple connections.
+        """
+        try:
+            with self._lock:
+                cur = self._conn.execute(
+                    """
+                    UPDATE meta_skill_runs
+                       SET parse_failure_count = parse_failure_count + 1
+                     WHERE run_id=? AND status='awaiting_user'
+                     RETURNING parse_failure_count
+                    """,
+                    (run_id,),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    self._conn.rollback()
+                    return 0
+                self._conn.commit()
+                if isinstance(row, sqlite3.Row):
+                    return int(row["parse_failure_count"])
+                return int(row[0])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("meta_run_writer.increment_parse_failures_failed: %s", exc)
+            return 0
+
+    def update_awaiting_partial(
+        self, *, run_id: str, filled_json: str, awaiting_since: float,
+    ) -> bool:
+        """Persist a partial fill for chat-mode awaiting (design §5.4).
+
+        Resets awaiting_since so the user gets a fresh timeout window.
+        Returns True only if the row was still in awaiting_user.
+        """
+        try:
+            with self._lock:
+                cur = self._conn.execute(
+                    """
+                    UPDATE meta_skill_runs
+                       SET awaiting_filled_json=?, awaiting_since=?
+                     WHERE run_id=? AND status='awaiting_user'
+                    """,
+                    (filled_json, awaiting_since, run_id),
+                )
+                if cur.rowcount == 0:
+                    self._conn.rollback()
+                    return False
+                self._conn.commit()
+                return True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("meta_run_writer.update_awaiting_partial_failed: %s", exc)
+            return False
 
     # ------------- cleanup -------------
 

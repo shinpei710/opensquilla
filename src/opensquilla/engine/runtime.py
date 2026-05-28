@@ -109,7 +109,6 @@ from opensquilla.engine.types import (
     DoneEvent,
     ErrorEvent,
     RouterControlReplayEvent,
-    RouterDecisionEvent,
     ThinkingLevel,
     ToolResultEvent,
     WarningEvent,
@@ -406,70 +405,6 @@ def _non_negative_int(value: object) -> int:
         return max(0, int(value))
     except (TypeError, ValueError):
         return 0
-
-
-def _build_router_decision_event(turn: TurnContext) -> RouterDecisionEvent | None:
-    """Construct a RouterDecisionEvent from post-pipeline turn metadata.
-
-    Returns None ONLY when squilla_router did not fire for this turn
-    (router fully disabled, tier-detection bailed for an image turn
-    with no supports_image tier, etc.). In observe-mode rollout the
-    event IS emitted, with ``routing_applied=False`` — the routed
-    model was NOT swapped into the actual provider call. The WebUI
-    uses ``routing_applied`` to decide whether to animate the strip
-    or render it in a dimmed "observing" state.
-    """
-    routed_tier = turn.metadata.get("routed_tier")
-    if not routed_tier:
-        return None
-    extra = turn.metadata.get("routing_extra")
-    if not isinstance(extra, dict):
-        extra = {}
-    probs_raw = extra.get("probs")
-    probs: list[float] = []
-    if isinstance(probs_raw, list | tuple):
-        for value in probs_raw[:4]:
-            try:
-                probs.append(float(value))
-            except (TypeError, ValueError):
-                probs.append(0.0)
-    tier_savings = extra.get("tier_savings")
-    savings_pct = 0.0
-    if isinstance(tier_savings, dict):
-        try:
-            savings_pct = float(tier_savings.get("pct", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            savings_pct = 0.0
-    # Natural mapping: "t0" → 0, "t1" → 1, ... Non-numeric tier ids
-    # ("image_model", custom names) fall to -1 via the except clause.
-    # Earlier revisions subtracted 1 and floored at 0, which collapsed
-    # both t0 and t1 to the same index.
-    tier_idx = -1
-    try:
-        tier_idx = int(str(routed_tier).lstrip("t"))
-    except (TypeError, ValueError):
-        tier_idx = -1
-    source = str(turn.metadata.get("routing_source") or "none")
-    routing_applied = turn.metadata.get("routing_applied")
-    if routing_applied is None:
-        # Legacy default — assume applied when the field is missing,
-        # so older transcripts (pre-this-field) keep rendering normally.
-        routing_applied = True
-    return RouterDecisionEvent(
-        tier=str(routed_tier),
-        tier_index=tier_idx,
-        model=str(turn.metadata.get("routed_model") or turn.model or ""),
-        baseline_model=str(turn.metadata.get("baseline_model") or ""),
-        source=source,
-        confidence=float(turn.metadata.get("routing_confidence") or 0.0),
-        probs=probs,
-        savings_pct=savings_pct,
-        fallback=source == "fallback",
-        thinking_mode=str(turn.metadata.get("thinking_mode") or ""),
-        prompt_policy=str(turn.metadata.get("prompt_policy") or ""),
-        routing_applied=bool(routing_applied),
-        rollout_phase=str(turn.metadata.get("rollout_phase") or "full"),
-    )
 
 
 def _token_cost_usd(input_tokens: float, output_tokens: float, price: PriceEntry) -> float:
@@ -2066,9 +2001,6 @@ class TurnRunner:
                 tool_context.router_control_turn_hold_applied = bool(
                     turn.metadata.get("router_control_hold_applied")
                 )
-            router_event = _build_router_decision_event(turn)
-            if router_event is not None:
-                yield router_event
             ab_outcome = await self._agent_bootstrap_stage.run(
                 AgentBootstrapStageInput(
                     provider=provider,
@@ -2301,6 +2233,12 @@ class TurnRunner:
                         ),
                         "tool_projection_tokens_saved": int(
                             turn.metadata.get("tool_projection_tokens_saved", 0) or 0
+                        ),
+                        "tool_result_store_writes": int(
+                            turn.metadata.get("tool_result_store_writes", 0) or 0
+                        ),
+                        "tool_result_store_skips": int(
+                            turn.metadata.get("tool_result_store_skips", 0) or 0
                         ),
                     },
                 )
@@ -3554,6 +3492,31 @@ class TurnRunner:
             return content[:max_chars] + "\n..."
         return content
 
+    def _make_meta_llm_chat(self, provider: Any, session_key: str) -> Any:
+        """Construct the (system_prompt, user_message) -> str callable that
+        meta_resolution's awaiting branch invokes for ``nl_extract: true``.
+
+        Returns None when the provider isn't available — the awaiting
+        branch silently falls back to the deterministic parser's errors,
+        which is exactly the behavior we want for non-LLM unit tests.
+        """
+        if provider is None:
+            return None
+        # Lazy import keeps the runtime cold-start independent of meta.
+        from opensquilla.engine.types import AgentConfig
+        from opensquilla.skills.meta.orchestrator import make_llm_chat_from_provider
+
+        # ``make_llm_chat_from_provider`` only reads ``model_id`` /
+        # ``metadata`` off base_config (via getattr). ``self._config`` is
+        # the GatewayConfig (different shape — no .model_id), so build a
+        # minimal AgentConfig() rather than passing the wrong type.
+        return make_llm_chat_from_provider(
+            provider=provider,
+            base_config=AgentConfig(),
+            usage_tracker=getattr(self, "_usage_tracker", None),
+            session_key=session_key,
+        )
+
     def _load_daily_notes(self, workspace_dir: Any) -> dict[str, str]:
         from opensquilla.identity.workspace import load_daily_notes
 
@@ -3597,6 +3560,7 @@ class TurnRunner:
             filter_skills,
             inject_platform_hint,
             inject_subagent_grounding,
+            meta_resolution,
             observe_reasoning_hint,
             resolve_model,
         )
@@ -3626,12 +3590,12 @@ class TurnRunner:
             )
 
         async def _bounded_apply_squilla_router(turn: TurnContext) -> TurnContext:
-            def _run_router() -> TurnContext:
-                return asyncio.run(apply_squilla_router(_copy_router_turn(turn)))
+            async def _run_router_step() -> TurnContext:
+                return await apply_squilla_router(_copy_router_turn(turn))
 
             try:
                 routed = await asyncio.wait_for(
-                    asyncio.to_thread(_run_router),
+                    asyncio.to_thread(lambda: asyncio.run(_run_router_step())),
                     timeout=router_timeout,
                 )
                 return commit_deferred_router_history(routed)
@@ -3642,7 +3606,34 @@ class TurnRunner:
 
         initial_metadata: dict[str, Any] = {
             "skill_loader": self._skill_loader,
+            "meta_run_writer": getattr(self, "_meta_run_writer", None),
+            # PR9: meta_resolution's awaiting branch calls this when the
+            # deterministic clarify_text parser fails and the SKILL.md
+            # has ``nl_extract: true``. None disables the LLM fallback.
+            "meta_llm_chat": self._make_meta_llm_chat(provider, session_key),
             "router_control_hold_store": self._router_control_hold_store,
+            # Surface the resolved per-agent workspace so the meta_invoke
+            # handler in Agent._run_one_streaming (agent.py ~L4724) can
+            # find it without falling through to default_workspace_dir().
+            # Prefer tool_context.workspace_dir (already resolved with
+            # the gateway config in rpc_sessions / channel_dispatch /
+            # scheduler); fall back to resolving from agent_id on the
+            # tool_context, then to an empty string. When this key was
+            # absent the meta_invoke handler dropped to
+            # default_workspace_dir() and exec_command sandbox blocked
+            # paths under ``/root/`` instead of the gateway workspace.
+            "bootstrap_workspace_dir": (
+                getattr(tool_context, "workspace_dir", None)
+                or (
+                    str(
+                        self._resolve_bootstrap_workspace_dir(
+                            getattr(tool_context, "agent_id", "main") or "main"
+                        )
+                    )
+                    if tool_context is not None
+                    else ""
+                )
+            ),
         }
         if ingress_pipeline_steps:
             initial_metadata["pipeline_steps"] = list(ingress_pipeline_steps)
@@ -3676,6 +3667,7 @@ class TurnRunner:
                 resolve_model,
                 _bounded_apply_squilla_router,
                 observe_reasoning_hint,
+                meta_resolution,
                 filter_skills,
                 inject_subagent_grounding,
                 inject_platform_hint,
@@ -3926,6 +3918,14 @@ class TurnRunner:
                     "tool_projection_tokens_saved",
                     0,
                 )
+                savings_telemetry.tool_result_store_writes = metadata.get(
+                    "tool_result_store_writes",
+                    0,
+                )
+                savings_telemetry.tool_result_store_skips = metadata.get(
+                    "tool_result_store_skips",
+                    0,
+                )
 
                 # Thinking mode
                 savings_telemetry.thinking_mode = metadata.get("thinking_mode")
@@ -4169,12 +4169,6 @@ class TurnRunner:
             previous_tier=previous,
             context_window_tokens=context_window_tokens,
             **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
-        )
-        await self._record_checkpoint_before_compaction(
-            session_key,
-            transcript,
-            turn_id=compaction_id,
-            source="t3_upgrade_compaction",
         )
 
         flush_receipt_status = "not_required"

@@ -36,7 +36,13 @@ def cmd_write_proposal(args: argparse.Namespace) -> dict:
     lint_result = json.loads(args.lint_result)
     smoke_result = json.loads(args.smoke_result)
     return proposals_lib.write_proposal(
-        Path(args.home), skill_md, lint_result, smoke_result,
+        Path(args.home),
+        skill_md,
+        lint_result,
+        smoke_result,
+        creator_mode=args.creator_mode,
+        acceptance_result=args.acceptance_result,
+        runtime_e2e_result=args.runtime_e2e_result,
     )
 
 
@@ -84,6 +90,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--skill-md-inline", default=None)
     p.add_argument("--lint-result", default="{}")
     p.add_argument("--smoke-result", default="{}")
+    p.add_argument("--creator-mode", default="")
+    p.add_argument("--acceptance-result", default="")
+    p.add_argument("--runtime-e2e-result", default="")
     p.add_argument("--proposal-id", default=None)
     p.add_argument("--force", action="store_true")
     args = p.parse_args(argv)

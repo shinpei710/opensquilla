@@ -11,7 +11,7 @@ import hashlib
 import json
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -37,6 +37,11 @@ from opensquilla.engine.session_sanitize import (
 )
 from opensquilla.engine.thinking import drop_reasoning
 from opensquilla.engine.tokenjuice_adapter import reduce_tool_result_with_tokenjuice
+from opensquilla.engine.tool_result_store import (
+    ToolResultRecord,
+    ToolResultStore,
+    ToolResultStoreBudgetError,
+)
 from opensquilla.engine.tool_text_compat import strip_synthetic_tool_call_suffix
 from opensquilla.engine.tool_token_estimate import estimate_tokens as get_approx_tokens
 from opensquilla.execution_status import (
@@ -75,7 +80,7 @@ from opensquilla.result_budget import (
     compact_tool_result_content,
     resolve_budget_class,
 )
-from opensquilla.router_control import router_control_replay_payload
+from opensquilla.router_control import router_control_replay_event_from_payload
 from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
@@ -108,7 +113,6 @@ from .types import (
     CompactionOutcome,
     DoneEvent,
     ErrorEvent,
-    RouterControlReplayEvent,
     RunHeartbeatEvent,
     StateChangeEvent,
     TextDeltaEvent,
@@ -256,24 +260,6 @@ def _pending_approval_payload(content: str) -> dict[str, Any] | None:
     if not isinstance(approval_id, str) or not approval_id:
         return None
     return payload
-
-
-def _router_control_replay_event(
-    content: object,
-    *,
-    replay_depth: int = 0,
-) -> RouterControlReplayEvent | None:
-    payload = router_control_replay_payload(content)
-    if payload is None:
-        return None
-    return RouterControlReplayEvent(
-        action=str(payload.get("action") or ""),
-        target_tier=payload.get("target_tier"),
-        target_model=payload.get("target_model"),
-        target_provider=payload.get("target_provider"),
-        target_id=payload.get("target_id"),
-        replay_depth=replay_depth,
-    )
 
 
 async def _wait_for_pending_approval_resolution(
@@ -508,6 +494,7 @@ def _chat_config_with_thinking_disabled(chat_cfg: ChatConfig) -> ChatConfig:
         model_capabilities=chat_cfg.model_capabilities,
         thinking_level=None,
         provider_request_max_chars=chat_cfg.provider_request_max_chars,
+        tool_choice=chat_cfg.tool_choice,
     )
 
 
@@ -583,7 +570,6 @@ class Agent:
         turn_call_logger: TurnCallLogger | None = None,
         memory_sync_manager: Any | None = None,
         session_flush_service: Any | None = None,
-        session_checkpoint_recorder: Callable[..., Any] | None = None,
         tool_registry: ToolRegistry | None = None,
         tool_context: ToolContext | None = None,
     ) -> None:
@@ -616,9 +602,9 @@ class Agent:
         self._flush_backoff_until: float = 0.0
         self._flush_backoff_seconds: float = 0.0
         self._session_flush_service = session_flush_service
-        self._session_checkpoint_recorder = session_checkpoint_recorder
         self._last_compaction_refusal_reason: str | None = None
         self._tool_failure_loop_counts: dict[tuple[str, str], int] = {}
+        self._provider_tool_result_overrides: dict[str, ContentBlockToolResult] = {}
 
     def _context_overflow_error(self) -> ErrorEvent:
         reason = self._last_compaction_refusal_reason
@@ -986,20 +972,30 @@ class Agent:
             return messages
 
         replacements: dict[tuple[int, int], ContentBlockToolResult] = {}
+        stored_handles: list[str] = []
 
         for message_index, block_index, block, content, original_tokens in eligible_refs:
             if total_tool_result_tokens <= budget_tokens:
                 break
             digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            stored = self._store_tool_result_snapshot(
+                content,
+                tool_use_id=block.tool_use_id,
+                tool_name=tool_name_by_use_id.get(block.tool_use_id, "tool"),
+            )
+            if stored is not None:
+                stored_handles.append(stored.handle)
             head = content[:240]
             tail = content[-240:] if len(content) > 240 else ""
             omitted = max(0, len(content) - len(head) - len(tail))
+            handle_line = f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
             compacted = (
                 "[aggregate_tool_result_compacted]\n"
                 f"tool_use_id: {block.tool_use_id}\n"
                 f"original_chars: {len(content)}\n"
                 f"original_tokens_estimate: {_tool_result_budget_tokens(content)}\n"
                 f"sha256: {digest}\n"
+                f"{handle_line}"
                 f"omitted_chars: {omitted}\n"
                 "reason: older non-error tool result compacted for provider context budget.\n"
                 f"head:\n{head}"
@@ -1086,6 +1082,7 @@ class Agent:
             "tool_aggregate_projection",
             original_tool_results=len(tool_result_refs),
             compacted_tool_results=len(replacements),
+            tool_result_handles=stored_handles,
             tokens_before=before_tokens,
             tokens_after=after_tokens,
         )
@@ -1240,6 +1237,12 @@ class Agent:
         if max_preview_chars > 0:
             max_preview_chars = max(1, min(max_preview_chars, 4_000))
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        stored = self._store_tool_result_snapshot(
+            content,
+            tool_use_id=tool_use_id,
+            tool_name=tool_name,
+        )
+        handle_line = f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
         if max_preview_chars <= 0:
             head = ""
             tail = ""
@@ -1258,6 +1261,7 @@ class Agent:
             f"tool_use_id: {tool_use_id}\n"
             f"original_chars: {len(content)}\n"
             f"sha256: {digest}\n"
+            f"{handle_line}"
             f"omitted_chars: {omitted}\n"
             f"reason: {reason}.\n"
             f"head:\n{head}"
@@ -1355,16 +1359,64 @@ class Agent:
         )
         return sanitized_messages
 
-    def _fallback_tool_result_projection(self, result: ToolResult) -> str:
-        return self._tool_result_projection_for_provider(
-            content=result.content,
-            tool_use_id=result.tool_use_id,
-            tool_name=result.tool_name,
-            reason="tokenjuice returned no projection",
-            max_preview_chars=self._tokenjuice_max_inline_chars(),
-        )
+    def _store_tool_result_snapshot(
+        self,
+        content: str,
+        *,
+        tool_use_id: str,
+        tool_name: str,
+    ) -> ToolResultRecord | None:
+        if not self.config.tool_result_store_dir:
+            return None
+        session_id = self.config.tool_result_store_session_id or self._session_key
+        session_key = self.config.tool_result_store_session_key or self._session_key
+        agent_id = self.config.tool_result_store_agent_id
+        if not agent_id and session_key:
+            from opensquilla.session.keys import parse_agent_id
 
-    async def _canonicalize_tool_result(
+            agent_id = parse_agent_id(session_key)
+        if not session_id or not session_key or not agent_id:
+            self.config.metadata["tool_result_store_skips"] = (
+                self.config.metadata.get("tool_result_store_skips", 0) + 1
+            )
+            return None
+        try:
+            record = ToolResultStore(self.config.tool_result_store_dir).write(
+                content,
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+                session_id=session_id,
+                session_key=session_key,
+                agent_id=agent_id,
+                max_bytes=self.config.tool_result_store_max_bytes,
+                disk_budget_bytes=self.config.tool_result_store_disk_budget_bytes,
+                retention_seconds=self.config.tool_result_store_retention_seconds,
+            )
+        except ToolResultStoreBudgetError as exc:
+            self.config.metadata["tool_result_store_skips"] = (
+                self.config.metadata.get("tool_result_store_skips", 0) + 1
+            )
+            logger.info(
+                "tool_result_store.skipped",
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+                reason=str(exc),
+            )
+            return None
+        except Exception as exc:  # pragma: no cover - storage must not break turns
+            logger.warning(
+                "tool_result_store.write_failed",
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+                error=str(exc),
+            )
+            return None
+        self.config.metadata["tool_result_store_writes"] = (
+            self.config.metadata.get("tool_result_store_writes", 0) + 1
+        )
+        return record
+
+    async def _project_tool_result_for_llm(
         self,
         result: ToolResult,
         *,
@@ -1402,13 +1454,6 @@ class Agent:
             command=self._tool_call_string_arg(tool_call, "command"),
             cwd=self._tool_call_string_arg(tool_call, "workdir", "cwd"),
         )
-        if projected_content is None and len(result.content) > self._tokenjuice_max_inline_chars():
-            projected_content = self._fallback_tool_result_projection(result)
-            self.config.metadata["tool_projection_backend"] = "bounded_fallback"
-            self.config.metadata["tool_projection_fallback_calls"] = (
-                self.config.metadata.get("tool_projection_fallback_calls", 0) + 1
-            )
-
         if projected_content is None:
             self.config.metadata["tool_projection_noops"] = (
                 self.config.metadata.get("tool_projection_noops", 0) + 1
@@ -1420,6 +1465,21 @@ class Agent:
                 original_chars=len(result.content),
             )
             return result
+
+        stored = self._store_tool_result_snapshot(
+            result.content,
+            tool_use_id=result.tool_use_id,
+            tool_name=result.tool_name,
+        )
+        stored_handle = stored.handle if stored is not None else None
+        if stored is not None:
+            projected_content = (
+                "[tool_result_projection]\n"
+                f"tool_result_handle: {stored.handle}\n"
+                f"sha256: {stored.sha256}\n"
+                f"original_chars: {stored.chars}\n"
+                f"{projected_content}"
+            )
 
         tokens_before = get_approx_tokens(result.content)
         tokens_after = get_approx_tokens(projected_content)
@@ -1441,6 +1501,7 @@ class Agent:
             "tool_projection_applied",
             tool_use_id=result.tool_use_id,
             name=result.tool_name,
+            tool_result_handle=stored_handle,
             original_chars=len(result.content),
             projected_chars=len(projected_content),
         )
@@ -1451,6 +1512,69 @@ class Agent:
             is_error=result.is_error,
             artifacts=list(result.artifacts),
             execution_status=result.execution_status,
+            terminates_turn=result.terminates_turn,
+        )
+
+    def _tool_result_compression_mode(self) -> str:
+        mode = self.config.tool_result_compression_mode
+        if mode in {"off", "truncate", "summarize"}:
+            return mode
+        return "truncate" if self.config.tool_result_compression_enabled else "off"
+
+    def _tool_result_over_budget(self, text: str) -> bool:
+        budget_tokens = int(
+            self.config.context_window_tokens * self.config.tool_result_compression_max_share
+        )
+        return get_approx_tokens(text) > budget_tokens
+
+    async def _compress_tool_result(self, result: ToolResult) -> ToolResult:
+        """Compatibility wrapper for legacy compression callers.
+
+        The current runtime projects tool results with Tokenjuice. This helper
+        remains for embedded tests and callers that exercise the older
+        compression API directly.
+        """
+        guarded_content, guarded = _omit_large_json_tool_fields(result.content)
+        if guarded:
+            result = ToolResult(
+                tool_use_id=result.tool_use_id,
+                tool_name=result.tool_name,
+                content=guarded_content,
+                is_error=result.is_error,
+                artifacts=list(result.artifacts),
+                execution_status=(
+                    mark_execution_status_truncated(result.execution_status)
+                    if result.execution_status is not None
+                    else None
+                ),
+                terminates_turn=result.terminates_turn,
+            )
+        mode = self._tool_result_compression_mode()
+        if mode == "off" or not self._tool_result_over_budget(result.content):
+            return result
+
+        budget_tokens = int(
+            self.config.context_window_tokens * self.config.tool_result_compression_max_share
+        )
+        max_preview_chars = max(0, budget_tokens * 4)
+        compressed_content = compact_tool_result_content(
+            tool_name=result.tool_name,
+            content=result.content,
+            max_preview_chars=max_preview_chars,
+            budget_class=resolve_budget_class(result.tool_name),
+            is_error=result.is_error,
+        )
+        return ToolResult(
+            tool_use_id=result.tool_use_id,
+            tool_name=result.tool_name,
+            content=compressed_content,
+            is_error=result.is_error,
+            artifacts=list(result.artifacts),
+            execution_status=(
+                mark_execution_status_truncated(result.execution_status)
+                if result.execution_status is not None
+                else None
+            ),
             terminates_turn=result.terminates_turn,
         )
 
@@ -1512,11 +1636,34 @@ class Agent:
         semantic_message: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Async generator that drives the state machine."""
+        self._provider_tool_result_overrides = {}
         self._current_turn_message = message
         _meta_invoke_turn_count.set(0)
 
         # ------ IDLE → THINKING ------
         yield self._transition(AgentState.THINKING)
+
+        # PR7/9 E2E fix — consume meta_resolution's awaiting-branch
+        # outcomes. meta_resolution stages six distinct outcomes on
+        # ctx.metadata (resume / errors / cancelled / expired /
+        # race_lost / [trigger match for fresh turn]) and returns; the
+        # runtime owns the user-visible feedback for the first five so
+        # the turn terminates cleanly instead of falling through to the
+        # LLM (which would re-trigger meta_invoke and hit the
+        # awaiting-guard with an opaque message).
+        metadata = self.config.metadata or {}
+        meta_resume = metadata.get("meta_resume")
+        if meta_resume is not None:
+            async for ev in self._run_meta_resume(meta_resume):
+                yield ev
+            return
+        clarify_outcome = self._read_clarify_outcome(metadata)
+        if clarify_outcome is not None:
+            text, terminates = clarify_outcome
+            async for ev in self._emit_terminal_text(text, iterations=0):
+                yield ev
+            _ = terminates  # always terminates today; reserved for future
+            return
 
         # Use the system prompt from config (wired by gateway via identity.prompt)
         if self._context is None:
@@ -1628,6 +1775,7 @@ class Agent:
                 self.config.thinking if isinstance(self.config.thinking, ThinkingLevel) else None
             ),
             provider_request_max_chars=self._provider_request_proof_max_chars(),
+            tool_choice=None,
         )
         _thinking_fallback_done = False
 
@@ -1936,6 +2084,18 @@ class Agent:
                             yield terminal_error
                         break
 
+                    call_chat_cfg = chat_cfg
+                    forced_tool_choice = self.config.metadata.get("meta_match_tool_choice")
+                    if (
+                        forced_tool_choice is not None
+                        and provider_tools_for_call
+                        and request_messages
+                        and not _message_has_tool_result(request_messages[-1])
+                    ):
+                        call_chat_cfg = chat_cfg.model_copy(
+                            update={"tool_choice": forced_tool_choice}
+                        )
+
                     self._write_turn_call_log(
                         "llm_request",
                         call_id=call_id,
@@ -1943,7 +2103,7 @@ class Agent:
                         attempt=_call_attempt,
                         messages=request_messages,
                         tools=provider_tools_for_call,
-                        config=chat_cfg,
+                        config=call_chat_cfg,
                     )
                     turn_llm_calls += 1
                     cache_prompt_snapshot = None
@@ -1951,7 +2111,7 @@ class Agent:
                         cache_prompt_snapshot = record_prompt_state(
                             messages=request_messages,
                             tools=provider_tools_for_call,
-                            config=chat_cfg,
+                            config=call_chat_cfg,
                             model=self.config.model_id or "",
                         )
 
@@ -1961,7 +2121,7 @@ class Agent:
                         raw_stream = self.provider.chat(
                             request_messages,
                             tools=provider_tools_for_call,
-                            config=chat_cfg,
+                            config=call_chat_cfg,
                         )
                         async for raw_ev in self._stream_provider_events_with_deadline(
                             raw_stream,
@@ -2776,6 +2936,7 @@ class Agent:
                             else None
                         ),
                         provider_request_max_chars=(self._provider_request_proof_max_chars()),
+                        tool_choice=chat_cfg.tool_choice,
                     )
 
                 assembled_text = "".join(assistant_text_parts)
@@ -3124,19 +3285,21 @@ class Agent:
                 for tc in tool_calls:
                     result = results_by_id[tc.tool_use_id]
                     result_tool_call = tc
-                    replay_event = _router_control_replay_event(result.content)
+                    for artifact in result.artifacts:
+                        yield ArtifactEvent(**_artifact_event_kwargs(artifact))
+                    yield ToolResultEvent(
+                        tool_use_id=result.tool_use_id,
+                        tool_name=result.tool_name,
+                        result=result.content,
+                        is_error=result.is_error,
+                        arguments=tc.arguments,
+                        execution_status=result.execution_status,
+                    )
+                    replay_event = router_control_replay_event_from_payload(result.content)
+                    if replay_event is not None:
+                        yield replay_event
                     pending_approval = _pending_approval_payload(result.content)
                     if pending_approval is not None and not tc.arguments.get("approval_id"):
-                        for artifact in result.artifacts:
-                            yield ArtifactEvent(**_artifact_event_kwargs(artifact))
-                        yield ToolResultEvent(
-                            tool_use_id=result.tool_use_id,
-                            tool_name=result.tool_name,
-                            result=result.content,
-                            is_error=result.is_error,
-                            arguments=tc.arguments,
-                            execution_status=result.execution_status,
-                        )
                         await _wait_for_pending_approval_resolution(
                             pending_approval,
                             timeout=_cap_timeout_by_deadlines(self._approval_wait_timeout()),
@@ -3152,25 +3315,33 @@ class Agent:
                         )
                         result = await _run_one(retry_call)
                         result_tool_call = retry_call
-                        replay_event = _router_control_replay_event(result.content)
-
-                    result = await self._canonicalize_tool_result(
+                        for artifact in result.artifacts:
+                            yield ArtifactEvent(**_artifact_event_kwargs(artifact))
+                        yield ToolResultEvent(
+                            tool_use_id=result.tool_use_id,
+                            tool_name=result.tool_name,
+                            result=result.content,
+                            is_error=result.is_error,
+                            arguments=retry_arguments,
+                            execution_status=result.execution_status,
+                        )
+                        replay_event = router_control_replay_event_from_payload(result.content)
+                        if replay_event is not None:
+                            yield replay_event
+                    executed_results.append(result)
+                    projected_result = await self._project_tool_result_for_llm(
                         result,
                         tool_call=result_tool_call,
                     )
-                    for artifact in result.artifacts:
-                        yield ArtifactEvent(**_artifact_event_kwargs(artifact))
-                    yield ToolResultEvent(
-                        tool_use_id=result.tool_use_id,
-                        tool_name=result.tool_name,
-                        result=result.content,
-                        is_error=result.is_error,
-                        arguments=result_tool_call.arguments,
-                        execution_status=result.execution_status,
-                    )
-                    if replay_event is not None:
-                        yield replay_event
-                    executed_results.append(result)
+                    if projected_result.content != result.content:
+                        self._provider_tool_result_overrides[result.tool_use_id] = (
+                            ContentBlockToolResult(
+                                tool_use_id=projected_result.tool_use_id,
+                                content=projected_result.content,
+                                is_error=projected_result.is_error,
+                                execution_status=projected_result.execution_status,
+                            )
+                        )
                     while self._pending_warnings:
                         yield self._pending_warnings.pop(0)
                     if self._is_turn_yield_result(result) or result.terminates_turn:
@@ -3411,10 +3582,44 @@ class Agent:
             runtime_context_message,
             runtime_context_insert_index,
         )
+        source_messages = self._apply_provider_tool_result_overrides(source_messages)
         source_messages = self._strip_provider_context_marker_replay_for_provider(source_messages)
         source_messages = self._compact_aggregate_tool_results_for_provider(source_messages)
         source_messages = self._sanitize_projected_tool_use_arguments_for_provider(source_messages)
         return sanitize_session_messages(source_messages)
+
+    def _apply_provider_tool_result_overrides(self, messages: list[Message]) -> list[Message]:
+        if not self._provider_tool_result_overrides:
+            return messages
+
+        projected: list[Message] = []
+        changed = False
+        for message in messages:
+            if not isinstance(message.content, list):
+                projected.append(message)
+                continue
+            blocks: list[Any] = []
+            message_changed = False
+            for block in message.content:
+                if isinstance(block, ContentBlockToolResult):
+                    override = self._provider_tool_result_overrides.get(block.tool_use_id)
+                    if override is not None:
+                        blocks.append(override)
+                        message_changed = True
+                        continue
+                blocks.append(block)
+            if message_changed:
+                projected.append(
+                    Message(
+                        role=message.role,
+                        content=blocks,
+                        reasoning_content=message.reasoning_content,
+                    )
+                )
+                changed = True
+            else:
+                projected.append(message)
+        return projected if changed else messages
 
     @staticmethod
     def _provider_request_is_smaller(before: list[Message], after: list[Message]) -> bool:
@@ -3606,13 +3811,6 @@ class Agent:
             )
 
         compaction_id = new_compaction_id()
-        if self._session_key and self._session_checkpoint_recorder is not None:
-            await self._session_checkpoint_recorder(
-                self._session_key,
-                list(messages),
-                turn_id=compaction_id,
-                source="agent_inline_overflow",
-            )
         # --- Pre-compaction flush; inline compaction can continue on degraded flush. ---
         flush_task: asyncio.Task | None = None
         self._consume_completed_flush_task()
@@ -4444,6 +4642,7 @@ class Agent:
         """Stream a meta_invoke tool call inline and return a terminal ToolResult."""
 
         import opensquilla.skills.creator  # noqa: F401
+        from opensquilla.skills.creator.runtime_e2e import make_runtime_e2e_context
         from opensquilla.skills.meta.enabled import is_meta_skill_enabled
         from opensquilla.skills.meta.inputs import make_meta_inputs
         from opensquilla.skills.meta.orchestrator import (
@@ -4549,6 +4748,37 @@ class Agent:
                 )
                 return
 
+            # Spec §10: "New meta_invoke while awaiting | Reject the new
+            # invocation". Without this guard the new run hits the
+            # partial unique index on (session_key) WHERE
+            # status='awaiting_user' deep inside try_claim_awaiting and
+            # the user sees an opaque "awaiting claim rejected" error
+            # instead of a clear "please finish or cancel the previous
+            # form" hint.
+            if (
+                self._meta_run_writer is not None
+                and self._session_key
+            ):
+                try:
+                    existing_awaiting = self._meta_run_writer.peek_awaiting(
+                        session_id=self._session_key,
+                    )
+                except Exception:  # noqa: BLE001 — fail-open
+                    existing_awaiting = None
+                if existing_awaiting is not None:
+                    yield ToolResult(
+                        tool_use_id=tc.tool_use_id,
+                        tool_name="meta_invoke",
+                        content=(
+                            f"上一个 meta-skill ({existing_awaiting.step_id!r} "
+                            f"in run {existing_awaiting.run_id}) 还在等你回答，"
+                            "请先回答表单或回 '取消' 终止后再发起新的 meta-skill。"
+                        ),
+                        is_error=True,
+                        terminates_turn=True,
+                    )
+                    return
+
             skill_spec = skill_loader.get_by_name(name)
             if skill_spec is None or getattr(skill_spec, "kind", "skill") != "meta":
                 yield ToolResult(
@@ -4618,6 +4848,7 @@ class Agent:
                 if self.tool_handler is not None
                 else None
             )
+
             memory_persist_enabled = True
             orch = MetaOrchestrator(
                 agent_runner=runner,
@@ -4650,6 +4881,29 @@ class Agent:
             )
 
             result: MetaResult | None = None
+            from opensquilla.skills.creator.proposer import (
+                reset_runtime_e2e_context,
+                set_runtime_e2e_context,
+            )
+
+            runtime_e2e_ctx = make_runtime_e2e_context(
+                provider=self.provider,
+                base_config=self.config,
+                skill_loader=skill_loader,
+                tool_definitions=self.tool_definitions,
+                tool_handler=self.tool_handler,
+                agent_factory=type(self),
+                llm_chat=llm_chat,
+                tool_invoker=tool_invoker,
+                workspace_dir=str(workspace_dir) if workspace_dir else None,
+                usage_tracker=self._usage_tracker,
+                session_key=getattr(self, "_session_key", None) or "",
+                tool_registry=self._tool_registry,
+                tool_context=effective_ctx,
+                system_prompt=system_prompt,
+                baseline_model=getattr(self.config, "model_id", "") or "",
+            )
+            runtime_e2e_token = set_runtime_e2e_context(runtime_e2e_ctx)
             try:
                 async for ev in orch.iter_events(match):
                     if isinstance(ev, MetaResult):
@@ -4667,6 +4921,8 @@ class Agent:
                     terminates_turn=False,
                 )
                 return
+            finally:
+                reset_runtime_e2e_context(runtime_e2e_token)
 
             if result is None:
                 yield ToolResult(
@@ -4675,6 +4931,28 @@ class Agent:
                     content="orchestrator produced no MetaResult sentinel",
                     is_error=True,
                     terminates_turn=False,
+                )
+                return
+            # PR7: a paused MetaResult (awaiting user_input) is NOT a
+            # failure. Render the form description into assistant text
+            # so IM/CLI/Web fallbacks all see it; the surface-specific
+            # rich card (PR5/6) rides on the synthetic ToolResultEvent
+            # already emitted by the scheduler.
+            if result.paused:
+                from opensquilla.engine.turn_runner.turn_finalizer_stage import (
+                    render_paused_outcome,
+                )
+                paused_text = render_paused_outcome(result)
+                if paused_text:
+                    yield TextDeltaEvent(text=paused_text)
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content=(
+                        f"meta-skill {name!r} paused awaiting user input."
+                    ),
+                    is_error=False,
+                    terminates_turn=True,
                 )
                 return
             if not result.ok:
@@ -4686,7 +4964,7 @@ class Agent:
                 tool_use_id=tc.tool_use_id,
                 tool_name="meta_invoke",
                 content=(
-                    f"meta-skill {name!r} completed; final answer streamed separately."
+                    f"meta-skill {name!r} completed."
                     if result.final_text
                     else "(meta-skill completed with no output text)"
                 ),
@@ -4698,6 +4976,243 @@ class Agent:
                 _meta_invoke_depth.reset(depth_token)
             except ValueError:
                 _meta_invoke_depth.set(current_depth)
+
+    async def _run_meta_resume(self, meta_resume: Any) -> AsyncIterator[Any]:
+        """Stream a meta-skill resume's events as a single turn.
+
+        ``meta_resume`` is the tuple ``(claim, parsed_fields)`` that
+        ``meta_resolution`` stashes on ctx.metadata after a successful
+        try_claim_resume CAS. We build a MetaOrchestrator with the same
+        wiring ``_run_one_streaming`` uses, then yield every event from
+        ``iter_resume_events`` followed by a synthetic DoneEvent so the
+        outer stream pipeline can finalize the turn.
+        """
+        from opensquilla.engine.types import DoneEvent
+        from opensquilla.skills.meta.orchestrator import (
+            MetaOrchestrator,
+            make_agent_runner_from_parent,
+            make_llm_chat_from_provider,
+            make_tool_invoker_from_handler,
+        )
+        from opensquilla.skills.meta.types import MetaResult
+        from opensquilla.tools.types import current_tool_context
+
+        try:
+            claim, parsed = meta_resume
+        except (TypeError, ValueError):
+            logger.warning("agent.meta_resume_malformed", extra={"value": str(meta_resume)})
+            return
+
+        metadata = self.config.metadata or {}
+        skill_loader = metadata.get("skill_loader")
+        if skill_loader is None or self._meta_run_writer is None:
+            logger.warning(
+                "agent.meta_resume_missing_deps",
+                extra={
+                    "has_loader": skill_loader is not None,
+                    "has_writer": self._meta_run_writer is not None,
+                },
+            )
+            return
+
+        # Drop the marker so a re-enter through this turn cannot re-resume.
+        if isinstance(metadata, dict):
+            metadata.pop("meta_resume", None)
+
+        effective_ctx = current_tool_context.get() or None
+        workspace_dir = (
+            (getattr(effective_ctx, "workspace_dir", None) if effective_ctx else None)
+            or metadata.get("bootstrap_workspace_dir")
+            or getattr(self.config, "workspace_dir", None)
+        )
+
+        runner = make_agent_runner_from_parent(
+            provider=self.provider,
+            base_config=self.config,
+            tool_definitions=self.tool_definitions,
+            tool_handler=self.tool_handler,
+            agent_factory=type(self),
+            workspace_dir=str(workspace_dir) if workspace_dir else None,
+            usage_tracker=self._usage_tracker,
+            session_key=self._session_key,
+        )
+        llm_chat = (
+            getattr(self, "_test_llm_chat_override", None)
+            or (
+                make_llm_chat_from_provider(
+                    provider=self.provider,
+                    base_config=self.config,
+                    usage_tracker=self._usage_tracker,
+                    session_key=self._session_key,
+                )
+                if self.provider is not None
+                else None
+            )
+        )
+        tool_invoker = (
+            make_tool_invoker_from_handler(tool_handler=self.tool_handler)
+            if self.tool_handler is not None
+            else None
+        )
+
+        orch = MetaOrchestrator(
+            agent_runner=runner,
+            skill_loader=skill_loader,
+            llm_chat=llm_chat,
+            tool_invoker=tool_invoker,
+            workspace_dir=str(workspace_dir) if workspace_dir else None,
+            run_writer=self._meta_run_writer,
+            triggered_by="resume",
+            session_key=getattr(self, "_session_key", None),
+            turn_id=getattr(self, "_turn_id", None),
+            memory_persist_enabled=True,
+            usage_tracker=self._usage_tracker,
+        )
+
+        result: Any = None
+        final_text_parts: list[str] = []
+        try:
+            async for ev in orch.iter_resume_events(
+                payload=claim,
+                filled_fields=parsed,
+            ):
+                if isinstance(ev, MetaResult):
+                    result = ev
+                    continue
+                # Stream nested AgentEvents through (TextDelta, ToolUseStart,
+                # ToolResult). Capture text deltas so we can render the
+                # final assistant text for the transcript / Done event.
+                from opensquilla.engine.types import TextDeltaEvent
+                if isinstance(ev, TextDeltaEvent) and ev.text:
+                    final_text_parts.append(ev.text)
+                yield ev
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("agent.meta_resume_failed", extra={"error": str(exc)})
+            yield DoneEvent(text="", input_tokens=0, output_tokens=0, iterations=0)
+            return
+
+        # Build the final assistant text. If the DAG re-paused, use the
+        # rendered form text; otherwise use the orchestrator's final_text.
+        if result is not None:
+            if result.paused:
+                from opensquilla.engine.turn_runner.turn_finalizer_stage import (
+                    render_paused_outcome,
+                )
+                final_text = render_paused_outcome(result)
+            else:
+                final_text = result.final_text or "".join(final_text_parts)
+            # Emit one synthetic TextDelta for any text not already streamed
+            # (re-pause path) so the transcript / surface sees it.
+            already_streamed = "".join(final_text_parts)
+            if final_text and final_text != already_streamed:
+                from opensquilla.engine.types import TextDeltaEvent
+                yield TextDeltaEvent(text=final_text)
+        else:
+            final_text = "".join(final_text_parts)
+
+        yield DoneEvent(
+            text=final_text,
+            input_tokens=0,
+            output_tokens=0,
+            iterations=1,
+            cost_usd=0.0,
+            cost_source="none",
+            model=self.config.model_id or "",
+        )
+
+    def _read_clarify_outcome(
+        self, metadata: dict[str, Any],
+    ) -> tuple[str, bool] | None:
+        """Translate meta_resolution awaiting-branch metadata into the
+        user-visible text dictated by spec §10.
+
+        Returns ``(text, terminates)`` on hit, ``None`` when no clarify
+        outcome is staged. Pops the consumed keys so the same turn can't
+        re-handle them and a re-entry into ``_turn_generator`` won't
+        echo a stale outcome.
+        """
+        # parse-failure (<3 strikes) — show error list + re-render form
+        errors = metadata.pop("meta_clarify_errors", None)
+        reprompt = metadata.pop("meta_clarify_reprompt", None)
+        if errors and reprompt is not None:
+            return self._render_clarify_errors(errors, reprompt), True
+
+        cancelled = metadata.pop("meta_clarify_cancelled", None)
+        reason = metadata.pop("meta_clarify_cancel_reason", "")
+        if cancelled is not None:
+            if reason == "parse_failure_limit":
+                return "无法解析回复，已取消上一轮收集。", True
+            return "好，已取消。", True
+
+        expired = metadata.pop("meta_clarify_expired", None)
+        if expired is not None:
+            return "上一轮收集已超时，请重新发起。", True
+
+        race_lost = metadata.pop("meta_clarify_race_lost", None)
+        if race_lost is not None:
+            return "你之前的回答已被处理。", True
+
+        return None
+
+    def _render_clarify_errors(
+        self, errors: Any, awaiting: Any,
+    ) -> str:
+        """Build the parse-error feedback block plus a re-rendered form.
+
+        ``errors`` is the ``list[str]`` returned by ``parse_clarify_reply``;
+        ``awaiting`` is the ``AwaitingPeek`` row whose ``awaiting_schema_json``
+        is reused to render the form a second time.
+        """
+        from opensquilla.engine.turn_runner.turn_finalizer_stage import (
+            render_paused_outcome,
+        )
+        from opensquilla.skills.meta.plan_serde import (
+            clarify_config_from_jsonable,
+        )
+        from opensquilla.skills.meta.types import MetaPaused, MetaResult
+
+        lines: list[str] = ["未能解析回复："]
+        for err in (errors or []):
+            lines.append(f"  - {err}")
+        try:
+            schema_payload = json.loads(awaiting.awaiting_schema_json or "{}")
+            cfg = clarify_config_from_jsonable(schema_payload)
+            synthetic = MetaResult(
+                ok=False,
+                paused=True,
+                paused_payload=MetaPaused(
+                    run_id=awaiting.run_id,
+                    step_id=awaiting.step_id,
+                    schema=cfg,
+                    intro=cfg.intro,
+                ),
+            )
+            form_text = render_paused_outcome(synthetic)
+            if form_text:
+                lines.append("")
+                lines.append(form_text)
+        except Exception:  # noqa: BLE001 — best-effort re-render
+            lines.append("")
+            lines.append("请按上次的表单格式重新回答，或回 '取消' 终止。")
+        return "\n".join(lines)
+
+    async def _emit_terminal_text(
+        self, text: str, *, iterations: int,
+    ) -> AsyncIterator[Any]:
+        """Yield ``TextDeltaEvent(text)`` + a minimal ``DoneEvent`` so the
+        stream consumer + transcript treat this as a full assistant turn."""
+        from opensquilla.engine.types import DoneEvent, TextDeltaEvent
+        if text:
+            yield TextDeltaEvent(text=text)
+        yield DoneEvent(
+            text=text,
+            input_tokens=0,
+            output_tokens=0,
+            iterations=iterations,
+            cost_usd=0.0,
+            cost_source="none",
+            model=self.config.model_id or "",
+        )
 
     def _format_meta_invoke_failure(
         self,
@@ -4818,6 +5333,13 @@ class Agent:
             tool_failure_loop_block_threshold=(self.config.tool_failure_loop_block_threshold),
             max_safe_tool_concurrency=self.config.max_safe_tool_concurrency,
             tool_result_external_keep_recent=self.config.tool_result_external_keep_recent,
+            tool_result_store_dir=self.config.tool_result_store_dir,
+            tool_result_store_session_id=self.config.tool_result_store_session_id,
+            tool_result_store_session_key=self.config.tool_result_store_session_key,
+            tool_result_store_agent_id=self.config.tool_result_store_agent_id,
+            tool_result_store_max_bytes=self.config.tool_result_store_max_bytes,
+            tool_result_store_disk_budget_bytes=(self.config.tool_result_store_disk_budget_bytes),
+            tool_result_store_retention_seconds=(self.config.tool_result_store_retention_seconds),
         )
         return Agent(
             provider=self.provider,

@@ -8,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
+from contextvars import ContextVar
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,8 @@ from opensquilla.engine.steps.meta_resolution import _trigger_matches
 from opensquilla.skills.creator.patterns import PATTERN_SLOT_SCHEMA
 from opensquilla.skills.loader import SkillLoader
 from opensquilla.tools.registry import tool
+
+from .runtime_e2e import run_runtime_e2e_gate
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "patterns"
 _log = structlog.get_logger(__name__)
@@ -49,11 +53,33 @@ def _strip_code_fences(text: str) -> str:
 
 
 def _jinja_env() -> Environment:
-    return Environment(
+    env = Environment(
         loader=FileSystemLoader(_TEMPLATES_DIR),
         undefined=StrictUndefined,
         keep_trailing_newline=True,
     )
+    env.globals["creator_step_kind"] = _creator_step_kind
+    return env
+
+
+@lru_cache(maxsize=256)
+def _creator_step_kind(skill_name: str) -> str:
+    """Return the safest generated meta-step kind for a bundled skill.
+
+    Skills with an entrypoint should be composed as ``skill_exec`` so the
+    runtime executes the wrapped CLI directly instead of asking a sub-Agent to
+    describe a command. Plain skills stay as agent steps.
+    """
+    bundled = Path(__file__).resolve().parents[1] / "bundled"
+    loader = SkillLoader(
+        bundled_dir=bundled,
+        snapshot_path=Path(tempfile.gettempdir()) / "creator-kind-snap.json",
+    )
+    loader.invalidate_cache()
+    spec = loader.get_by_name(skill_name)
+    if spec is not None and getattr(spec, "entrypoint", None):
+        return "skill_exec"
+    return "agent"
 
 
 def meta_skill_assemble(pattern_id: str, slots_json: str) -> str:
@@ -337,6 +363,58 @@ def _build_pattern_example(pattern_id: str) -> dict:
     return {}
 
 
+def _extract_required_triggers_from_intent(user_intent: str) -> list[str]:
+    """Extract trigger phrases the user explicitly required.
+
+    The LLM prompt asks for verbatim preservation, but FULL_GATED creator
+    output should not rely on the model remembering exact trigger phrases.
+    Keep this intentionally conservative: only parse clear "trigger phrases
+    include:" style clauses and stop at sentence/newline boundaries.
+    """
+    patterns = [
+        r"触发(?:短语|词)?(?:要|应|必须)?(?:包含|包括)\s*[:：]\s*([^\n。；;]+)",
+        r"trigger phrases?\s+(?:must\s+)?(?:include|contain)\s*[:：]\s*([^\n.;]+)",
+    ]
+    captured = ""
+    for pattern in patterns:
+        match = _re.search(pattern, user_intent, flags=_re.IGNORECASE)
+        if match:
+            captured = match.group(1)
+            break
+    if not captured:
+        return []
+
+    phrases: list[str] = []
+    seen: set[str] = set()
+    for raw in _re.split(r"[、，,]+", captured):
+        phrase = raw.strip().strip("`'\"“”‘’[]()")
+        if not phrase or phrase in seen:
+            continue
+        # Preserve only safe, plausible trigger phrases. This mirrors schema
+        # YAML-safety constraints without accepting long trailing prose.
+        if any(ch in phrase for ch in ('"', "\n", "\r", "\\")):
+            continue
+        if len(phrase) > 80:
+            continue
+        seen.add(phrase)
+        phrases.append(phrase)
+    return phrases
+
+
+def _preserve_required_triggers(validated: Any, schema: Any, user_intent: str) -> Any:
+    required = _extract_required_triggers_from_intent(user_intent)
+    if not required:
+        return validated
+    data = validated.model_dump()
+    current = [t for t in data.get("triggers", []) if isinstance(t, str)]
+    merged: list[str] = []
+    for phrase in [*required, *current]:
+        if phrase not in merged:
+            merged.append(phrase)
+    data["triggers"] = merged[:8]
+    return schema.model_validate(data)
+
+
 def meta_skill_fill_slots(
     pattern_id: str, history_summary: str, user_intent: str,
 ) -> str:
@@ -370,6 +448,8 @@ def meta_skill_fill_slots(
         f"Emit ONLY a JSON object matching the schema above. No prose. No markdown.\n"
         f"CRITICAL field-name rules:\n"
         f"- The list of phrases is called `triggers` (NOT `trigger_condition`).\n"
+        f"- If User intent names exact required trigger phrases, include those "
+        f"phrases verbatim in `triggers` before adding optional synonyms.\n"
         f"- The pipeline is called `steps` (NOT `execution_sequence`, `pipeline`, "
         f"`actions`, or `sequence`).\n"
         f"- Each step must have: id (str, snake_case), skill (str from catalog), "
@@ -381,6 +461,7 @@ def meta_skill_fill_slots(
     response = _strip_code_fences(response)  # Fix #A
     try:
         validated = schema.model_validate_json(response)
+        validated = _preserve_required_triggers(validated, schema, user_intent)
         return str(validated.model_dump_json())
     except ValidationError as exc:
         # Fix #B: log raw response on initial failure so E2E logs capture LLM output.
@@ -404,6 +485,7 @@ def meta_skill_fill_slots(
         retry_response = _strip_code_fences(retry_response)  # Fix #A
         try:
             validated = schema.model_validate_json(retry_response)
+            validated = _preserve_required_triggers(validated, schema, user_intent)
             return str(validated.model_dump_json())
         except ValidationError as retry_exc:
             # Fix #B: log raw response on retry failure.
@@ -574,6 +656,21 @@ _PROPOSALS_SCRIPT = (
     / "bundled" / "skill-creator-proposals" / "scripts" / "proposals.py"
 )
 
+_RUNTIME_E2E_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
+    "opensquilla_meta_skill_runtime_e2e_context",
+    default=None,
+)
+
+
+def set_runtime_e2e_context(ctx: dict[str, Any] | None):
+    """Install the runtime E2E runner for the current async context."""
+
+    return _RUNTIME_E2E_CONTEXT.set(ctx)
+
+
+def reset_runtime_e2e_context(token) -> None:
+    _RUNTIME_E2E_CONTEXT.reset(token)
+
 
 # ---------------------------------------------------------------------------
 # Sync core implementations for lint / smoke / persist
@@ -629,6 +726,11 @@ def meta_skill_persist_proposal(
     lint_result: str,
     smoke_result: str,
     home: str = "",
+    *,
+    creator_mode: str = "",
+    acceptance_result: str = "",
+    runtime_e2e_result: str = "",
+    auto_enable_manual: bool = True,
 ) -> str:
     """Write a proposal candidate to ~/.opensquilla/proposals/<id>/. Returns JSON."""
     home_path = Path(home).expanduser() if home else None
@@ -636,7 +738,10 @@ def meta_skill_persist_proposal(
             "--action", "write_proposal",
             "--skill-md-inline", skill_md,
             "--lint-result", lint_result,
-            "--smoke-result", smoke_result]
+            "--smoke-result", smoke_result,
+            "--creator-mode", creator_mode,
+            "--acceptance-result", acceptance_result,
+            "--runtime-e2e-result", runtime_e2e_result]
     if home:
         args.extend(["--home", home])
     proc = subprocess.run(args, capture_output=True, text=True, check=False)
@@ -650,7 +755,12 @@ def meta_skill_persist_proposal(
         out = json.loads(proc.stdout)
     except json.JSONDecodeError:
         return proc.stdout
-    if out.get("status") == "ok" and out.get("proposal_id") and home_path is not None:
+    if (
+        auto_enable_manual
+        and out.get("status") == "ok"
+        and out.get("proposal_id")
+        and home_path is not None
+    ):
         _maybe_auto_enable_manual_proposal(home_path, str(out["proposal_id"]), out)
     return json.dumps(out, ensure_ascii=False)
 
@@ -766,6 +876,56 @@ async def meta_skill_smoke_run_tool(
     )
 
 
+async def meta_skill_runtime_e2e_run(
+    skill_md: str,
+    eval_prompts: str = "",
+    baseline_model: str = "",
+) -> str:
+    ctx = _RUNTIME_E2E_CONTEXT.get()
+    if not ctx:
+        return json.dumps({
+            "status": "unavailable",
+            "passed": False,
+            "winner": "",
+            "reason": "runtime_e2e_context_unavailable",
+            "cases": [],
+        }, ensure_ascii=False)
+    result = await run_runtime_e2e_gate(
+        skill_md=skill_md,
+        eval_prompts=eval_prompts,
+        baseline_model=baseline_model or str(ctx.get("baseline_model") or ""),
+        runner=ctx["runner"],
+        judge=ctx["judge"],
+    )
+    return json.dumps(result, ensure_ascii=False)
+
+
+@tool(
+    name="meta_skill_runtime_e2e_run",
+    description=(
+        "Run the candidate meta-skill on eval prompts and compare it against "
+        "a no-meta highest-tier baseline. Returns JSON gate results."
+    ),
+    params={
+        "skill_md": {"type": "string"},
+        "eval_prompts": {"type": "string"},
+        "baseline_model": {"type": "string"},
+    },
+    required=["skill_md"],
+    exposed_by_default=False,
+)
+async def meta_skill_runtime_e2e_run_tool(
+    skill_md: str,
+    eval_prompts: str = "",
+    baseline_model: str = "",
+) -> str:
+    return await meta_skill_runtime_e2e_run(
+        skill_md=skill_md,
+        eval_prompts=eval_prompts,
+        baseline_model=baseline_model,
+    )
+
+
 @tool(
     name="meta_skill_persist_proposal",
     description=(
@@ -776,6 +936,10 @@ async def meta_skill_smoke_run_tool(
         "skill_md": {"type": "string"},
         "lint_result": {"type": "string"},
         "smoke_result": {"type": "string"},
+        "creator_mode": {"type": "string"},
+        "acceptance_result": {"type": "string"},
+        "runtime_e2e_result": {"type": "string"},
+        "auto_enable_manual": {"type": "boolean"},
         "home": {"type": "string"},
     },
     required=["skill_md", "lint_result", "smoke_result"],
@@ -786,10 +950,22 @@ async def meta_skill_persist_proposal_tool(
     lint_result: str,
     smoke_result: str,
     home: str = "",
+    creator_mode: str = "",
+    acceptance_result: str = "",
+    runtime_e2e_result: str = "",
+    auto_enable_manual: bool = True,
 ) -> str:
     import asyncio
     return await asyncio.to_thread(
-        meta_skill_persist_proposal, skill_md, lint_result, smoke_result, home,
+        meta_skill_persist_proposal,
+        skill_md,
+        lint_result,
+        smoke_result,
+        home,
+        creator_mode=creator_mode,
+        acceptance_result=acceptance_result,
+        runtime_e2e_result=runtime_e2e_result,
+        auto_enable_manual=auto_enable_manual,
     )
 
 

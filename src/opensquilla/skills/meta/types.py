@@ -76,6 +76,84 @@ class MetaStep:
     # THIS step's id, so downstream depends_on links remain satisfied.
     # Empty string = no substitute (DAG fails normally on error).
     on_failure: str = ""
+    # New in PR1 (design §6): populated only when kind == "user_input".
+    # All other step kinds keep this as None and the executor layer
+    # ignores it. Frozen at parse time; the orchestrator never mutates.
+    clarify_config: ClarifyStepConfig | None = None
+
+
+@dataclass(frozen=True)
+class ClarifyField:
+    """One field in a user_input step's collection schema.
+
+    The user-input schema parser owns the concrete validation contract.
+    The validator semantics (min/max for int, max_chars for string, choices
+    for enum) are enforced by parser.py and at field-value-collection time;
+    this dataclass is the static declaration only.
+    """
+
+    name: str
+    type: str  # "string" | "enum" | "int" | "bool"
+    required: bool = False
+    prompt: str = ""
+    choices: tuple[str, ...] = ()
+    default: Any = None
+    min: int | None = None
+    max: int | None = None
+    max_chars: int | None = None
+
+
+@dataclass(frozen=True)
+class ClarifyStepConfig:
+    """Static schema describing what a user_input step collects.
+
+    All side-effect semantics (skip_if evaluation, cancel detection,
+    timeout, nl_extract LLM call) live in the executor and meta_resolution
+    layer; this dataclass is the parsed declaration only.
+    """
+
+    mode: str  # "form" | "chat"
+    fields: tuple[ClarifyField, ...]
+    skip_if: str = ""
+    cancel_keywords: tuple[str, ...] = ()
+    timeout_hours: int = 24
+    intro: str = ""
+    nl_extract: bool = False
+    nl_extract_tier: str = ""  # "" ⇒ lowest configured router tier
+
+
+class MetaPaused(Exception):  # noqa: N818
+    """Control-flow signal raised by the user_input executor.
+
+    Carries enough information to render a clarify form on any surface
+    (Web / CLI / IM) without re-loading the SkillSpec from disk.
+    Subclasses Exception so it can propagate through asyncio's task
+    machinery; the scheduler intercepts it ahead of CancelledError /
+    generic Exception per design §8.1.
+
+    NOTE: design §6 declares this as ``@dataclass(frozen=True)``, but
+    frozen dataclasses cannot subclass Exception cleanly (the
+    ``__init__`` rewrites collide with BaseException.args bookkeeping).
+    PR1 implements the same surface as a hand-written class with a
+    keyword-only constructor; treat instances as immutable by
+    convention.
+    """
+
+    __slots__ = ("run_id", "step_id", "schema", "intro")
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        step_id: str,
+        schema: ClarifyStepConfig,
+        intro: str = "",
+    ) -> None:
+        super().__init__(f"meta-skill paused at step {step_id!r}")
+        self.run_id = run_id
+        self.step_id = step_id
+        self.schema = schema
+        self.intro = intro
 
 
 @dataclass(frozen=True)
@@ -122,3 +200,6 @@ class MetaResult:
     step_outputs: dict[str, str] = field(default_factory=dict)
     error: str | None = None
     failed_step_id: str | None = None
+    # New in PR3 (design §8.1, §8.3): pause signal vs failure distinction.
+    paused: bool = False
+    paused_payload: MetaPaused | None = None

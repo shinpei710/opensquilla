@@ -69,8 +69,13 @@ SOFTWARE.
 These bundled skill descriptors are authored and maintained by OpenSquilla and
 are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 
+- `cron`
+- `deep-research`
+- `docx`
 - `git-diff`
+- `github`
 - `history-explorer`
+- `html-to-pdf`
 - `http-fetch`
 - `latex-compile`
 - `memory`
@@ -91,19 +96,13 @@ are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 - `meta-scheduled-morning-digest`
 - `meta-security-review-bundle`
 - `meta-skill-creator`
-- `skill-creator-linter`
-- `skill-creator-proposals`
-- `skill-creator-smoke-test`
-- `stack-trace-generic-probe`
-- `stack-trace-go-probe`
-- `stack-trace-js-probe`
-- `stack-trace-python-probe`
-- `stack-trace-rust-probe`
 - `meta-spreadsheet-insight`
 - `meta-stack-trace-investigator`
 - `meta-travel-planner`
 - `meta-web-research-to-report`
 - `meta-web-to-pdf-briefing`
+- `multi-search-engine`
+- `nano-pdf`
 - `paper-abstract-author`
 - `paper-citation-planner`
 - `paper-experiment-stub`
@@ -114,6 +113,22 @@ are released under OpenSquilla's repository license (Apache-2.0; see `LICENSE`):
 - `paper-revision-author`
 - `paper-section-author`
 - `paper-source-curator`
+- `pdf-toolkit`
+- `pptx`
+- `skill-creator`
+- `skill-creator-linter`
+- `skill-creator-proposals`
+- `skill-creator-smoke-test`
+- `stack-trace-generic-probe`
+- `stack-trace-go-probe`
+- `stack-trace-js-probe`
+- `stack-trace-python-probe`
+- `stack-trace-rust-probe`
+- `sub-agent`
+- `summarize`
+- `tmux`
+- `weather`
+- `xlsx`
 
 ## tokenjuice adapted reduction rules
 

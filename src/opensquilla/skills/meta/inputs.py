@@ -22,4 +22,8 @@ def make_meta_inputs(*, user_message: str, system_prompt: Any = "") -> dict[str,
     return {
         "user_message": user_message,
         "system_prompt": system_prompt_input(system_prompt),
+        # Populated by MetaOrchestrator.resume() in PR3; downstream
+        # template authors address structured user_input values as
+        # `inputs.collected.<step_id>.<field>` (see design §5.3).
+        "collected": {},
     }

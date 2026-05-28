@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass, is_dataclass
-from typing import Any, cast
+from dataclasses import asdict, dataclass
+from typing import Any
 
 DEFAULT_HOLD_TURNS = 4
 DEFAULT_HOLD_TTL_SECONDS = 600.0
@@ -276,17 +276,30 @@ def router_control_payload_terminates_turn(content: object) -> bool:
     return bool(payload and payload.get("accepted") is True and payload.get("replay_required"))
 
 
-def router_control_replay_payload(content: object) -> dict[str, Any] | None:
+def router_control_replay_event_from_payload(
+    content: object,
+    *,
+    replay_depth: int = 0,
+) -> Any | None:
     payload = router_control_payload(content)
     if not payload or payload.get("accepted") is not True or not payload.get("replay_required"):
         return None
-    return payload
+    from opensquilla.engine.types import RouterControlReplayEvent
+
+    return RouterControlReplayEvent(
+        action=str(payload.get("action") or ""),
+        target_tier=payload.get("target_tier"),
+        target_model=payload.get("target_model"),
+        target_provider=payload.get("target_provider"),
+        target_id=payload.get("target_id"),
+        replay_depth=replay_depth,
+    )
 
 
 def router_control_payload_asdict(content: object) -> dict[str, Any]:
     payload = router_control_payload(content)
     if payload is not None:
         return payload
-    if is_dataclass(content) and not isinstance(content, type):
-        return cast(dict[str, Any], asdict(content))
+    if hasattr(content, "__dataclass_fields__"):
+        return asdict(content)
     return {}

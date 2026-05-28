@@ -202,6 +202,28 @@ async def test_meta_resolution_matches_trigger() -> None:
 
 
 @pytest.mark.asyncio
+async def test_meta_resolution_soft_hint_directs_meta_invoke_not_skill_view() -> None:
+    spec = _make_meta_spec(
+        composition={"steps": [{"id": "a", "skill": "summarize"}]},
+        triggers=["travel plan"],
+        priority=10,
+    )
+    loader = _FakeLoader([spec])
+    ctx = SimpleNamespace(
+        message="please make a travel plan for Dalian",
+        semantic_message="please make a travel plan for Dalian",
+        metadata={"skill_loader": loader},
+        system_prompt=("base prompt", ""),
+    )
+
+    out = await meta_resolution(ctx)  # type: ignore[arg-type]
+
+    hint = out.system_prompt[1]
+    assert 'call `meta_invoke(name="meta-x")`' in hint
+    assert "Do not call `skill_view` for this meta-skill" in hint
+
+
+@pytest.mark.asyncio
 async def test_meta_resolution_noops_when_meta_skill_config_disabled() -> None:
     spec = _make_meta_spec(
         composition={"steps": [{"id": "a", "skill": "summarize"}]},
@@ -290,6 +312,43 @@ async def test_meta_resolution_promotes_meta_skill_creator_to_highest_text_tier(
     assert out.metadata["routed_model"] == "frontier-model"
     assert out.metadata["routing_source"] == "meta_skill_required_tier"
     assert out.metadata["routing_confidence"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_meta_resolution_does_not_promote_non_creator_meta_to_highest_text_tier() -> None:
+    spec = _make_meta_spec(
+        name="meta-pdf-intelligence",
+        composition={"steps": [{"id": "a", "skill": "summarize"}]},
+        triggers=["PDF intelligence"],
+        priority=55,
+    )
+    loader = _FakeLoader([spec])
+    ctx = SimpleNamespace(
+        message="Run this as a PDF intelligence task",
+        semantic_message="Run this as a PDF intelligence task",
+        model="router-default-model",
+        system_prompt=("base system prompt", ""),
+        metadata={"skill_loader": loader},
+        config=SimpleNamespace(
+            squilla_router=SimpleNamespace(
+                tiers={
+                    "t1": {"model": "cheap-model"},
+                    "t3": {"model": "frontier-model"},
+                    "vision": {"model": "vision-model", "image_only": True},
+                },
+            ),
+        ),
+    )
+
+    out = await meta_resolution(ctx)  # type: ignore[arg-type]
+
+    assert out.metadata["meta_match"].plan.name == "meta-pdf-intelligence"
+    assert out.model == "router-default-model"
+    assert "meta_required_tier" not in out.metadata
+    assert "meta_required_model" not in out.metadata
+    assert "meta_required_source" not in out.metadata
+    assert "routing_source" not in out.metadata
+    assert "routing_confidence" not in out.metadata
 
 
 @pytest.mark.asyncio
@@ -507,12 +566,24 @@ def test_bundled_sample_loads(tmp_path: Path) -> None:
     loader = SkillLoader(bundled_dir=bundled, snapshot_path=snapshot)
     loader.invalidate_cache()
     specs = {s.name: s for s in loader.load_all()}
-    meta = specs.get("meta-web-to-pdf-briefing")
+    meta = specs.get("meta-web-research-to-report")
     assert meta is not None
     assert meta.kind == "meta"
     plan = parse_meta_plan(meta)
     assert plan is not None
-    assert [s.id for s in plan.steps] == ["search", "digest", "render"]
+    assert [s.id for s in plan.steps] == [
+        "preferences",
+        "report_mode",
+        "search",
+        "source_quality",
+        "research",
+        "outline",
+        "report_draft",
+        "source_to_claim",
+        "quality_gate",
+        "final_report",
+        "export",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1236,7 +1307,7 @@ async def test_make_llm_chat_from_provider_uses_deliverable_sized_token_budget()
     )
 
     assert await llm_chat("system", "user") == "ok"
-    assert captured["max_tokens"] == 4096
+    assert captured["max_tokens"] == 16384
 
 
 @pytest.mark.asyncio
@@ -2135,6 +2206,60 @@ async def test_iter_events_forwards_subagent_tool_events_but_folds_text() -> Non
 
 
 @pytest.mark.asyncio
+async def test_paper_section_author_uses_llm_chat_without_subagent_tools() -> None:
+    """paper-section-author is a text-only section writer.
+
+    Running it as a full sub-Agent exposes shell/code tools, which can turn a
+    single section into a long write/check/rewrite loop. When the orchestrator
+    has an LLM-only dependency, this skill should bypass the sub-Agent runner.
+    """
+
+    spec = _make_meta_spec(
+        composition={
+            "steps": [
+                {
+                    "id": "abstract",
+                    "kind": "agent",
+                    "skill": "paper-section-author",
+                    "with": {"task": "Write the abstract."},
+                },
+            ],
+        },
+    )
+    plan = parse_meta_plan(spec)
+    assert plan is not None
+
+    async def explode_runner(_s: str, _u: str) -> AsyncIterator[AgentEvent]:
+        raise AssertionError("paper-section-author must not use sub-Agent tools")
+        if False:
+            yield DoneEvent(text="")  # pragma: no cover
+
+    llm_calls: list[tuple[str, str]] = []
+
+    async def llm_chat(system_prompt: str, user_message: str) -> str:
+        llm_calls.append((system_prompt, user_message))
+        return "\\begin{abstract}\nFast section.\n\\end{abstract}"
+
+    orch = MetaOrchestrator(
+        agent_runner=explode_runner,
+        skill_loader=_FakeLoader([
+            _make_skill_spec("paper-section-author", content="SECTION BODY"),
+        ]),
+        llm_chat=llm_chat,
+    )
+
+    final: MetaResult | None = None
+    async for ev in orch.iter_events(MetaMatch(plan=plan, inputs={})):
+        if isinstance(ev, MetaResult):
+            final = ev
+
+    assert final is not None and final.ok
+    assert len(llm_calls) == 1
+    assert "SECTION BODY" in llm_calls[0][0]
+    assert "\\begin{abstract}" in final.final_text
+
+
+@pytest.mark.asyncio
 async def test_iter_events_emits_error_result_on_step_failure() -> None:
     from opensquilla.engine.types import ToolResultEvent
     from opensquilla.skills.meta.types import MetaResult
@@ -2286,33 +2411,6 @@ async def test_drain_agent_runner_fails_when_sub_agent_produces_no_text() -> Non
     assert result.error and "no plain-text output" in result.error
 
 
-def test_bundled_kb_bootstrap_has_routes() -> None:
-    bundled = Path(__file__).resolve().parents[2] / "src" / "opensquilla" / "skills" / "bundled"
-    skill_path = bundled / "meta-knowledge-base-bootstrap" / "SKILL.md"
-    assert skill_path.is_file()
-    loader = SkillLoader(
-        bundled_dir=bundled,
-        snapshot_path=Path("/tmp/_kb_bootstrap_snap.json"),
-    )
-    loader.invalidate_cache()
-    specs = {s.name: s for s in loader.load_all()}
-    kb = specs["meta-knowledge-base-bootstrap"]
-    plan = parse_meta_plan(kb)
-    assert plan is not None
-    by_id = {s.id: s for s in plan.steps}
-    assert {"classify", "ingest", "memorize", "index"} <= set(by_id)
-    # classify must use the lightweight llm_classify executor, not a sub-Agent.
-    assert by_id["classify"].kind == "llm_classify"
-    assert set(by_id["classify"].output_choices) == {"URL", "PDF", "GIT", "TEXT"}
-    # ingest must run multi-search-engine deterministically via skill_exec
-    # (no sub-Agent in the loop for the wrapped-CLI step).
-    assert by_id["ingest"].kind == "skill_exec"
-    assert by_id["ingest"].skill == "multi-search-engine"
-    # memorize must call memory_save directly — no LLM in the loop.
-    assert by_id["memorize"].kind == "tool_call"
-    assert by_id["memorize"].tool == "memory_save"
-
-
 def test_bundled_migration_assistant_has_routes() -> None:
     bundled = Path(__file__).resolve().parents[2] / "src" / "opensquilla" / "skills" / "bundled"
     skill_path = bundled / "meta-migration-assistant" / "SKILL.md"
@@ -2342,4 +2440,5 @@ def test_bundled_migration_assistant_has_routes() -> None:
     assert fetch.skill == "deep-research"
     repo_context = plan.steps[2]
     assert repo_context.skill == "git-diff"
-    assert "current repo" in repo_context.when
+    assert "current diff" in repo_context.when
+    assert "current branch" in repo_context.when

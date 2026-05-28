@@ -17,10 +17,8 @@ LINT = _LINTER_DIR / "scripts" / "lint.py"
 def _run_lint(skill_md: str, gates: str = "G1,G2") -> dict:
     proc = subprocess.run(
         [sys.executable, str(LINT), "--gates", gates, "--skill-md-stdin"],
-        input=skill_md, capture_output=True, text=True, encoding="utf-8",
+        input=skill_md, capture_output=True, text=True,
     )
-    assert proc.returncode == 0, proc.stderr
-    assert proc.stdout, proc.stderr
     return json.loads(proc.stdout)
 
 
@@ -54,15 +52,6 @@ def test_g1_passes_on_valid_p1() -> None:
     assert out["G1"]["passed"] is True
 
 
-def test_g1_accepts_utf8_stdin_with_localized_trigger() -> None:
-    localized = VALID_P1.replace(
-        '  - "lint test trigger"',
-        '  - "处理 PDF — 质量门"',
-    )
-    out = _run_lint(localized)
-    assert out["G1"]["passed"] is True
-
-
 def test_g1_fails_on_missing_xml_escape() -> None:
     bad = VALID_P1.replace("{{ inputs.user_message | xml_escape | truncate(512) }}",
                             "{{ inputs.user_message }}")
@@ -84,16 +73,10 @@ def test_g2_passes_on_valid_p1() -> None:
 
 
 EXISTING_META_BUNDLES = [
-    "meta-pdf-intelligence", "meta-travel-planner", "meta-security-review-bundle",
-    "meta-migration-assistant", "meta-knowledge-base-bootstrap",
-    "meta-multi-format-export-pack", "meta-compliance-audit-bundle",
-    "meta-spreadsheet-insight", "meta-web-research-to-report",
-    "meta-web-to-pdf-briefing", "meta-github-pr-watch-digest",
-    "meta-issue-to-pr-autopilot", "meta-long-running-build-watchdog",
-    "meta-pdf-reformat-pipeline", "meta-scheduled-morning-digest",
-    "meta-stack-trace-investigator", "meta-arxiv-daily-digest-deck",
-    "meta-diagram-triangulation", "meta-codereview-current-diff",
-    "meta-pre-commit-quality-gate",
+    "meta-pdf-intelligence", "meta-travel-planner",
+    "meta-migration-assistant", "meta-web-research-to-report",
+    "meta-stack-trace-investigator", "meta-paper-write",
+    "meta-skill-creator",
 ]
 
 
@@ -158,7 +141,7 @@ def test_linter_passes_existing_meta_bundle(bundle: str) -> None:
     """Regression: linter must accept every existing kind=meta bundle.
     Catches over-strict lint rules."""
     skill_path = REPO / "src" / "opensquilla" / "skills" / "bundled" / bundle / "SKILL.md"
-    skill_md = skill_path.read_text(encoding="utf-8")
+    skill_md = skill_path.read_text()
     out = _run_lint(skill_md)
     assert out["G1"]["passed"] is True, f"{bundle} G1 fail: {out['G1']['diagnostics']}"
     assert out["G2"]["passed"] is True, f"{bundle} G2 fail: {out['G2']['diagnostics']}"

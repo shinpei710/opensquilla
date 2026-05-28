@@ -1235,19 +1235,19 @@ git commit -m "Prove durable memory pipeline failure semantics"
 
 ## Risks And Mitigations
 
-- **Risk:** Checkpoint writes add latency to chat sends.  
+- **Risk:** Checkpoint writes add latency to chat sends.
   **Mitigation:** Write checkpoint only when destructive compaction/reset/truncate is about to remove history; do not require per-turn checkpoint before ordinary send.
 
-- **Risk:** DB ledger and file checkpoint can diverge.  
+- **Risk:** DB ledger and file checkpoint can diverge.
   **Mitigation:** File write happens first, ledger success second; startup/reconcile marks missing files as `receipt_orphaned` and backfills ledger rows for existing checkpoint files.
 
-- **Risk:** Repair queue grows forever.  
+- **Risk:** Repair queue grows forever.
   **Mitigation:** Retry schedule ends in `repair_abandoned`; health escalates backlog >10 or oldest >24h.
 
-- **Risk:** Existing strict/block behavior regresses.  
+- **Risk:** Existing strict/block behavior regresses.
   **Mitigation:** Preserve current flush receipt semantics when no checkpoint receipt is present; add tests for protect/block modes.
 
-- **Risk:** Checkpoint content leaks into recall.  
+- **Risk:** Checkpoint content leaks into recall.
   **Mitigation:** Dot-sidecar path, memory tool filtering, sync/index exclusion tests, and RPC health redaction.
 
 ## Verification Commands

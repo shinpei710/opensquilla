@@ -73,7 +73,7 @@ Output:
     }
   ],
   "errors": [
-    {"engine": "brave", "reason": "BRAVE_API_KEY not set; skipping"}
+    {"engine": "brave", "reason": "BRAVE_SEARCH_API_KEY/BRAVE_API_KEY not set; skipping"}
   ]
 }
 ```
@@ -87,7 +87,7 @@ Output:
 | `baidu` | no | — | Chinese-language web |
 | `sogou` | no | — | Chinese-language web |
 | `360` | no | — | Chinese-language web |
-| `brave` | yes | `BRAVE_API_KEY` | High-quality results, generous free tier |
+| `brave` | yes | `BRAVE_SEARCH_API_KEY` or legacy `BRAVE_API_KEY` | High-quality results, generous free tier |
 | `tavily` | yes | `TAVILY_API_KEY` | Designed for AI agents, returns clean JSON |
 | `serpapi` | yes | `SERPAPI_API_KEY` | Aggregator across many engines |
 

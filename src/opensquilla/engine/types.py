@@ -187,20 +187,15 @@ class RouterDecisionEvent:
     tier_index: int = -1
     model: str = ""
     baseline_model: str = ""
-    source: str = "none"          # router | forced | fallback | none
+    source: str = "none"
     confidence: float = 0.0
     probs: list[float] = field(default_factory=list)
     savings_pct: float = 0.0
     fallback: bool = False
     thinking_mode: str = ""
     prompt_policy: str = ""
-    # True when the routed model was actually swapped into the
-    # provider call for this turn. False in observe-mode rollouts,
-    # where the router records a hypothetical decision but the
-    # baseline model handles the turn. Frontend dims the strip and
-    # skips the hop animation when False.
     routing_applied: bool = True
-    rollout_phase: str = "full"   # full | observe | disabled
+    rollout_phase: str = "full"
 
 
 @dataclass
@@ -294,7 +289,7 @@ class AgentConfig:
     # Upper bound for same-turn safe tool execution. Safe tools can overlap, but
     # unbounded fan-out can overload local/network resources.
     max_safe_tool_concurrency: int = 6
-    max_tokens: int = 8192
+    max_tokens: int = 16384
     # Optional per-turn operator budgets. 0 disables the corresponding budget.
     max_turn_llm_calls: int = 0
     max_turn_input_tokens: int = 0
@@ -342,8 +337,17 @@ class AgentConfig:
     repair_max_items_per_tick: int = 5
     flush_workspace_dir: str | None = None
     model_capabilities: Any | None = None  # ModelCapabilities from provider.types
-    # Tokenjuice projection canonicalizes tool results immediately after tool
-    # execution. Raw tool output is transient and is not persisted separately.
+    # Tokenjuice projection: project eligible fresh tool results before the
+    # next LLM turn. This is not user-selectable behavior.
+    # Legacy compression knobs remain as compatibility shims for meta_invoke
+    # tests and embedded callers; the runtime's default path uses Tokenjuice.
+    tool_result_compression_enabled: bool = True
+    tool_result_compression_mode: Literal["off", "truncate", "summarize"] | None = None
+    tool_result_compression_max_share: float = 0.25
+    tool_result_compression_summary_model: str | None = None
+    tool_result_compression_summary_max_tokens: int = 1024
+    tool_result_compression_summary_timeout_seconds: float = 20.0
+    tool_result_compression_summary_input_max_chars: int = 60_000
     tool_result_projection_max_inline_chars: int = 60_000
     tool_result_provider_request_max_chars: int = 0
     provider_request_proof_max_chars: int = 0
@@ -351,6 +355,13 @@ class AgentConfig:
     tool_use_argument_projection_enabled: bool = False
     tool_result_external_keep_recent: int = 2
     tool_failure_loop_block_threshold: int = 3
+    tool_result_store_dir: str | None = None
+    tool_result_store_session_id: str | None = None
+    tool_result_store_session_key: str | None = None
+    tool_result_store_agent_id: str | None = None
+    tool_result_store_max_bytes: int | None = 8 * 1024 * 1024
+    tool_result_store_disk_budget_bytes: int | None = 256 * 1024 * 1024
+    tool_result_store_retention_seconds: int | None = 7 * 24 * 60 * 60
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def resolve_thinking(self, prompt: str | None = None) -> tuple[bool, int]:

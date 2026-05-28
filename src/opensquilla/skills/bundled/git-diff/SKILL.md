@@ -1,6 +1,6 @@
 ---
 name: git-diff
-description: "Capture the current git diff (staged, working-tree, or staged file list) as text. Used by meta-skills that review uncommitted code (meta-codereview-current-diff, meta-pre-commit-quality-gate). Direct shell call — no LLM agent loop."
+description: "Capture the current git diff (staged, working-tree, or staged file list) as text. Direct shell call for workflows that need repository diffs without an LLM agent loop."
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

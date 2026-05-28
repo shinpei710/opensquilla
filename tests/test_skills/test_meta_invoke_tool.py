@@ -68,7 +68,7 @@ async def test_meta_invoke_handler_raises_routing_error() -> None:
 
 # ---------------------------------------------------------------------------
 # Task 3: ToolResult.terminates_turn field + preservation through
-# Agent._canonicalize_tool_result rebuild sites.
+# Agent._compress_tool_result rebuild sites.
 # ---------------------------------------------------------------------------
 
 
@@ -86,32 +86,24 @@ def test_tool_result_has_terminates_turn_field() -> None:
 
 
 class _NullProvider:
-    """Minimal LLMProvider stand-in: never called by tool-result canonicalization."""
+    """Minimal LLMProvider stand-in: never called by _compress_tool_result."""
 
     provider_name = "null"
 
     def chat(self, *args: object, **kwargs: object) -> object:  # pragma: no cover
-        raise AssertionError("provider.chat must not be called by tool-result canonicalization")
+        raise AssertionError("provider.chat must not be called by _compress_tool_result")
 
     async def list_models(self) -> list[object]:  # pragma: no cover
         return []
 
 
 @pytest.mark.asyncio
-async def test_canonicalize_tool_result_preserves_terminates_turn_when_noop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When tokenjuice leaves content unchanged, terminates_turn must survive."""
-    import opensquilla.engine.agent as agent_mod
+async def test_compress_tool_result_preserves_terminates_turn_when_short() -> None:
+    """When content is short enough to not need compression, the rebuild
+    must still carry terminates_turn through."""
     from opensquilla.engine import Agent, AgentConfig
     from opensquilla.tool_boundary import ToolResult
 
-    monkeypatch.setattr(
-        agent_mod,
-        "reduce_tool_result_with_tokenjuice",
-        lambda **kwargs: None,
-        raising=False,
-    )
     agent = Agent(provider=_NullProvider(), config=AgentConfig())
 
     original = ToolResult(
@@ -121,26 +113,26 @@ async def test_canonicalize_tool_result_preserves_terminates_turn_when_noop(
         is_error=False,
         terminates_turn=True,
     )
-    canonical = await agent._canonicalize_tool_result(original)
-    assert canonical.terminates_turn is True
+    compressed = await agent._compress_tool_result(original)
+    assert compressed.terminates_turn is True
 
 
 @pytest.mark.asyncio
-async def test_canonicalize_tool_result_preserves_terminates_turn_when_projected(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When canonicalization rebuilds the result, terminates_turn must survive."""
-    import opensquilla.engine.agent as agent_mod
+async def test_compress_tool_result_preserves_terminates_turn_when_compressed() -> None:
+    """When content IS large enough to trigger compression, the rebuild
+    must STILL carry terminates_turn through (the other code path)."""
     from opensquilla.engine import Agent, AgentConfig
     from opensquilla.tool_boundary import ToolResult
 
-    monkeypatch.setattr(
-        agent_mod,
-        "reduce_tool_result_with_tokenjuice",
-        lambda **kwargs: None,
-        raising=False,
+    # Shrink context_window_tokens so 50_000 chars (~12500 tokens) exceeds
+    # the compression budget (context_window_tokens * max_share = 1000 * 0.25
+    # = 250 tokens). truncate mode keeps compression purely local — no
+    # provider call needed.
+    config = AgentConfig(
+        context_window_tokens=1000,
+        tool_result_compression_enabled=True,
+        tool_result_compression_mode="truncate",
     )
-    config = AgentConfig(tool_result_projection_max_inline_chars=1000)
     agent = Agent(provider=_NullProvider(), config=config)
 
     big_content = "x" * 50_000
@@ -151,13 +143,15 @@ async def test_canonicalize_tool_result_preserves_terminates_turn_when_projected
         is_error=False,
         terminates_turn=True,
     )
-    canonical = await agent._canonicalize_tool_result(original)
-    assert len(canonical.content) < len(big_content), (
-        "test setup error: fallback projection did not trigger"
+    compressed = await agent._compress_tool_result(original)
+    # Sanity-check the compression path actually fired (content shrunk).
+    assert len(compressed.content) < len(big_content), (
+        "test setup error: compression did not trigger; "
+        "second rebuild site would not be exercised"
     )
     # The FLAG must survive the rebuild.
-    assert canonical.terminates_turn is True, (
-        "terminates_turn lost during ToolResult canonicalization rebuild"
+    assert compressed.terminates_turn is True, (
+        "terminates_turn lost during ToolResult compression rebuild"
     )
 
 
@@ -681,7 +675,7 @@ async def test_run_one_streaming_propagates_current_turn_message_to_inputs(
 
     assert final is not None
     assert final.is_error is False
-    assert final.content == "meta-skill 'meta-tiny' completed; final answer streamed separately."
+    assert final.content == "meta-skill 'meta-tiny' completed."
     assert captured.get("inputs", {}).get("user_message") == "RAG in low-resource settings", (
         f"expected user_message to propagate from _current_turn_message; got {captured!r}"
     )
@@ -861,7 +855,7 @@ async def test_dispatch_intercepts_meta_invoke_and_terminates_turn(
         f"got: {streamed_text[:300]!r}"
     )
     success_contents = " | ".join(r.result or "" for r in meta_invoke_results)
-    assert "final answer streamed separately" in success_contents
+    assert "meta-skill 'meta-tiny' completed." in success_contents
 
     # The orchestrator emits ToolUseStartEvent / ToolResultEvent for each
     # meta-step (tool_name="meta-step:<step_id>"). The dispatch interceptor
@@ -989,7 +983,10 @@ async def test_dispatch_coerces_meta_skill_view_to_meta_invoke(
         "skill_view(name=<meta-skill>) must be coerced into meta_invoke"
     )
     assert all(not r.is_error for r in meta_invoke_results)
-    assert any("final answer streamed separately" in (r.result or "") for r in meta_invoke_results)
+    assert any(
+        "meta-skill 'meta-tiny' completed." in (r.result or "")
+        for r in meta_invoke_results
+    )
     assert "A" in "".join(e.text for e in events if isinstance(e, TextDeltaEvent))
 
 

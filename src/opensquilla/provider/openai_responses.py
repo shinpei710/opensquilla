@@ -219,7 +219,7 @@ class OpenAIResponsesProvider:
             payload["stop"] = config.stop_sequences
         if tools:
             payload["tools"] = [_responses_tool(tool) for tool in tools]
-            payload["tool_choice"] = "auto"
+            payload["tool_choice"] = config.tool_choice or "auto"
 
         try:
             async with httpx.AsyncClient(

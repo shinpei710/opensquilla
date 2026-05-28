@@ -141,6 +141,7 @@ METHOD_SCOPES: dict[str, str] = {
     "agent.wait": WRITE_SCOPE,
     "chat.send": WRITE_SCOPE,
     "chat.abort": WRITE_SCOPE,
+    "chat.clarify_submit": WRITE_SCOPE,
     "search.query": WRITE_SCOPE,
     "sessions.create": WRITE_SCOPE,
     "sessions.send": WRITE_SCOPE,
