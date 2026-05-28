@@ -414,6 +414,14 @@ const ChatView = (() => {
       .replace(/"/g, '&quot;');
   }
 
+  function _displayRoleLabel(role) {
+    return role === 'user' ? 'You'
+      : role === 'assistant' ? 'Squilla'
+      : role === 'subagent' ? 'Sub-agent'
+      : role ? role.charAt(0).toUpperCase() + role.slice(1)
+      : '';
+  }
+
   /* ── Inline SVG icons local to chat.js (icons.js owned by another agent) ── */
 
   // 14px sliders icon — three horizontal rails with knobs at different
@@ -503,7 +511,7 @@ const ChatView = (() => {
     const row = document.createElement('div');
     row.className = 'msg-actions';
     row.setAttribute('role', 'toolbar');
-    row.setAttribute('aria-label', role === 'user' ? 'User message actions' : 'Assistant message actions');
+    row.setAttribute('aria-label', role === 'user' ? 'User message actions' : 'Squilla message actions');
 
     if (role === 'assistant') {
       row.innerHTML =
@@ -2165,8 +2173,14 @@ const ChatView = (() => {
   }
 
   function _autoResizeTextarea() {
+    if (!_textarea) return;
+    if (!_textarea.value) {
+      _textarea.style.height = '';
+      return;
+    }
+    const minHeight = Number.parseFloat(getComputedStyle(_textarea).minHeight) || 40;
     _textarea.style.height = 'auto';
-    _textarea.style.height = Math.min(_textarea.scrollHeight, 160) + 'px';
+    _textarea.style.height = Math.max(minHeight, Math.min(_textarea.scrollHeight, 160)) + 'px';
   }
 
   /* ── Slash Command Menu ─────────────────────────────────────────────── */
@@ -3335,7 +3349,7 @@ const ChatView = (() => {
     // written to the transcript, never fed back to the LLM.
     _unsubs.push(_rpc.on('session.event.warning', (payload) => {
       if (_isStaleEpoch(payload)) return;
-      const msg = (payload && payload.message) || 'Assistant warning';
+      const msg = (payload && payload.message) || 'Squilla warning';
       UI.toast(msg, 'warn', 5000);
     }));
 
@@ -4397,7 +4411,7 @@ const ChatView = (() => {
       header.className = 'msg-header';
       const roleLabel = document.createElement('span');
       roleLabel.className = 'role-label';
-      roleLabel.textContent = 'Assistant';
+      roleLabel.textContent = _displayRoleLabel('assistant');
       header.appendChild(roleLabel);
       _thinkingEl.appendChild(header);
     }
@@ -4498,7 +4512,7 @@ const ChatView = (() => {
       if (!sameGroup) {
         _streamBubble.innerHTML = `
           <div class="msg-header">
-            <span class="role-label">Assistant</span>
+            <span class="role-label">${_esc(_displayRoleLabel('assistant'))}</span>
             <span class="savings-indicator"></span>
             <span class="msg-time"></span>
           </div>
@@ -5338,10 +5352,7 @@ const ChatView = (() => {
     const div = document.createElement('div');
     div.className = 'msg ' + displayRole;
 
-    const roleText = displayRole === 'user' ? 'You'
-      : displayRole === 'assistant' ? 'Assistant'
-      : displayRole === 'subagent' ? 'Sub-agent'
-      : displayRole.charAt(0).toUpperCase() + displayRole.slice(1);
+    const roleText = _displayRoleLabel(displayRole);
 
     // Collapse header for consecutive same-speaker messages within the same day.
     // Always show for system/error/tool roles.
@@ -5355,7 +5366,7 @@ const ChatView = (() => {
       const header = document.createElement('div');
       header.className = 'msg-header';
       if (isoStr) header.title = new Date(isoStr).toLocaleString();
-      header.innerHTML = `<span class="role-label">${roleText}</span>${_renderMessageTags(options)}<span class="msg-time">${_esc(timeStr)}</span>`;
+      header.innerHTML = `<span class="role-label">${_esc(roleText)}</span>${_renderMessageTags(options)}<span class="msg-time">${_esc(timeStr)}</span>`;
       div.appendChild(header);
     } else {
       // No header; attach ISO timestamp as title on the bubble body for hover tooltip
@@ -5591,7 +5602,7 @@ const ChatView = (() => {
     let md = `# Chat Export \u2014 ${_sessionKey}\n\n`;
     md += `Exported: ${new Date().toISOString()}\n\n---\n\n`;
     _messages.forEach((msg) => {
-      const role = msg.role === 'user' ? 'You' : msg.role === 'assistant' ? 'Assistant' : msg.role;
+      const role = _displayRoleLabel(msg.role) || msg.role;
       const time = msg.ts ? ` _(${new Date(msg.ts).toLocaleString()})_` : '';
       md += `### ${role}${time}\n\n${msg.text}${_artifactMarkdownLines(msg.artifacts || [])}\n\n---\n\n`;
     });
