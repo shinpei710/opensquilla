@@ -81,6 +81,7 @@ async def _latest_session_checkpoint_receipt(
     storage: Any,
     session_key: str,
     session_id: str | None,
+    expected_turn_id: str,
 ) -> Any | None:
     list_receipts = getattr(storage, "list_memory_durable_receipts", None)
     if not callable(list_receipts):
@@ -91,17 +92,54 @@ async def _latest_session_checkpoint_receipt(
             continue
         if session_id is not None and _receipt_field(receipt, "session_id") != session_id:
             continue
+        if _receipt_field(receipt, "turn_id") != expected_turn_id:
+            continue
         return receipt
     return None
 
 
-async def _durable_receipt_allows_current_destructive_compaction(
+def _checkpoint_turn_id_for_entries(entries: list[Any]) -> str | None:
+    if not entries:
+        return None
+    from opensquilla.memory.checkpoint import checkpoint_turn_id
+
+    return checkpoint_turn_id(entries)
+
+
+async def _durable_receipt_allows_covered_destructive_compaction(
     storage: Any,
     session_key: str,
     session_id: str | None,
+    entries: list[Any],
 ) -> bool:
-    receipt = await _latest_session_checkpoint_receipt(storage, session_key, session_id)
+    expected_turn_id = _checkpoint_turn_id_for_entries(entries)
+    if expected_turn_id is None:
+        return True
+    receipt = await _latest_session_checkpoint_receipt(
+        storage,
+        session_key,
+        session_id,
+        expected_turn_id,
+    )
     return durable_receipt_allows_destructive_compaction(receipt)
+
+
+def _truncate_removed_entries(transcript: list[Any], max_messages: int) -> list[Any]:
+    if max_messages < 0:
+        return list(transcript)
+    if len(transcript) <= max_messages:
+        return []
+    if max_messages == 0:
+        return list(transcript)
+    return list(transcript[:-max_messages])
+
+
+def _truncate_checkpoint_scope_entries(
+    transcript: list[Any],
+    max_messages: int,
+) -> list[Any]:
+    removed_entries = _truncate_removed_entries(transcript, max_messages)
+    return removed_entries or list(transcript)
 
 
 _attachment_media_type = _attachment_ingest.attachment_media_type
@@ -1383,20 +1421,27 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
         # always safe to rotate (nothing to lose).
         transcript = await ctx.session_manager.get_transcript(key)
         if transcript and not force:
-            raise RpcHandlerError(
-                code="flush_unavailable",
-                message=(
-                    "Reset aborted: flush service is unavailable and the "
-                    "transcript is non-empty. Re-run with force=true (admin) "
-                    "to discard without backup."
-                ),
-                details={
-                    "key": key,
-                    "session_id": previous_session_id,
-                    "reason": "flush_service_disabled",
-                    "message_count": len(transcript),
-                },
+            checkpoint_safe = await _durable_receipt_allows_covered_destructive_compaction(
+                storage,
+                key,
+                previous_session_id,
+                transcript,
             )
+            if not checkpoint_safe:
+                raise RpcHandlerError(
+                    code="flush_unavailable",
+                    message=(
+                        "Reset aborted: flush service is unavailable and the "
+                        "transcript is non-empty. Re-run with force=true (admin) "
+                        "to discard without backup."
+                    ),
+                    details={
+                        "key": key,
+                        "session_id": previous_session_id,
+                        "reason": "flush_service_disabled",
+                        "message_count": len(transcript),
+                    },
+                )
         if transcript and force and "operator.admin" not in ctx.principal.scopes:
             raise RpcHandlerError(
                 code="permission_denied",
@@ -1495,10 +1540,11 @@ async def _handle_sessions_reset(params: dict | None, ctx: RpcContext) -> dict[s
 
         if not flush_receipt_allows_destructive_compaction(
             receipt
-        ) and not await _durable_receipt_allows_current_destructive_compaction(
+        ) and not await _durable_receipt_allows_covered_destructive_compaction(
             storage,
             key,
             previous_session_id,
+            transcript,
         ):
             flush_status = flush_receipt_status_for_compaction(receipt, ctx.config)
             raise RpcHandlerError(
@@ -1792,10 +1838,11 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
             ):
                 durable_receipt_safe = (
                     storage is not None
-                    and await _durable_receipt_allows_current_destructive_compaction(
+                    and await _durable_receipt_allows_covered_destructive_compaction(
                         storage,
                         key,
                         getattr(session, "session_id", None) if session else None,
+                        transcript,
                     )
                 )
                 if not durable_receipt_safe:
@@ -1998,20 +2045,30 @@ async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dic
             # an admin force override. Empty transcripts are safe to truncate.
             transcript = await ctx.session_manager.get_transcript(key)
             if transcript and not force:
-                raise RpcHandlerError(
-                    code="flush_unavailable",
-                    message=(
-                        "Truncate aborted: flush service is unavailable and "
-                        "the transcript is non-empty. Re-run with force=true "
-                        "(admin) to truncate without backup."
-                    ),
-                    details={
-                        "key": key,
-                        "session_id": previous_session_id,
-                        "reason": "flush_service_disabled",
-                        "message_count": len(transcript),
-                    },
+                checkpoint_safe = (
+                    storage is not None
+                    and await _durable_receipt_allows_covered_destructive_compaction(
+                        storage,
+                        key,
+                        previous_session_id,
+                        _truncate_checkpoint_scope_entries(transcript, max_messages),
+                    )
                 )
+                if not checkpoint_safe:
+                    raise RpcHandlerError(
+                        code="flush_unavailable",
+                        message=(
+                            "Truncate aborted: flush service is unavailable and "
+                            "the transcript is non-empty. Re-run with force=true "
+                            "(admin) to truncate without backup."
+                        ),
+                        details={
+                            "key": key,
+                            "session_id": previous_session_id,
+                            "reason": "flush_service_disabled",
+                            "message_count": len(transcript),
+                        },
+                    )
             if transcript and force and "operator.admin" not in ctx.principal.scopes:
                 raise RpcHandlerError(
                     code="permission_denied",
@@ -2058,10 +2115,11 @@ async def _handle_sessions_truncate(params: dict | None, ctx: RpcContext) -> dic
 
                 if not flush_receipt_allows_destructive_compaction(
                     receipt
-                ) and not await _durable_receipt_allows_current_destructive_compaction(
+                ) and not await _durable_receipt_allows_covered_destructive_compaction(
                     storage,
                     key,
                     previous_session_id,
+                    _truncate_checkpoint_scope_entries(transcript, max_messages),
                 ):
                     flush_status = flush_receipt_status_for_compaction(receipt, ctx.config)
                     raise RpcHandlerError(

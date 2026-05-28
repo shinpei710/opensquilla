@@ -267,6 +267,23 @@ def make_ctx(session_manager=None, **kwargs) -> RpcContext:
     return ctx
 
 
+def _checkpoint_receipt(
+    session: FakeSession,
+    *,
+    turn_id: str,
+    status: str = "checkpoint_saved",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        session_key=session.session_key,
+        session_id=session.session_id,
+        turn_id=turn_id,
+        scope="checkpoint",
+        status=status,
+        source_path="memory/.checkpoints/agent-main-webchat-abc/turn-1.jsonl",
+        content_hash="h1",
+    )
+
+
 class _FakeCompactionProvider:
     provider_name = "openai"
 
@@ -1196,16 +1213,9 @@ class TestSessionsReset:
         self, dispatcher, session
     ):
         manager = FakeSessionManager([session])
-        manager.transcript = [SimpleNamespace(content="message to preserve")]
+        manager.transcript = [SimpleNamespace(id=1, content="message to preserve")]
         manager._storage.memory_durable_receipts.append(
-            SimpleNamespace(
-                session_key=session.session_key,
-                session_id=session.session_id,
-                scope="checkpoint",
-                status="checkpoint_saved",
-                source_path="memory/.checkpoints/agent-main-webchat-abc/turn-1.jsonl",
-                content_hash="h1",
-            )
+            _checkpoint_receipt(session, turn_id="through-1")
         )
         flush_service = SimpleNamespace(
             execute=AsyncMock(
@@ -1221,6 +1231,59 @@ class TestSessionsReset:
             )
         )
         ctx = make_ctx(session_manager=manager, flush_service=flush_service)
+
+        res = await dispatcher.dispatch(
+            "r1", "sessions.reset", {"key": session.session_key}, ctx
+        )
+
+        assert res.ok is True
+        assert manager.applied_intents == [(session.session_key, "reset_same_key")]
+
+    @pytest.mark.asyncio
+    async def test_reset_refuses_stale_checkpoint_receipt_for_later_transcript(
+        self, dispatcher, session
+    ):
+        manager = FakeSessionManager([session])
+        manager.transcript = [
+            SimpleNamespace(id=1, content="checkpointed"),
+            SimpleNamespace(id=2, content="not checkpointed"),
+        ]
+        manager._storage.memory_durable_receipts.append(
+            _checkpoint_receipt(session, turn_id="through-1")
+        )
+        flush_service = SimpleNamespace(
+            execute=AsyncMock(
+                return_value=SimpleNamespace(
+                    mode="raw",
+                    integrity_ok=True,
+                    output_coverage_status="ok",
+                    missing_candidate_count=0,
+                    invalid_candidate_count=0,
+                    obligation_status="ok",
+                    to_dict=lambda: {"mode": "raw"},
+                )
+            )
+        )
+        ctx = make_ctx(session_manager=manager, flush_service=flush_service)
+
+        res = await dispatcher.dispatch(
+            "r1", "sessions.reset", {"key": session.session_key}, ctx
+        )
+
+        assert res.ok is False
+        assert res.error.code == "flush_disk_error"
+        assert manager.applied_intents == []
+
+    @pytest.mark.asyncio
+    async def test_reset_without_flush_service_allows_covering_checkpoint_receipt(
+        self, dispatcher, session
+    ):
+        manager = FakeSessionManager([session])
+        manager.transcript = [SimpleNamespace(id=1, content="message to preserve")]
+        manager._storage.memory_durable_receipts.append(
+            _checkpoint_receipt(session, turn_id="through-1")
+        )
+        ctx = make_ctx(session_manager=manager, flush_service=None)
 
         res = await dispatcher.dispatch(
             "r1", "sessions.reset", {"key": session.session_key}, ctx
@@ -1344,16 +1407,12 @@ class TestSessionsTruncate:
         self, dispatcher, session
     ):
         manager = FakeSessionManager([session])
-        manager.transcript = [SimpleNamespace(content="message to preserve")]
+        manager.transcript = [
+            SimpleNamespace(id=1, content="message to remove"),
+            SimpleNamespace(id=2, content="message to keep"),
+        ]
         manager._storage.memory_durable_receipts.append(
-            SimpleNamespace(
-                session_key=session.session_key,
-                session_id=session.session_id,
-                scope="checkpoint",
-                status="checkpoint_saved",
-                source_path="memory/.checkpoints/agent-main-webchat-abc/turn-1.jsonl",
-                content_hash="h1",
-            )
+            _checkpoint_receipt(session, turn_id="through-1")
         )
         flush_service = SimpleNamespace(
             execute=AsyncMock(
@@ -1370,11 +1429,75 @@ class TestSessionsTruncate:
         ctx = make_ctx(session_manager=manager, flush_service=flush_service)
 
         res = await dispatcher.dispatch(
-            "r1", "sessions.truncate", {"key": session.session_key}, ctx
+            "r1",
+            "sessions.truncate",
+            {"key": session.session_key, "maxMessages": 1},
+            ctx,
         )
 
         assert res.ok is True
-        assert manager.truncate_calls == [(session.session_key, 20)]
+        assert manager.truncate_calls == [(session.session_key, 1)]
+
+    @pytest.mark.asyncio
+    async def test_truncate_refuses_stale_checkpoint_for_later_removed_messages(
+        self, dispatcher, session
+    ):
+        manager = FakeSessionManager([session])
+        manager.transcript = [
+            SimpleNamespace(id=1, content="checkpointed"),
+            SimpleNamespace(id=2, content="not checkpointed"),
+        ]
+        manager._storage.memory_durable_receipts.append(
+            _checkpoint_receipt(session, turn_id="through-1")
+        )
+        flush_service = SimpleNamespace(
+            execute=AsyncMock(
+                return_value=SimpleNamespace(
+                    mode="raw",
+                    integrity_ok=True,
+                    output_coverage_status="ok",
+                    missing_candidate_count=0,
+                    invalid_candidate_count=0,
+                    obligation_status="ok",
+                )
+            )
+        )
+        ctx = make_ctx(session_manager=manager, flush_service=flush_service)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.truncate",
+            {"key": session.session_key, "maxMessages": 0},
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "CONTEXT_FLUSH_FAILED"
+        assert manager.truncate_calls == []
+
+    @pytest.mark.asyncio
+    async def test_truncate_without_flush_service_allows_covering_checkpoint_receipt(
+        self, dispatcher, session
+    ):
+        manager = FakeSessionManager([session])
+        manager.transcript = [
+            SimpleNamespace(id=1, content="message to remove"),
+            SimpleNamespace(id=2, content="message to keep"),
+        ]
+        manager._storage.memory_durable_receipts.append(
+            _checkpoint_receipt(session, turn_id="through-1")
+        )
+        ctx = make_ctx(session_manager=manager, flush_service=None)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.truncate",
+            {"key": session.session_key, "maxMessages": 1},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert manager.truncate_calls == [(session.session_key, 1)]
 
     @pytest.mark.asyncio
     async def test_truncate_refuses_orphaned_checkpoint_receipt(
@@ -1383,14 +1506,7 @@ class TestSessionsTruncate:
         manager = FakeSessionManager([session])
         manager.transcript = [SimpleNamespace(content="message to preserve")]
         manager._storage.memory_durable_receipts.append(
-            SimpleNamespace(
-                session_key=session.session_key,
-                session_id=session.session_id,
-                scope="checkpoint",
-                status="receipt_orphaned",
-                source_path="memory/.checkpoints/agent-main-webchat-abc/turn-1.jsonl",
-                content_hash="h1",
-            )
+            _checkpoint_receipt(session, turn_id="turn-old", status="receipt_orphaned")
         )
         flush_service = SimpleNamespace(
             execute=AsyncMock(
@@ -1691,16 +1807,9 @@ class TestSessionsContextCompact:
         self, dispatcher, session
     ):
         manager = FakeSessionManager([session])
-        manager.transcript = [SimpleNamespace(content="message to preserve")]
+        manager.transcript = [SimpleNamespace(id=1, content="message to preserve")]
         manager._storage.memory_durable_receipts.append(
-            SimpleNamespace(
-                session_key=session.session_key,
-                session_id=session.session_id,
-                scope="checkpoint",
-                status="checkpoint_saved",
-                source_path="memory/.checkpoints/agent-main-webchat-abc/turn-1.jsonl",
-                content_hash="h1",
-            )
+            _checkpoint_receipt(session, turn_id="through-1")
         )
         flush_service = SimpleNamespace(
             execute=AsyncMock(
@@ -1731,6 +1840,49 @@ class TestSessionsContextCompact:
 
         assert res.ok is True
         assert manager.compact_calls[0][:2] == (session.session_key, 100000)
+
+    @pytest.mark.asyncio
+    async def test_context_compact_block_mode_refuses_stale_checkpoint_receipt(
+        self, dispatcher, session
+    ):
+        manager = FakeSessionManager([session])
+        manager.transcript = [
+            SimpleNamespace(id=1, content="checkpointed"),
+            SimpleNamespace(id=2, content="not checkpointed"),
+        ]
+        manager._storage.memory_durable_receipts.append(
+            _checkpoint_receipt(session, turn_id="through-1")
+        )
+        flush_service = SimpleNamespace(
+            execute=AsyncMock(
+                return_value=SimpleNamespace(
+                    mode="raw",
+                    integrity_ok=True,
+                    output_coverage_status="ok",
+                    missing_candidate_count=0,
+                    invalid_candidate_count=0,
+                    obligation_status="ok",
+                )
+            )
+        )
+        ctx = make_ctx(
+            session_manager=manager,
+            flush_service=flush_service,
+            config=GatewayConfig(
+                memory={
+                    "flush_enabled": True,
+                    "flush_compaction_safety_mode": "block",
+                }
+            ),
+        )
+
+        res = await dispatcher.dispatch(
+            "r1", "sessions.contextCompact", {"key": session.session_key}, ctx
+        )
+
+        assert res.ok is False
+        assert res.error.code == "CONTEXT_FLUSH_FAILED"
+        assert manager.compact_calls == []
 
     @pytest.mark.asyncio
     async def test_context_compact_block_mode_refuses_without_checkpoint_receipt(
