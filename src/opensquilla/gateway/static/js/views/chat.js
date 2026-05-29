@@ -40,6 +40,8 @@ const ChatView = (() => {
   let _streamIdleTimer = null;
   let _streamIdlePausedForApproval = false;
   let _historySyncTimer = null;
+  const _AWAITING_MODEL_CLASS = 'awaiting-model';
+  let _lastVisibleStreamEvent = '';
   const _DEFAULT_STREAM_IDLE_TIMEOUT_MS = 210000; // server should emit terminal first
   let _streamIdleTimeoutMs = _DEFAULT_STREAM_IDLE_TIMEOUT_MS;
   let _lastStreamSeq = 0;
@@ -4274,7 +4276,11 @@ const ChatView = (() => {
       _chatDiag('event.run_heartbeat', _chatDiagSummarizePayload(payload));
       if (!_isStreaming) _startStreaming();
       _resetStreamIdleTimer();
-      if (!_streamBubble) _showThinkingIndicator();
+      if (_streamBubble) {
+        _showAwaitingModelHintAfterToolResult();
+      } else {
+        _showThinkingIndicator();
+      }
     }));
 
     _unsubs.push(_rpc.on('session.event.cron_result', (payload) => {
@@ -5396,6 +5402,7 @@ const ChatView = (() => {
   function _replaceStreamText(finalText) {
     if (!_isStreaming) _startStreaming();
     _ensureStreamBubble();
+    _markVisibleStreamEvent('text_delta');
     if (!_streamBubble) {
       _streamRaw = finalText;
       return;
@@ -5837,6 +5844,24 @@ const ChatView = (() => {
     if (hadThinking) _chatDiag('thinking.hide', {});
   }
 
+  function _clearAwaitingModelHint() {
+    if (_streamBubble) _streamBubble.classList.remove(_AWAITING_MODEL_CLASS);
+  }
+
+  function _markVisibleStreamEvent(kind) {
+    _lastVisibleStreamEvent = kind || '';
+    if (_lastVisibleStreamEvent !== 'tool_result') _clearAwaitingModelHint();
+  }
+
+  function _showAwaitingModelHintAfterToolResult() {
+    if (!_streamBubble || _lastVisibleStreamEvent !== 'tool_result') return false;
+    if (!_streamBubble.classList.contains(_AWAITING_MODEL_CLASS)) {
+      _streamBubble.classList.add(_AWAITING_MODEL_CLASS);
+      if (_autoScroll) _scrollToBottom();
+    }
+    return true;
+  }
+
   function _startStreaming() {
     _chatDiag('stream.start.before', {
       wasStreaming: _isStreaming,
@@ -5851,6 +5876,7 @@ const ChatView = (() => {
     _streamRaw = '';
     _segments = []; _activeTextSeg = null; _activeTextRaw = '';
     _streamArtifacts = [];
+    _lastVisibleStreamEvent = '';
     _streamBubble = null;
     _autoScroll = true;
     if (_thread) _thread.setAttribute('aria-busy', 'true');
@@ -5942,6 +5968,7 @@ const ChatView = (() => {
     });
     if (!_isStreaming) _startStreaming();
     _ensureStreamBubble();
+    _markVisibleStreamEvent('text_delta');
     _streamRaw += text;
     _activeTextRaw += text;
     // Keep segment raw in sync for final render
@@ -6006,6 +6033,8 @@ const ChatView = (() => {
       streamRawLen: _streamRaw.length,
     });
     _hideThinkingIndicator();
+    _clearAwaitingModelHint();
+    _lastVisibleStreamEvent = '';
     if (_historySyncTimer) { clearTimeout(_historySyncTimer); _historySyncTimer = null; }
     if (_renderRafId) { cancelAnimationFrame(_renderRafId); _renderRafId = null; }
     _renderDirty = false;
@@ -6144,6 +6173,7 @@ const ChatView = (() => {
       activeTextSeg: _activeTextSeg,
       activeTextRaw: _activeTextRaw,
       streamArtifacts: _streamArtifacts.slice(),
+      lastVisibleStreamEvent: _lastVisibleStreamEvent,
       routerStrips,
       streamGeneration: _streamGeneration,
       autoScroll: _autoScroll,
@@ -6169,6 +6199,7 @@ const ChatView = (() => {
     _streamRaw = '';
     _segments = []; _activeTextSeg = null; _activeTextRaw = '';
     _streamArtifacts = [];
+    _lastVisibleStreamEvent = '';
     if (_thread) _thread.setAttribute('aria-busy', 'false');
     _updateSendButton();
     _chatDiag('stream.view_state_parked', {
@@ -6195,6 +6226,7 @@ const ChatView = (() => {
     _activeTextSeg = state.activeTextSeg || null;
     _activeTextRaw = state.activeTextRaw || '';
     _streamArtifacts = Array.isArray(state.streamArtifacts) ? state.streamArtifacts.slice() : [];
+    _lastVisibleStreamEvent = state.lastVisibleStreamEvent || '';
     _streamGeneration = Math.max(_streamGeneration, state.streamGeneration || 0);
     _autoScroll = state.autoScroll !== false;
     _pendingFinalizedAssistantBubble = state.pendingFinalizedAssistantBubble || null;
@@ -6209,6 +6241,7 @@ const ChatView = (() => {
       _streamBubble.dataset.streamSessionKey = sessionKey;
       if (_thread && !_streamBubble.isConnected) _thread.appendChild(_streamBubble);
     }
+    if (_lastVisibleStreamEvent !== 'tool_result') _clearAwaitingModelHint();
     if (_thread) {
       routerStrips.forEach((el) => {
         el.dataset.sessionKey = sessionKey;
@@ -6257,6 +6290,7 @@ const ChatView = (() => {
     _streamRaw = '';
     _segments = []; _activeTextSeg = null; _activeTextRaw = '';
     _streamArtifacts = [];
+    _lastVisibleStreamEvent = '';
     _streamGeneration += 1;
     if (_thread) _thread.setAttribute('aria-busy', 'false');
     _updateSendButton();
@@ -6540,6 +6574,7 @@ const ChatView = (() => {
     const toolId = payload.tool_use_id || '';
 
     const bubble = _ensureStreamBubble();
+    _markVisibleStreamEvent('tool_use_start');
     const body = bubble.querySelector('.msg-body');
     const existing = _findToolDetailsById(body, toolId);
     if (existing) {
@@ -6600,6 +6635,7 @@ const ChatView = (() => {
       && _args.clarify_schema
     ) {
       try { console.log('[clarify-debug] firing _appendClarifyForm'); } catch (e) {}
+      _markVisibleStreamEvent('clarify_form');
       _appendClarifyForm(payload, _args);
       _chatDiag('tool_result.append.clarify_form', _chatDiagSummarizePayload(payload));
       return;
@@ -6612,6 +6648,7 @@ const ChatView = (() => {
     let toolName = payload.name || payload.tool_name || '';
 
     const bubble = _ensureStreamBubble();
+    _markVisibleStreamEvent('tool_result');
     const body = bubble.querySelector('.msg-body');
 
     // Transition tool container from running → success/error and find target container
@@ -6870,6 +6907,7 @@ const ChatView = (() => {
     _chatDiag('artifact.append.start', _chatDiagSummarizePayload(payload));
     _streamArtifacts.push(payload);
     const bubble = _ensureStreamBubble();
+    _markVisibleStreamEvent('artifact');
     const body = bubble.querySelector('.msg-body');
     body.insertAdjacentHTML('beforeend', _renderArtifacts([payload]));
     if (_autoScroll) _scrollToBottom();
@@ -7886,6 +7924,7 @@ const ChatView = (() => {
     _streamRaw = '';
     _segments = []; _activeTextSeg = null; _activeTextRaw = '';
     _streamArtifacts = [];
+    _lastVisibleStreamEvent = '';
     _liveStreamStateBySession.clear();
     _streamSeqBySession.clear();
     _lastStreamSeq = 0;

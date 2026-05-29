@@ -559,6 +559,27 @@
   margin-left: 2px;
 }
 
+.msg.streaming.awaiting-model::after {
+  content: 'waiting for model response...';
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  margin-top: 2px;
+  padding: 0 var(--sp-2);
+  border-left: 2px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.4;
+  letter-spacing: 0;
+  opacity: 0.82;
+  animation: awaitingModelPulse 1.6s ease-in-out infinite;
+}
+
+@keyframes awaitingModelPulse {
+  0%, 100% { opacity: 0.82; }
+  50%      { opacity: 0.48; }
+}
+
 @keyframes blink {
   0%, 100% { opacity: 1; }
   50%      { opacity: 0.2; }

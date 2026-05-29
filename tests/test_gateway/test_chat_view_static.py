@@ -118,6 +118,54 @@ def test_chat_resets_stream_timeout_on_run_heartbeat() -> None:
     assert "webui_stream_idle_grace_ms" in source
 
 
+def test_chat_shows_awaiting_model_hint_after_tool_result_heartbeat() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    css = CHAT_CSS.read_text(encoding="utf-8")
+    heartbeat_start = source.index("_rpc.on('session.event.run_heartbeat'")
+    heartbeat_end = source.index("    }));", heartbeat_start)
+    heartbeat_body = source[heartbeat_start:heartbeat_end]
+    tool_result_start = source.index("function _appendToolResult(payload)")
+    tool_result_end = source.index("  // ── PR5", tool_result_start)
+    tool_result_body = source[tool_result_start:tool_result_end]
+
+    assert "const _AWAITING_MODEL_CLASS = 'awaiting-model';" in source
+    assert "function _showAwaitingModelHintAfterToolResult()" in source
+    assert "_markVisibleStreamEvent('tool_result');" in tool_result_body
+    assert "_showAwaitingModelHintAfterToolResult();" in heartbeat_body
+    assert "if (_streamBubble)" in heartbeat_body
+    assert "_showThinkingIndicator();" in heartbeat_body
+    assert ".msg.streaming.awaiting-model::after" in css
+    assert "content: 'waiting for model response...';" in css
+    assert "textContent = 'waiting for model response" not in source
+    assert "document.createTextNode('waiting for model response" not in source
+
+
+def test_chat_clears_awaiting_model_hint_on_next_visible_event_and_stream_reset() -> None:
+    source = CHAT_JS.read_text(encoding="utf-8")
+    append_delta_start = source.index("function _appendDelta(text)")
+    append_delta_end = source.index("  function _flushPendingTextSegment", append_delta_start)
+    append_delta_body = source[append_delta_start:append_delta_end]
+    append_tool_start = source.index("function _appendToolCall(payload)")
+    append_tool_end = source.index("  function _appendToolResult(payload)", append_tool_start)
+    append_tool_body = source[append_tool_start:append_tool_end]
+    append_artifact_start = source.index("function _appendArtifact(payload)")
+    append_artifact_end = source.index("  function _renderStreamArtifacts", append_artifact_start)
+    append_artifact_body = source[append_artifact_start:append_artifact_end]
+    end_stream_start = source.index("function _endStreaming(opts)")
+    end_stream_end = source.index("  function _hasViewLocalStreamState", end_stream_start)
+    end_stream_body = source[end_stream_start:end_stream_end]
+    clear_state_start = source.index("function _clearViewLocalStreamState(reason)")
+    clear_state_end = source.index("  function _updateSendButton", clear_state_start)
+    clear_state_body = source[clear_state_start:clear_state_end]
+
+    assert "_markVisibleStreamEvent('text_delta');" in append_delta_body
+    assert "_markVisibleStreamEvent('tool_use_start');" in append_tool_body
+    assert "_markVisibleStreamEvent('artifact');" in append_artifact_body
+    assert "_clearAwaitingModelHint();" in end_stream_body
+    assert "_lastVisibleStreamEvent = '';" in end_stream_body
+    assert "_lastVisibleStreamEvent = '';" in clear_state_body
+
+
 def test_chat_tool_results_use_execution_status_for_state() -> None:
     source = CHAT_JS.read_text(encoding="utf-8")
 
