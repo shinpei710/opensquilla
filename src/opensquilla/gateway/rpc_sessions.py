@@ -1717,6 +1717,21 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
     turn_runner = ctx.turn_runner
     lock = get_session_lock(turn_runner, key)
 
+    async def _publish_manual_compaction_event(**payload: Any) -> None:
+        event_payload = {
+            "source": "manual",
+            "phase": "manual",
+            "context_window_tokens": context_window_tokens,
+            **payload,
+        }
+        notify_compaction(key, notify_listeners=False, **event_payload)
+        await _emit_to_subscribers(
+            ctx,
+            key,
+            "session.event.compaction",
+            dict(event_payload),
+        )
+
     async def _run_locked() -> dict[str, Any]:
         receipt = None
         flush_receipt_status: str | None = None
@@ -1727,23 +1742,15 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
             session = await storage.get_session(key)
             if session is None:
                 if _is_ephemeral_webchat_session_key(key):
-                    notify_compaction(
-                        key,
-                        source="manual",
-                        phase="manual",
+                    await _publish_manual_compaction_event(
                         status="started",
-                        context_window_tokens=context_window_tokens,
                         **compaction_lifecycle_payload(
                             compaction_id,
                             COMPACTION_TRIGGERED_EVENT,
                         ),
                     )
-                    notify_compaction(
-                        key,
-                        source="manual",
-                        phase="manual",
+                    await _publish_manual_compaction_event(
                         status="skipped",
-                        context_window_tokens=context_window_tokens,
                         reason="empty_ephemeral_webchat_session",
                         **compaction_lifecycle_payload(
                             compaction_id,
@@ -1771,12 +1778,8 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                         "state_kind": "text",
                     }
                 raise KeyError(f"Session not found: {key}")
-        notify_compaction(
-            key,
-            source="manual",
-            phase="manual",
+        await _publish_manual_compaction_event(
             status="started",
-            context_window_tokens=context_window_tokens,
             **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
         )
         transcript = []
@@ -1945,12 +1948,8 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                     ):
                         observed_payload = compaction_lifecycle_payload(compaction_id, event)
                         observed_payload.update(compaction_result_payload(result))
-                        notify_compaction(
-                            key,
-                            source="manual",
-                            phase="manual",
+                        await _publish_manual_compaction_event(
                             status="observed",
-                            context_window_tokens=context_window_tokens,
                             **observed_payload,
                         )
             else:
@@ -1968,24 +1967,16 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
                 tokens_after = 0
                 remaining_budget_tokens = 0
         except asyncio.CancelledError:
-            notify_compaction(
-                key,
-                source="manual",
-                phase="manual",
+            await _publish_manual_compaction_event(
                 status="cancelled",
                 message="Compaction was cancelled.",
-                context_window_tokens=context_window_tokens,
                 **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
             )
             raise
         except Exception as exc:
-            notify_compaction(
-                key,
-                source="manual",
-                phase="manual",
+            await _publish_manual_compaction_event(
                 status="failed",
                 message=str(exc),
-                context_window_tokens=context_window_tokens,
                 **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
             )
             raise
@@ -2018,10 +2009,7 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
         )
         final_lifecycle_payload = compaction_lifecycle_payload(compaction_id, final_event)
         final_lifecycle_payload.pop("coverage_status", None)
-        notify_compaction(
-            key,
-            source="manual",
-            phase="manual",
+        await _publish_manual_compaction_event(
             status="completed" if removed_count > 0 else "skipped",
             tokens_before=tokens_before,
             tokens_after=tokens_after,
@@ -2035,7 +2023,6 @@ async def _handle_sessions_context_compact(params: dict | None, ctx: RpcContext)
             state_kind=state_kind,
             summary_len=len(summary),
             summary_source=summary_source,
-            context_window_tokens=context_window_tokens,
             flush_receipt_status=flush_receipt_status,
             **final_lifecycle_payload,
         )

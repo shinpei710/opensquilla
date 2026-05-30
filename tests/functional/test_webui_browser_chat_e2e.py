@@ -509,6 +509,73 @@ def test_chat_compaction_events_render_recoverable_toasts_in_real_browser(
               await emitEvent(page, "session.event.done", { text: "compact queued answer" });
               await page.waitForTimeout(150);
 
+              await page.fill("#chat-textarea", "seed automatic compact turn");
+              await page.click("#chat-btn-send");
+              await page.waitForTimeout(150);
+              const callsBeforeAutomaticCompact = await page.evaluate(
+                () => window.__compactUx.chatCalls.length
+              );
+              await emitCompaction(page, {
+                status: "started",
+                source: "automatic",
+                phase: "preflight",
+              });
+              await page.waitForSelector(".chat-compact-status:not(.hidden)", { timeout: 5000 });
+              const automaticStartedStatusVisible = await page
+                .locator("#chat-compact-status")
+                .innerText();
+              await page.fill("#chat-textarea", "queued during automatic compact");
+              await page.click("#chat-btn-send");
+              await page.waitForTimeout(150);
+              const automaticQueuedBeforeCompleted = await page.evaluate(
+                () => window.__compactUx.chatCalls.length
+              );
+              await emitCompaction(page, {
+                status: "observed",
+                source: "automatic",
+                event: "compaction.chunk_summarized",
+                tokens_before: 5000,
+                tokens_after: 2600,
+              });
+              await page.waitForTimeout(150);
+              const automaticObservedStatusVisible = await page
+                .locator("#chat-compact-status")
+                .innerText();
+              await emitCompaction(page, {
+                status: "completed",
+                source: "automatic",
+                tokens_before: 5000,
+                tokens_after: 1800,
+              });
+              await page.waitForTimeout(250);
+              const automaticDidNotDrainBeforeDone = await page.evaluate(
+                expected => window.__compactUx.chatCalls.length === expected,
+                callsBeforeAutomaticCompact
+              );
+              await emitEvent(page, "session.event.done", { text: "automatic compact answer" });
+              await page.waitForFunction(
+                () =>
+                  window.__compactUx.chatCalls
+                    .some(c => c.params.message === "queued during automatic compact"),
+                { timeout: 5000 }
+              );
+
+              await emitCompaction(page, {
+                status: "started",
+                source: "automatic",
+                phase: "preflight",
+              });
+              await emitCompaction(page, {
+                status: "emergency_ephemeral",
+                source: "automatic",
+                phase: "preflight",
+                reason: "compact_failed",
+                tokens_before: 5000,
+                tokens_after: 2400,
+              });
+              await page.waitForTimeout(250);
+              const emergencyStatusVisible = await page.locator("#chat-compact-status").innerText();
+
               await emitCompaction(page, { status: "started", source: "manual" });
               await page.fill("#chat-textarea", "queued after blocking compact failure");
               await page.click("#chat-btn-send");
@@ -542,6 +609,22 @@ def test_chat_compaction_events_render_recoverable_toasts_in_real_browser(
                 skippedDrainedQueuedSend: await page.evaluate(
                   () => window.__compactUx.chatCalls
                     .some(c => c.params.message === "queued during compact")
+                ),
+                automaticStartedStatusVisible: automaticStartedStatusVisible.includes(
+                  "Compacting context..."
+                ),
+                automaticObservedStatusVisible: automaticObservedStatusVisible.includes(
+                  "Summarizing older context..."
+                ),
+                automaticQueuedBeforeCompleted:
+                  automaticQueuedBeforeCompleted === callsBeforeAutomaticCompact,
+                automaticDidNotDrainBeforeDone,
+                automaticDrainedAfterDone: await page.evaluate(
+                  () => window.__compactUx.chatCalls
+                    .some(c => c.params.message === "queued during automatic compact")
+                ),
+                emergencyStatusVisible: emergencyStatusVisible.includes(
+                  "Continuing with temporary context compaction"
                 ),
                 blockingFailureKeptPending:
                   (await page.locator("#chat-pending").innerText())
@@ -605,6 +688,12 @@ def test_chat_compaction_events_render_recoverable_toasts_in_real_browser(
         "failedStatusVisible": True,
         "queuedBeforeSkipped": 0,
         "skippedDrainedQueuedSend": True,
+        "automaticStartedStatusVisible": True,
+        "automaticObservedStatusVisible": True,
+        "automaticQueuedBeforeCompleted": True,
+        "automaticDidNotDrainBeforeDone": True,
+        "automaticDrainedAfterDone": True,
+        "emergencyStatusVisible": True,
         "blockingFailureKeptPending": True,
         "blockingFailureDidNotDrain": True,
         "blockingFailureDidNotRecoverComposer": True,

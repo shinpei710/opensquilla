@@ -203,3 +203,47 @@ def test_notify_compaction_resets_cache_only_after_completed_status(
     )
 
     assert completed_report.reason == "baseline_reset_after_compaction"
+
+
+def test_notify_compaction_can_reset_cache_without_notifying_listeners(
+    monkeypatch,
+) -> None:
+    monitor = CacheBreakMonitor(min_drop_tokens=10, min_drop_ratio=0.05)
+    monkeypatch.setattr(cache_break_monitor, "default_cache_break_monitor", monitor)
+    events: list[tuple[str, dict]] = []
+    remove = cache_break_monitor.add_compaction_listener(
+        lambda session_key, payload: events.append((session_key, payload))
+    )
+    try:
+        before = monitor.record_prompt_state(
+            messages=[
+                Message(role="user", content="old"),
+                Message(role="user", content="now"),
+            ],
+            tools=None,
+            config=ChatConfig(system="stable system"),
+            model="model-a",
+        )
+        monitor.check_response_for_cache_break("agent:main:s1", before, 5000)
+
+        cache_break_monitor.notify_compaction(
+            "agent:main:s1",
+            status="completed",
+            notify_listeners=False,
+        )
+
+        after = monitor.record_prompt_state(
+            messages=[
+                Message(role="assistant", content="new baseline"),
+                Message(role="user", content="now"),
+            ],
+            tools=None,
+            config=ChatConfig(system="stable system"),
+            model="model-a",
+        )
+        report = monitor.check_response_for_cache_break("agent:main:s1", after, 0)
+    finally:
+        remove()
+
+    assert events == []
+    assert report.reason == "baseline_reset_after_compaction"

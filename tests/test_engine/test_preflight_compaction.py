@@ -762,6 +762,41 @@ async def test_preflight_compact_failure_uses_emergency_ephemeral_history_trim()
 
 
 @pytest.mark.asyncio
+async def test_preflight_compact_failure_reports_emergency_without_failed_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_key = "agent:ops:preflight-emergency-event"
+    context_window = 1000
+    entries = [
+        TranscriptEntry(
+            session_id="test-session-id",
+            session_key=session_key,
+            role="user" if index % 2 == 0 else "assistant",
+            content=f"historic message {index} " + ("x" * 500),
+            token_count=300,
+        )
+        for index in range(8)
+    ]
+    sm = _FailingResultCompactionSessionManager(entries)
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        runtime_module,
+        "notify_compaction",
+        lambda session_key, **payload: events.append((session_key, payload)),
+    )
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=sm)
+
+    await runner._maybe_preflight_compact(session_key, context_window)
+
+    statuses = [payload["status"] for _, payload in events]
+    assert statuses == ["started", "emergency_ephemeral"]
+    emergency = events[-1][1]
+    assert emergency["durability"] == "request_scoped"
+    assert emergency["reason"] == "compact_failed"
+    assert emergency["flush_receipt_status"] == "emergency_ephemeral"
+
+
+@pytest.mark.asyncio
 async def test_preflight_empty_summary_uses_emergency_ephemeral_history_trim() -> None:
     session_key = "agent:ops:preflight-empty-summary"
     context_window = 1000

@@ -2628,7 +2628,9 @@ const ChatView = (() => {
       case '/compact': {
         const compactKey = _sessionKey;
         _setCompactInFlight(true, compactKey);
-        _showCompactionToast({ key: compactKey, source: 'manual', status: 'started' });
+        _setCompactStatus('started', 'Compacting context...', {
+          tone: 'info',
+        });
         _rpc.call('sessions.contextCompact', { key: compactKey })
           .then((result) => {
             if (compactKey !== _sessionKey) return;
@@ -2755,7 +2757,9 @@ const ChatView = (() => {
 
   function _suppressDuplicateCompactionToast(payload, status, source) {
     const key = String(payload && payload.key || _sessionKey || '');
-    const sig = `${key}|${source || ''}|${status || ''}`;
+    const event = String(payload && payload.event || '');
+    const reason = String(payload && (payload.reason || payload.skip_reason) || '');
+    const sig = `${key}|${source || ''}|${status || ''}|${event}|${reason}`;
     const now = Date.now();
     if (sig === _lastCompactionToastSig && now - _lastCompactionToastAt < 1500) {
       return true;
@@ -2839,6 +2843,26 @@ const ChatView = (() => {
     );
   }
 
+  function _compactionProgressMessage(payload) {
+    const event = String(payload && payload.event || '').toLowerCase();
+    if (event === 'compaction.chunk_summarized') return 'Summarizing older context...';
+    if (event === 'compaction.summary_verified') return 'Verifying compacted context...';
+    return 'Compacting context...';
+  }
+
+  function _compactionSkipMessage(payload, source) {
+    if (source === 'manual') return 'Already within context budget; no compact was applied.';
+    const reason = String(payload && (payload.reason || payload.skip_reason) || '');
+    if (reason) return 'Context compaction skipped';
+    return 'Already within context budget; no compact was applied.';
+  }
+
+  function _compactionStatusDetail(payload) {
+    const reason = String(payload && (payload.reason || payload.skip_reason) || '');
+    if (reason) return reason.replace(/_/g, ' ');
+    return '';
+  }
+
   function _showCompactionToast(payload, meta = {}) {
     if (meta && meta.replayed) return;
     let status = String(payload && payload.status || '').toLowerCase();
@@ -2848,51 +2872,72 @@ const ChatView = (() => {
     const source = String(payload && payload.source || '').toLowerCase();
     if (_suppressDuplicateCompactionToast(payload || {}, status, source)) return;
     if (status === 'started') {
-      if (source === 'manual') _setCompactInFlight(true, payload && payload.key || _sessionKey);
-      if (source === 'manual') _setCompactStatus('started', 'Compacting context...', { tone: 'info' });
+      _setCompactInFlight(true, payload && payload.key || _sessionKey);
+      _setCompactStatus('started', 'Compacting context...', {
+        tone: 'info',
+        detail: _compactionStatusDetail(payload || {}),
+      });
       UI.toast('Compacting context...', 'info', 2500);
+      return;
+    }
+    if (status === 'observed') {
+      if (_isCompactInFlightForCurrentSession()) {
+        _setCompactStatus('started', _compactionProgressMessage(payload || {}), {
+          tone: 'info',
+          detail: _compactionStatusDetail(payload || {}),
+        });
+      }
+      return;
+    }
+    if (status === 'emergency_ephemeral') {
+      _settleCompactInFlight(payload || {});
+      const detail = _compactionStatusDetail(payload || {}) || 'Request-scoped; session history was not rewritten';
+      _setCompactStatus('completed', 'Continuing with temporary context compaction', {
+        tone: 'warn',
+        detail,
+        dismissMs: 8000,
+      });
+      UI.toast('Continuing with temporary context compaction for this turn', 'info', 4500);
       return;
     }
     if (status === 'skipped') {
       _settleCompactInFlight(payload || {});
-      if (source === 'manual') {
-        _setCompactStatus('skipped', 'Already within context budget; no compact was applied.', {
-          tone: 'info',
-          dismissMs: 5000,
-        });
-      }
-      UI.toast('Already within context budget; no compact was applied.', 'info', 3500);
+      const skippedMessage = _compactionSkipMessage(payload || {}, source);
+      _setCompactStatus('skipped', skippedMessage, {
+        tone: 'info',
+        detail: _compactionStatusDetail(payload || {}),
+        dismissMs: 5000,
+      });
+      UI.toast(skippedMessage, 'info', 3500);
       return;
     }
     const semanticNotice = _compactSemanticMemoryNotice(payload || {});
     if (semanticNotice) {
       _settleCompactInFlight(payload || {});
-      if (source === 'manual') {
-        _setCompactStatus('completed', semanticNotice, {
-          tone: 'ok',
-          dismissMs: 5000,
-        });
-      }
+      _setCompactStatus('completed', semanticNotice, {
+        tone: 'ok',
+        dismissMs: 5000,
+      });
       UI.toast(semanticNotice, 'info', 3500);
       return;
     }
     if (status === 'failed' || status === 'error') {
       const preservePending = _compactFailureBlocksPending(payload || {});
+      const keepPendingQueued = preservePending || (source !== 'manual' && _isStreaming);
       const recovered = _settleCompactInFlight(payload || {}, {
-        recoverPending: true,
-        preservePending,
+        recoverPending: !keepPendingQueued,
+        preservePending: keepPendingQueued,
       });
       const detail = _compactSafeMessageDetail(payload || {});
       const msg = detail ? ': ' + detail : '';
-      const pendingSuffix = preservePending
+      const pendingSuffix = keepPendingQueued
         ? '; pending message preserved'
         : (recovered ? '; pending message recovered to input' : '');
-      if (source === 'manual') {
-        _setCompactStatus('failed', 'Compact failed' + msg + pendingSuffix, {
-          tone: 'err',
-          dismissMs: 10000,
-        });
-      }
+      _setCompactStatus('failed', 'Compact failed' + msg + pendingSuffix, {
+        tone: 'err',
+        detail: _compactionStatusDetail(payload || {}),
+        dismissMs: 10000,
+      });
       UI.toast(
         'Compact failed' + msg + pendingSuffix,
         'err',
@@ -2902,12 +2947,10 @@ const ChatView = (() => {
     }
     if (status === 'cancelled') {
       const recovered = _settleCompactInFlight(payload || {}, { recoverPending: true });
-      if (source === 'manual') {
-        _setCompactStatus('cancelled', 'Compact cancelled' + (recovered ? '; pending message recovered to input' : ''), {
-          tone: 'warn',
-          dismissMs: 8000,
-        });
-      }
+      _setCompactStatus('cancelled', 'Compact cancelled' + (recovered ? '; pending message recovered to input' : ''), {
+        tone: 'warn',
+        dismissMs: 8000,
+      });
       UI.toast(
         'Compact cancelled' + (recovered ? '; pending message recovered to input' : ''),
         'info',
@@ -2926,6 +2969,10 @@ const ChatView = (() => {
       UI.toast('Context compacted' + details, 'info', 4500);
       return;
     }
+    _setCompactStatus('completed', 'Context compacted' + details, {
+      tone: 'ok',
+      dismissMs: 5000,
+    });
     UI.toast(
       'Context compacted older messages to keep this session within budget' + details,
       'info',

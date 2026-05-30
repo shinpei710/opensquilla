@@ -294,6 +294,23 @@ def make_ctx(session_manager=None, **kwargs) -> RpcContext:
     return ctx
 
 
+def _capture_compaction_emits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, str, dict[str, Any]]]:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _record_emit(
+        _ctx: RpcContext,
+        session_key: str,
+        event_name: str,
+        payload: dict[str, Any],
+    ) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    monkeypatch.setattr(rpc_sessions, "_emit_to_subscribers", _record_emit)
+    return emitted
+
+
 def _checkpoint_receipt(
     session: FakeSession,
     *,
@@ -1835,6 +1852,7 @@ class TestSessionsContextCompact:
         manager = SlowCompactionSessionManager([session])
         ctx = make_ctx(session_manager=manager)
         events: list[tuple[str, dict[str, Any]]] = []
+        emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
             rpc_sessions,
             "notify_compaction",
@@ -1852,6 +1870,9 @@ class TestSessionsContextCompact:
 
         await asyncio.wait_for(manager.started.wait(), timeout=1.0)
         assert [payload["status"] for _, payload in events] == ["started"]
+        assert [(key, event, payload["status"]) for key, event, payload in emitted] == [
+            (session.session_key, "session.event.compaction", "started")
+        ]
         assert task.done() is False
 
         manager.release.set()
@@ -1859,6 +1880,12 @@ class TestSessionsContextCompact:
 
         assert res.ok is True
         assert [payload["status"] for _, payload in events] == [
+            "started",
+            "observed",
+            "observed",
+            "completed",
+        ]
+        assert [payload["status"] for _, _, payload in emitted] == [
             "started",
             "observed",
             "observed",
@@ -1875,6 +1902,7 @@ class TestSessionsContextCompact:
         manager = SlowCompactionSessionManager([session])
         ctx = make_ctx(session_manager=manager)
         events: list[tuple[str, dict[str, Any]]] = []
+        emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
             rpc_sessions,
             "notify_compaction",
@@ -1899,6 +1927,10 @@ class TestSessionsContextCompact:
             "started",
             "cancelled",
         ]
+        assert [payload["status"] for _, _, payload in emitted] == [
+            "started",
+            "cancelled",
+        ]
         assert manager.compact_calls == []
 
     @pytest.mark.asyncio
@@ -1912,6 +1944,7 @@ class TestSessionsContextCompact:
         manager.compact_summary = ""
         ctx = make_ctx(session_manager=manager)
         events: list[tuple[str, dict[str, Any]]] = []
+        emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
             rpc_sessions,
             "notify_compaction",
@@ -1925,6 +1958,10 @@ class TestSessionsContextCompact:
         assert res.ok is True
         assert res.payload["compacted"] is False
         assert [payload["status"] for _, payload in events] == ["started", "skipped"]
+        assert [payload["status"] for _, _, payload in emitted] == [
+            "started",
+            "skipped",
+        ]
 
     @pytest.mark.asyncio
     async def test_context_compact_emits_failed_when_compaction_raises(
@@ -1941,6 +1978,7 @@ class TestSessionsContextCompact:
         manager.compact_with_result = _boom  # type: ignore[method-assign]
         ctx = make_ctx(session_manager=manager)
         events: list[tuple[str, dict[str, Any]]] = []
+        emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
             rpc_sessions,
             "notify_compaction",
@@ -1953,6 +1991,10 @@ class TestSessionsContextCompact:
 
         assert res.ok is False
         assert [payload["status"] for _, payload in events] == ["started", "failed"]
+        assert [payload["status"] for _, _, payload in emitted] == [
+            "started",
+            "failed",
+        ]
         assert "compact boom" in events[-1][1]["message"]
 
     @pytest.mark.asyncio
@@ -2325,6 +2367,7 @@ class TestSessionsContextCompact:
         monkeypatch: pytest.MonkeyPatch,
     ):
         events: list[tuple[str, dict[str, Any]]] = []
+        emitted = _capture_compaction_emits(monkeypatch)
         monkeypatch.setattr(
             rpc_sessions,
             "notify_compaction",
@@ -2343,6 +2386,10 @@ class TestSessionsContextCompact:
         assert res.payload["reason"] == "empty_ephemeral_webchat_session"
         assert ctx_with_sessions.session_manager.compact_calls == []
         assert [(event_key, payload["status"]) for event_key, payload in events] == [
+            (key, "started"),
+            (key, "skipped"),
+        ]
+        assert [(event_key, payload["status"]) for event_key, _, payload in emitted] == [
             (key, "started"),
             (key, "skipped"),
         ]

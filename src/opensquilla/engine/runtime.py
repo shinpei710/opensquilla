@@ -4420,7 +4420,7 @@ class TurnRunner:
                 error=str(exc),
             )
             self._record_compaction_failure(session_key)
-            await self._record_emergency_ephemeral_compaction(
+            emergency_applied = await self._record_emergency_ephemeral_compaction(
                 session_key,
                 transcript,
                 context_window_tokens,
@@ -4428,6 +4428,8 @@ class TurnRunner:
                 phase="t3_upgrade",
                 reason="compact_failed",
             )
+            if emergency_applied:
+                return _T3_COMPACT_FAILED
             notify_compaction(
                 session_key,
                 source="automatic",
@@ -4638,7 +4640,7 @@ class TurnRunner:
                 error=str(exc),
             )
             self._record_compaction_failure(session_key)
-            await self._record_emergency_ephemeral_compaction(
+            emergency_applied = await self._record_emergency_ephemeral_compaction(
                 session_key,
                 transcript,
                 context_window_tokens,
@@ -4646,6 +4648,8 @@ class TurnRunner:
                 phase="preflight",
                 reason="compact_failed",
             )
+            if emergency_applied:
+                return
             notify_compaction(
                 session_key,
                 source="automatic",
@@ -5132,6 +5136,7 @@ class TurnRunner:
             source="automatic",
             phase=phase,
             status="emergency_ephemeral",
+            durability="request_scoped",
             reason=reason,
             removed_count=result.removed_count,
             kept_count=len(kept_entries),

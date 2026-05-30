@@ -840,7 +840,7 @@ def test_chat_surfaces_compaction_lifecycle_toasts() -> None:
     assert "function _showCompactionToast(payload, meta = {})" in source
     assert "_setCompactInFlight(true, compactKey);" in compact_block
     assert "Compacting context..." in body
-    assert "Already within context budget; no compact was applied." in body
+    assert "Already within context budget; no compact was applied." in source
     assert "if (compactKey !== _sessionKey) return;" in compact_block
     assert (
         "_showCompactionToast({ ...(result || {}), key: compactKey, source: 'manual'"
@@ -848,6 +848,7 @@ def test_chat_surfaces_compaction_lifecycle_toasts() -> None:
     )
     assert "session.event.compaction" in source
     assert "Context compacted older messages to keep this session within budget" in source
+    assert "Continuing with temporary context compaction" in source
     assert "Compact cancelled" in source
 
 
@@ -865,13 +866,13 @@ def test_chat_surfaces_persistent_compaction_status_row() -> None:
     assert "function _hideCompactStatus()" in source
     assert "_compactStatusEl = _el.querySelector('#chat-compact-status');" in source
     assert "_setCompactStatus('started', 'Compacting context...'" in body
-    assert (
-        "_setCompactStatus('skipped', 'Already within context budget; no compact was applied.'"
-        in body
-    )
+    assert "function _compactionSkipMessage(payload, source)" in source
+    assert "_setCompactStatus('skipped', skippedMessage" in body
     assert "_setCompactStatus('completed', 'Context compacted' + details" in body
     assert "_setCompactStatus('failed', 'Compact failed' + msg + pendingSuffix" in body
     assert "_setCompactStatus('cancelled', 'Compact cancelled'" in body
+    assert "status === 'emergency_ephemeral'" in body
+    assert "status === 'observed'" in body
     assert "_hideCompactStatus();" in source[source.index("function destroy()") :]
     assert ".chat-compact-status" in css
     assert ".chat-compact-status__spinner" in css
@@ -889,7 +890,8 @@ def test_chat_compaction_token_details_are_success_only() -> None:
     skipped_end = body.index("if (status === 'failed'", skipped_start)
     skipped_block = body[skipped_start:skipped_end]
 
-    assert "UI.toast('Already within context budget; no compact was applied.'" in skipped_block
+    assert "const skippedMessage = _compactionSkipMessage(payload || {}, source);" in skipped_block
+    assert "UI.toast(skippedMessage, 'info', 3500);" in skipped_block
     assert "_compactionTokenStats" not in skipped_block
     assert "payload && payload.tokens_after || 0" not in stats_body
     assert body.index("_compactionTokenStats(payload || {})") > body.index(
@@ -977,7 +979,11 @@ def test_chat_compact_blocking_failure_preserves_pending_queue() -> None:
     assert "compaction_insufficient" in source
     assert "compaction_flush_failed" in source
     assert "const preservePending = _compactFailureBlocksPending(payload || {});" in toast_body
-    assert "preservePending," in toast_body
+    assert (
+        "const keepPendingQueued = preservePending || (source !== 'manual' && _isStreaming);"
+        in toast_body
+    )
+    assert "preservePending: keepPendingQueued" in toast_body
     assert "options && options.preservePending" in settle_body
     assert "_popAllPendingIntoComposer();" in settle_body
     assert "recovered = _pendingQueue.length > 0;" in settle_body

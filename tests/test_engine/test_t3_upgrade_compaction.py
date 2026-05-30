@@ -596,7 +596,9 @@ async def test_compact_raises_continues() -> None:
 
 
 @pytest.mark.asyncio
-async def test_t3_compact_failure_uses_emergency_ephemeral_history_trim() -> None:
+async def test_t3_compact_failure_uses_emergency_ephemeral_history_trim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     session_key = "agent:main:webchat:t3-emergency"
     transcript = [
         TranscriptEntry(
@@ -614,6 +616,12 @@ async def test_t3_compact_failure_uses_emergency_ephemeral_history_trim() -> Non
         raise RuntimeError("compact boom")
 
     sm.compact = _boom  # type: ignore[assignment]
+    events: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        runtime_module,
+        "notify_compaction",
+        lambda session_key, **payload: events.append((session_key, payload)),
+    )
     runner = _make_runner(session_manager=sm, flush_service=_FakeFlushService())
 
     result = await runner._maybe_compact_on_t3_upgrade(
@@ -639,3 +647,8 @@ async def test_t3_compact_failure_uses_emergency_ephemeral_history_trim() -> Non
     assert 0 < len(agent.history) < len(transcript)
     assert summary_context is not None
     assert "emergency request-scoped compaction" in summary_context.lower()
+    statuses = [payload["status"] for _, payload in events]
+    assert statuses[:2] == ["started", "emergency_ephemeral"]
+    assert "failed" not in statuses
+    emergency = next(payload for _, payload in events if payload["status"] == "emergency_ephemeral")
+    assert emergency["durability"] == "request_scoped"
