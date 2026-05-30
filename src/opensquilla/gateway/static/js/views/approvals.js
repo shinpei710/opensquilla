@@ -67,9 +67,12 @@ const ApprovalsView = (() => {
   }
 
   function _loadData() {
-    fetch('/api/approvals', { headers: _authHeaders() })
-      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-      .then(data => {
+    Promise.all([
+      fetch('/api/approvals', { headers: _authHeaders() })
+        .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }),
+      _loadExecutionModeSummary(),
+    ])
+      .then(([data, executionMode]) => {
         const container = _el && _el.querySelector('#appr-content');
         if (!container) return;
 
@@ -94,6 +97,11 @@ const ApprovalsView = (() => {
               <div class="stat-label">Strategy</div>
               <div class="stat-value">${_esc(activeOpt.label)}</div>
               <div class="stat-hint">${_esc(activeOpt.desc)}</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Effective execution mode</div>
+              <div class="stat-value mono">${_esc(executionMode.label)}</div>
+              <div class="stat-hint">${_esc(executionMode.desc)}</div>
             </div>
           </section>
 
@@ -163,6 +171,79 @@ const ApprovalsView = (() => {
         });
       })
       .catch(err => UI.toast('Failed to load approvals: ' + err.message, 'err'));
+  }
+
+  async function _loadExecutionModeSummary() {
+    const sessionMode = _browserElevatedMode();
+    if (sessionMode) return _executionModeSummary('Session', sessionMode);
+    let globalMode = '';
+    try {
+      if (_rpc?.waitForConnection && _rpc.state !== 'connected') {
+        await _withTimeout(_rpc.waitForConnection(), 1000);
+      }
+      const cfg = _rpc?.call ? await _rpc.call('config.get') : null;
+      globalMode = _normalizeElevatedMode(cfg?.permissions?.default_mode);
+    } catch {}
+    if (globalMode) return _executionModeSummary('Global', globalMode);
+    return {
+      label: 'Approval prompts',
+      desc: 'Risky tool calls will open approval prompts.',
+    };
+  }
+
+  function _executionModeSummary(scope, mode) {
+    const label = `${scope} ${String(mode).toUpperCase()}`;
+    if (mode === 'bypass') {
+      return {
+        label,
+        desc: scope === 'Session'
+          ? 'Approval prompts are currently bypassed for this browser chat session.'
+          : 'Approval prompts are currently bypassed by the global permission mode.',
+      };
+    }
+    if (mode === 'full') {
+      return {
+        label,
+        desc: scope === 'Session'
+          ? 'Approval and sensitive-path prompts are bypassed for this browser chat session.'
+          : 'Approval and sensitive-path prompts are bypassed by the global permission mode.',
+      };
+    }
+    return {
+      label,
+      desc: 'Host execution is enabled; risky tool calls still use approval prompts.',
+    };
+  }
+
+  function _withTimeout(promise, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+      Promise.resolve(promise).then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
+  }
+
+  function _browserElevatedMode() {
+    let mode = '';
+    let version = '';
+    try {
+      mode = localStorage.getItem(ELEVATED_MODE_KEY) || '';
+      version = localStorage.getItem(ELEVATED_MODE_VERSION_KEY) || '';
+    } catch {}
+    if (mode === 'full' && version !== ELEVATED_MODE_STORAGE_VERSION) return 'bypass';
+    return _normalizeElevatedMode(mode);
+  }
+
+  function _normalizeElevatedMode(mode) {
+    return mode === 'on' || mode === 'bypass' || mode === 'full' ? mode : '';
   }
 
   function _renderApproval(item) {

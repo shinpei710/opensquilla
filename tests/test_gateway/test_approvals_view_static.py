@@ -56,3 +56,17 @@ def test_approval_card_metadata_wraps_long_runtime_identifiers() -> None:
     assert "overflow-wrap: anywhere" in meta_item_rule
     assert "white-space: normal" in code_rule
     assert "overflow-wrap: anywhere" in code_rule
+
+
+def test_approvals_view_separates_strategy_from_effective_execution_mode() -> None:
+    js = APPROVALS_JS.read_text(encoding="utf-8")
+
+    assert "Effective execution mode" in js
+    assert "cfg?.permissions?.default_mode" in js
+    assert "localStorage.getItem(ELEVATED_MODE_KEY)" in js
+    assert "_executionModeSummary('Session', sessionMode)" in js
+    assert "_executionModeSummary('Global', globalMode)" in js
+    assert "const label = `${scope} ${String(mode).toUpperCase()}`;" in js
+    assert "Approval prompts are currently bypassed by the global permission mode." in js
+    assert "Approval prompts are currently bypassed for this browser chat session." in js
+    assert "Risky tool calls will open approval prompts." in js

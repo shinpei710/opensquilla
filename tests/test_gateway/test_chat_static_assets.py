@@ -73,10 +73,14 @@ def test_chat_input_accept_attribute_matches_allowlist() -> None:
 def test_chat_permission_pill_distinguishes_global_and_session_modes() -> None:
     source = _read_chat_js()
 
+    assert '<span class="chat-toolbar-row-label">Execution mode</span>' in source
+    assert '<span class="chat-toolbar-row-label">Approvals</span>' not in source
     assert "cfg?.permissions?.default_mode" in source
     assert "Global ${_globalElevatedMode.toUpperCase()}" in source
     assert "Session ${_elevatedMode.toUpperCase()}" in source
+    assert "Approval prompts are active" in source
     assert "opensquilla sandbox on|bypass|full|reset" in source
+    assert "Bypass Off" not in source
 
     # The legacy image-only `accept="image/*" multiple` literal must be gone:
     assert 'accept="image/*" multiple' not in source

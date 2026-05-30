@@ -1178,7 +1178,7 @@ const ChatView = (() => {
             <button class="btn btn--icon btn--ghost" id="chat-btn-attach" title="Attach files: PNG, JPEG, GIF, WEBP, PDF, TXT, MD, HTML, CSV, JSON">${icons.paperclip()}</button>
             <div class="chat-toolbar-wrap">
               <button type="button" class="btn btn--icon btn--ghost chat-toolbar-trigger" id="chat-toolbar-trigger"
-                      title="Run modes — approvals, router"
+                      title="Run modes — execution, router"
                       aria-label="Run modes"
                       aria-haspopup="dialog"
                       aria-expanded="false">${_iconGear()}<span class="chat-toolbar-trigger-dots" aria-hidden="true"><i data-dot="bypass"></i><i data-dot="router"></i></span></button>
@@ -1186,9 +1186,9 @@ const ChatView = (() => {
                 <div class="chat-toolbar-popover-arrow" aria-hidden="true"></div>
                 <div class="chat-toolbar-popover-inner" id="chat-toolbar">
                   <div class="chat-toolbar-row">
-                    <span class="chat-toolbar-row-label">Approvals</span>
+                    <span class="chat-toolbar-row-label">Execution mode</span>
                     <button class="chat-pill chat-pill--danger" id="pill-elevated"
-                            title="Approval prompts active. Click to enable full bypass for this browser session.">Bypass Off</button>
+                            title="Approval prompts are active. Click to enable approval bypass for this browser session.">Approval prompts</button>
                   </div>
                   <div class="chat-toolbar-row">
                     <span class="chat-toolbar-row-label">Squilla Router</span>
@@ -2224,15 +2224,15 @@ const ChatView = (() => {
     if (_elevatedMode) {
       _elevatedPill.textContent = `Session ${_elevatedMode.toUpperCase()}`;
       _elevatedPill.title =
-        'Session permission override is active. Click to clear the browser session override.';
+        'Session permission override is active. Approval prompts are bypassed for this browser chat session. Click to clear the override.';
     } else if (_globalElevatedMode) {
       _elevatedPill.textContent = `Global ${_globalElevatedMode.toUpperCase()}`;
       _elevatedPill.title =
-        'Global permission default is controlled by opensquilla sandbox on|bypass|full|reset.';
+        'Global permission default controls execution mode and is configured by opensquilla sandbox on|bypass|full|reset.';
     } else {
-      _elevatedPill.textContent = 'Bypass Off';
+      _elevatedPill.textContent = 'Approval prompts';
       _elevatedPill.title =
-        'Approval prompts active. Click to enable approval bypass for this browser session.';
+        'Approval prompts are active. Click to enable approval bypass for this browser session.';
     }
   }
 
