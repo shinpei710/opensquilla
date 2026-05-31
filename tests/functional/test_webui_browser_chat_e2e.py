@@ -739,8 +739,10 @@ def test_chat_compaction_events_render_recoverable_toasts_in_real_browser(
 
               await emitCompaction(page, { status: "started", source: "manual" });
               await page.waitForSelector(".chat-compact-status:not(.hidden)", { timeout: 5000 });
+              await page.waitForSelector(".chat-context-rail", { timeout: 5000 });
               await page.waitForTimeout(600);
               const startedStatusVisible = await page.locator("#chat-compact-status").innerText();
+              const manualRailStarted = await page.locator(".chat-context-rail").innerText();
               await emitCompaction(page, { status: "skipped", source: "manual" });
               await page.waitForTimeout(250);
               const skippedStatusVisible = await page.locator("#chat-compact-status").innerText();
@@ -795,6 +797,7 @@ def test_chat_compaction_events_render_recoverable_toasts_in_real_browser(
               const automaticStartedStatusVisible = await page
                 .locator("#chat-compact-status")
                 .innerText();
+              const automaticRailStarted = await page.locator(".chat-context-rail").innerText();
               await page.fill("#chat-textarea", "queued during automatic compact");
               await page.click("#chat-btn-send");
               await page.waitForTimeout(150);
@@ -812,6 +815,7 @@ def test_chat_compaction_events_render_recoverable_toasts_in_real_browser(
               const automaticObservedStatusVisible = await page
                 .locator("#chat-compact-status")
                 .innerText();
+              const automaticRailObserved = await page.locator(".chat-context-rail").innerText();
               await emitCompaction(page, {
                 status: "completed",
                 source: "automatic",
@@ -819,6 +823,7 @@ def test_chat_compaction_events_render_recoverable_toasts_in_real_browser(
                 tokens_after: 1800,
               });
               await page.waitForTimeout(250);
+              const automaticRailCompleted = await page.locator(".chat-context-rail").innerText();
               const automaticDidNotDrainBeforeDone = await page.evaluate(
                 expected => window.__compactUx.chatCalls.length === expected,
                 callsBeforeAutomaticCompact
@@ -847,6 +852,9 @@ def test_chat_compaction_events_render_recoverable_toasts_in_real_browser(
               await page.waitForTimeout(250);
               const automaticNoopStatusHidden = await page
                 .locator("#chat-compact-status.hidden")
+                .count();
+              const automaticNoopRailHidden = await page
+                .locator(".chat-context-rail")
                 .count();
               const automaticNoopBodyText = await page.locator("body").innerText();
 
@@ -915,6 +923,9 @@ def test_chat_compaction_events_render_recoverable_toasts_in_real_browser(
                 ),
                 hasReplayedFailureToast: toastMessages.some(m => m.includes("old replay")),
                 startedStatusVisible: startedStatusVisible.includes("Compacting context..."),
+                manualRailStarted:
+                  manualRailStarted.includes("Manual compact") &&
+                  manualRailStarted.includes("Compacting context..."),
                 skippedStatusVisible: skippedStatusVisible.includes(
                   "Already within context budget; no compact was applied."
                 ),
@@ -927,11 +938,21 @@ def test_chat_compaction_events_render_recoverable_toasts_in_real_browser(
                     .some(c => c.params.message === "queued during compact")
                 ),
                 automaticStartedStatusVisible: automaticStartedStatusVisible.includes(
-                  "Compacting context..."
+                  "Automatically compacting context..."
                 ),
+                automaticRailStarted:
+                  automaticRailStarted.includes("Auto compact before turn") &&
+                  automaticRailStarted.includes("Automatically compacting context..."),
                 automaticObservedStatusVisible: automaticObservedStatusVisible.includes(
                   "Summarizing older context..."
                 ),
+                automaticRailObserved:
+                  automaticRailObserved.includes("Summarizing older context...") &&
+                  automaticRailObserved.includes("summarize"),
+                automaticRailCompleted:
+                  automaticRailCompleted.includes("Context compacted; continuing the turn") &&
+                  automaticRailCompleted.includes("5,000 -> 1,800") &&
+                  automaticRailCompleted.includes("64% smaller"),
                 automaticQueuedBeforeCompleted:
                   automaticQueuedBeforeCompleted === callsBeforeAutomaticCompact,
                 automaticDidNotDrainBeforeDone,
@@ -945,6 +966,7 @@ def test_chat_compaction_events_render_recoverable_toasts_in_real_browser(
                   "Request-scoped; session history was not rewritten"
                 ) && !emergencyStatusVisible.includes("empty summary"),
                 automaticNoopStatusHidden: automaticNoopStatusHidden === 1,
+                automaticNoopRailHidden: automaticNoopRailHidden === 0,
                 automaticNoopSkippedHidden:
                   !automaticNoopBodyText.includes("Context compaction skipped") &&
                   !automaticNoopBodyText.includes("structured content noop"),
@@ -1014,17 +1036,22 @@ def test_chat_compaction_events_render_recoverable_toasts_in_real_browser(
         "hasFailedToast": True,
         "hasReplayedFailureToast": False,
         "startedStatusVisible": True,
+        "manualRailStarted": True,
         "skippedStatusVisible": True,
         "failedStatusVisible": True,
         "queuedBeforeSkipped": 0,
         "skippedDrainedQueuedSend": True,
         "automaticStartedStatusVisible": True,
+        "automaticRailStarted": True,
         "automaticObservedStatusVisible": True,
+        "automaticRailObserved": True,
+        "automaticRailCompleted": True,
         "automaticQueuedBeforeCompleted": True,
         "automaticDidNotDrainBeforeDone": True,
         "automaticDrainedAfterDone": True,
         "emergencyStatusVisible": True,
         "automaticNoopStatusHidden": True,
+        "automaticNoopRailHidden": True,
         "automaticNoopSkippedHidden": True,
         "automaticNonBenignSkipVisible": True,
         "blockingFailureKeptPending": True,
@@ -1494,6 +1521,238 @@ def test_router_fx_live_then_reopen_stays_settled_in_real_browser(tmp_path: Path
         "deepseek-v4-flash",
         "gemini-3.1-flash-lite",
     }, after_hydration
+
+
+def test_completed_reconnect_without_replay_refreshes_history_in_real_browser(
+    tmp_path: Path,
+) -> None:
+    if os.environ.get("OPENSQUILLA_WEBUI_BROWSER_CHAT_E2E") != "1":
+        pytest.skip("set OPENSQUILLA_WEBUI_BROWSER_CHAT_E2E=1 to run chat browser e2e")
+
+    port = _free_port()
+    server_script = tmp_path / "webui_completed_reconnect_server.py"
+    browser_script = tmp_path / "webui_completed_reconnect_browser.js"
+    server_script.write_text(
+        textwrap.dedent(
+            f"""
+            import uvicorn
+
+            from opensquilla.gateway.app import create_gateway_app
+            from opensquilla.gateway.config import AuthConfig, GatewayConfig
+
+            config = GatewayConfig(
+                host="127.0.0.1",
+                port={port},
+                auth=AuthConfig(mode="none"),
+            )
+            app = create_gateway_app(config)
+
+            if __name__ == "__main__":
+                uvicorn.run(app, host="127.0.0.1", port={port}, log_level="warning")
+            """
+        ),
+        encoding="utf-8",
+    )
+    browser_script.write_text(
+        textwrap.dedent(
+            r"""
+            const { chromium } = require("playwright");
+
+            async function waitRpc(page) {
+              await page.waitForFunction(
+                () =>
+                  typeof App !== "undefined" &&
+                  App.getRpc &&
+                  App.getRpc()?.state === "connected",
+                { timeout: 15000 }
+              );
+            }
+
+            (async () => {
+              const browser = await chromium.launch({ headless: true });
+              const page = await browser.newPage({ viewport: { width: 1280, height: 720 } });
+              const errors = [];
+              page.on("pageerror", err => errors.push(String(err)));
+
+              await page.goto(process.env.TARGET_URL, {
+                waitUntil: "domcontentloaded",
+                timeout: 30000,
+              });
+              await waitRpc(page);
+
+              await page.evaluate(() => {
+                window.__completedReconnectTest = {
+                  sessionKey: "agent:main:webchat:completed-reconnect",
+                  subscribeCalls: 0,
+                  historyCalls: 0,
+                  historyMessages: [
+                    {
+                      role: "user",
+                      text: "late single chunk",
+                      message_id: "completed-reconnect-u1",
+                      timestamp: "2026-05-31T00:38:14Z",
+                    },
+                  ],
+                };
+                const rpc = App.getRpc();
+                const originalCall = rpc.call.bind(rpc);
+                rpc.call = (method, params = {}) => {
+                  if (method === "tools.search_provider") {
+                    return Promise.resolve({ provider: "none" });
+                  }
+                  if (method === "config.get") {
+                    return Promise.resolve({
+                      permissions: { default_mode: "ask" },
+                      squilla_router: {
+                        enabled: true,
+                        rollout_phase: "full",
+                        tiers: {
+                          t1: { model: "openrouter/deepseek-v4-flash" },
+                        },
+                      },
+                    });
+                  }
+                  if (method === "chat.history") {
+                    window.__completedReconnectTest.historyCalls += 1;
+                    return Promise.resolve({
+                      messages: window.__completedReconnectTest.historyMessages,
+                      history_scope: "complete",
+                      has_more: false,
+                    });
+                  }
+                  if (method === "sessions.messages.subscribe") {
+                    window.__completedReconnectTest.subscribeCalls += 1;
+                    return new Promise(resolve => {
+                      setTimeout(() => {
+                        window.__completedReconnectTest.historyMessages = [
+                          {
+                            role: "user",
+                            text: "late single chunk",
+                            message_id: "completed-reconnect-u1",
+                            timestamp: "2026-05-31T00:38:14Z",
+                          },
+                          {
+                            role: "assistant",
+                            text: "未能解析回复：\n  - field 'intent': '不要用这个skill实施' not in choices",
+                            message_id: "completed-reconnect-a1",
+                            timestamp: "2026-05-31T00:38:28Z",
+                            model: "openrouter/deepseek-v4-flash",
+                            usage: {
+                              model: "openrouter/deepseek-v4-flash",
+                              routed_model: "openrouter/deepseek-v4-flash",
+                              routed_tier: "t1",
+                              routing_source: "squilla_router",
+                              routing_applied: true,
+                              input_tokens: 0,
+                              output_tokens: 0,
+                            },
+                          },
+                        ];
+                        resolve({
+                          subscribed: true,
+                          key: params.key,
+                          current_stream_seq: 0,
+                          replay_complete: true,
+                          replayed_count: 0,
+                          run_status: "idle",
+                          last_task: {
+                            task_id: "completed-reconnect-task",
+                            status: "succeeded",
+                            terminal_reason: "completed",
+                          },
+                        });
+                      }, 800);
+                    });
+                  }
+                  return originalCall(method, params);
+                };
+              });
+
+              await page.evaluate(() =>
+                Router.navigate("/chat?session=agent:main:webchat:completed-reconnect")
+              );
+              await page.waitForSelector("#chat-textarea", { timeout: 15000 });
+              await page.waitForFunction(
+                () => document.querySelector(".msg.user")?.textContent.includes("late single chunk"),
+                { timeout: 5000 }
+              );
+              const userOnly = await page.evaluate(() => ({
+                assistantHasReply: Array.from(document.querySelectorAll(".msg.assistant"))
+                  .some(el => el.textContent.includes("未能解析回复")),
+                historyCalls: window.__completedReconnectTest.historyCalls,
+                subscribeCalls: window.__completedReconnectTest.subscribeCalls,
+              }));
+
+              await page.waitForFunction(
+                () => Array.from(document.querySelectorAll(".msg.assistant"))
+                  .some(el => el.textContent.includes("未能解析回复")),
+                { timeout: 5000 }
+              );
+              const afterTerminalSubscribe = await page.evaluate(() => ({
+                assistantHasReply: Array.from(document.querySelectorAll(".msg.assistant"))
+                  .some(el => el.textContent.includes("未能解析回复")),
+                thinkingCount: document.querySelectorAll(".msg.thinking").length,
+                streamingCount: document.querySelectorAll(".msg.streaming").length,
+                routerWinner: document.querySelector(".router-fx-cell.win .nm")?.textContent || "",
+                historyCalls: window.__completedReconnectTest.historyCalls,
+                subscribeCalls: window.__completedReconnectTest.subscribeCalls,
+              }));
+
+              await browser.close();
+              console.log(JSON.stringify({
+                userOnly,
+                afterTerminalSubscribe: {
+                  ...afterTerminalSubscribe,
+                  pageErrors: errors,
+                },
+              }));
+            })().catch(err => {
+              console.error(err && err.stack ? err.stack : String(err));
+              process.exit(1);
+            });
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["OPENSQUILLA_STATE_DIR"] = str(tmp_path / "state")
+    env["OPENSQUILLA_LOG_DIR"] = str(tmp_path / "logs")
+    server = subprocess.Popen(
+        [sys.executable, str(server_script)],
+        cwd=Path.cwd(),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        _wait_for_health(port, server)
+        _install_playwright(tmp_path)
+        result = subprocess.run(
+            [_node(), str(browser_script)],
+            cwd=tmp_path,
+            env=dict(env, TARGET_URL=f"http://127.0.0.1:{port}/control/"),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+    finally:
+        _stop_process(server)
+
+    assert payload["userOnly"]["assistantHasReply"] is False, payload
+    after = payload["afterTerminalSubscribe"]
+    assert after["assistantHasReply"] is True, after
+    assert after["thinkingCount"] == 0, after
+    assert after["streamingCount"] == 0, after
+    assert after["routerWinner"] == "deepseek-v4-flash", after
+    assert after["historyCalls"] >= 2, after
+    assert after["pageErrors"] == [], after
 
 
 def test_webui_hotfix_flows_in_real_browser(tmp_path: Path) -> None:

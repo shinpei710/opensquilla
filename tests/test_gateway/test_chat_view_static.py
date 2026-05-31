@@ -860,7 +860,10 @@ def test_chat_surfaces_compaction_lifecycle_status_and_exception_toasts() -> Non
 
     assert "function _showCompactionToast(payload, meta = {})" in source
     assert "_setCompactInFlight(true, compactKey);" in compact_block
-    assert "Compacting context..." in body
+    assert "_syncCompactionRail(" in compact_block
+    assert "Compacting context..." in source
+    assert "Automatically compacting context..." in source
+    assert "_compactionStatusMessage(payload || {}, source, status)" in body
     assert "Already within context budget; no compact was applied." in source
     assert "Context compaction could not be applied" in source
     assert "No compactable chat history yet." in source
@@ -875,6 +878,8 @@ def test_chat_surfaces_compaction_lifecycle_status_and_exception_toasts() -> Non
     assert "Continuing with temporary context compaction" in source
     assert "Continuing with temporary context compaction for this turn" in body
     assert "Compact cancelled" in source
+    assert "Auto compact before send" in source
+    assert "Auto compact during provider retry" in source
     assert "function _compactionUserVisible(payload, source, status)" in source
     assert "if (!_compactionUserVisible(payload || {}, source, status))" in body
     assert "structured content noop" not in source.lower()
@@ -890,10 +895,16 @@ def test_chat_surfaces_persistent_compaction_status_row() -> None:
     assert 'id="chat-compact-status"' in source
     assert "let _compactStatusEl = null;" in source
     assert "let _compactStatusTimer = null;" in source
+    assert "let _compactionRailEl = null;" in source
+    assert "let _compactionRailTimer = null;" in source
     assert "function _setCompactStatus(status, message, options = {})" in source
+    assert "function _syncCompactionRail(payload, status, source)" in source
+    assert "function _compactionLifecycleSteps(payload, status)" in source
     assert "function _hideCompactStatus()" in source
+    assert "function _hideCompactionRail()" in source
     assert "_compactStatusEl = _el.querySelector('#chat-compact-status');" in source
-    assert "_setCompactStatus('started', 'Compacting context...'" in body
+    assert "_setCompactStatus('started', _compactionStatusMessage(payload || {}, source, status)" in body
+    assert "return source === 'manual' ? 'Compacting context...' : 'Automatically compacting context...';" in source
     assert "function _compactionSkipMessage(payload, source)" in source
     assert "if (_INTERNAL_COMPACTION_SKIP_REASONS.has(reason)) return '';" in source
     assert "Request-scoped; session history was not rewritten" in source
@@ -906,8 +917,12 @@ def test_chat_surfaces_persistent_compaction_status_row() -> None:
     assert "status === 'emergency_ephemeral'" in body
     assert "status === 'observed'" in body
     assert "_hideCompactStatus();" in source[source.index("function destroy()") :]
+    assert "_hideCompactionRail();" in source[source.index("function destroy()") :]
     assert ".chat-compact-status" in css
     assert ".chat-compact-status__spinner" in css
+    assert ".chat-context-rail" in css
+    assert ".chat-context-rail__steps" in css
+    assert "contextRailEnter" in css
 
 
 def test_chat_compaction_token_details_are_success_only() -> None:

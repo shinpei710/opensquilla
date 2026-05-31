@@ -319,6 +319,8 @@ const ChatView = (() => {
   let _lastCompactionToastAt = 0;
   let _compactStatusEl = null;
   let _compactStatusTimer = null;
+  let _compactionRailEl = null;
+  let _compactionRailTimer = null;
   let _stopRequestedByUser = false;
   let _pendingArea = null;
   let _stopBtn = null;
@@ -1638,6 +1640,16 @@ const ChatView = (() => {
     return ['failed', 'timeout', 'cancelled', 'interrupted'].includes(runStatus);
   }
 
+  function _subscribeResultNeedsTerminalHistorySync(res) {
+    if (!res || Number(res.replayed_count || 0) > 0) return false;
+    const state = _sessionRunStatus(res);
+    if (state.status !== 'idle' || !state.task) return false;
+    const taskStatus = String(state.task.status || '').toLowerCase();
+    const terminalReason = String(state.task.terminal_reason || state.task.terminalReason || '').toLowerCase();
+    return ['succeeded', 'success', 'complete', 'completed', 'done'].includes(taskStatus)
+      || terminalReason === 'completed';
+  }
+
   function _syncTerminalSessionChange(payload = {}) {
     if (!_isCurrentSessionPayload(payload)) return false;
     _clearActiveTaskGroups();
@@ -1738,6 +1750,7 @@ const ChatView = (() => {
     _clearPendingDrainAfterTerminalTimer();
     _setCompactInFlight(false);
     _hideCompactStatus();
+    _hideCompactionRail();
     _pendingQueue = []; if (_pendingArea) _renderPendingQueue();
     _applySessionRunState({ run_status: 'idle' });
     _clearContextStatus();
@@ -2275,6 +2288,7 @@ const ChatView = (() => {
       _clearPendingDrainAfterTerminalTimer();
       _setCompactInFlight(false);
       _hideCompactStatus();
+      _hideCompactionRail();
       _pendingSessionIntent = 'new_chat'; _pendingQueue = []; if (_pendingArea) _renderPendingQueue();
       _messages = [];
       _clearContextStatus();
@@ -2601,6 +2615,7 @@ const ChatView = (() => {
         _clearPendingDrainAfterTerminalTimer();
         _setCompactInFlight(false);
         _hideCompactStatus();
+        _hideCompactionRail();
         _pendingSessionIntent = 'new_chat'; _pendingQueue = []; if (_pendingArea) _renderPendingQueue();
         _messages = [];
         _clearContextStatus();
@@ -2628,6 +2643,7 @@ const ChatView = (() => {
             _clearPendingDrainAfterTerminalTimer();
             _setCompactInFlight(false);
             _hideCompactStatus();
+            _hideCompactionRail();
             _pendingQueue = [];
             if (_pendingArea) _renderPendingQueue();
             _clearContextStatus();
@@ -2645,6 +2661,11 @@ const ChatView = (() => {
         _setCompactStatus('started', 'Compacting context...', {
           tone: 'info',
         });
+        _syncCompactionRail(
+          { key: compactKey, source: 'manual', status: 'started', phase: 'manual' },
+          'started',
+          'manual',
+        );
         _rpc.call('sessions.contextCompact', { key: compactKey })
           .then((result) => {
             if (compactKey !== _sessionKey) return;
@@ -2729,6 +2750,14 @@ const ChatView = (() => {
         && Number(res.replayed_count || 0) <= 0
       ) {
         _setSessionStreamSeq(subscribeKey, res.current_stream_seq);
+      }
+      if (_subscribeResultNeedsTerminalHistorySync(res)) {
+        _chatDiag('session.subscribe.terminal_without_replay.history_sync', {
+          runStatus: res.run_status || res.runStatus || '',
+          currentStreamSeq: res.current_stream_seq,
+          replayedCount: res.replayed_count || 0,
+        });
+        _scheduleHistorySync();
       }
       if (_isStreaming) _resetStreamIdleTimer();
     } catch (err) {
@@ -2815,6 +2844,243 @@ const ChatView = (() => {
     }
   }
 
+  function _clearCompactionRailTimer() {
+    if (_compactionRailTimer) {
+      clearTimeout(_compactionRailTimer);
+      _compactionRailTimer = null;
+    }
+  }
+
+  function _hideCompactionRail() {
+    _clearCompactionRailTimer();
+    if (_compactionRailEl && _compactionRailEl.parentNode) {
+      _compactionRailEl.remove();
+    }
+    _compactionRailEl = null;
+  }
+
+  function _placeCompactionRail() {
+    if (!_thread || !_compactionRailEl) return;
+    const empty = _thread.querySelector('.chat-empty');
+    if (empty) empty.remove();
+    if (_isStreaming && _isCurrentSessionStreamBubble(_streamBubble)) {
+      if (_compactionRailEl.nextSibling !== _streamBubble) {
+        _thread.insertBefore(_compactionRailEl, _streamBubble);
+      }
+      return;
+    }
+    if (_compactionRailEl.parentNode !== _thread || _thread.lastElementChild !== _compactionRailEl) {
+      _thread.appendChild(_compactionRailEl);
+    }
+  }
+
+  function _ensureCompactionRail() {
+    if (!_thread) return null;
+    if (!_compactionRailEl || !_compactionRailEl.isConnected) {
+      _compactionRailEl = document.createElement('div');
+      _compactionRailEl.className = 'chat-context-rail chat-context-rail--info';
+      _compactionRailEl.setAttribute('role', 'status');
+      _compactionRailEl.setAttribute('aria-live', 'polite');
+    }
+    _placeCompactionRail();
+    return _compactionRailEl;
+  }
+
+  function _compactNumber(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '';
+    return Math.round(number).toLocaleString();
+  }
+
+  function _compactRatioPercent(before, after) {
+    const b = Number(before);
+    const a = Number(after);
+    if (!Number.isFinite(b) || !Number.isFinite(a) || b <= 0 || a < 0 || a >= b) return '';
+    return Math.round((1 - (a / b)) * 100) + '% smaller';
+  }
+
+  function _compactionPhaseLabel(payload, source) {
+    const phase = String(payload && payload.phase || '').toLowerCase();
+    if (source === 'manual') return 'Manual compact';
+    if (phase === 'gateway_auto_summarize') return 'Auto compact before send';
+    if (phase === 'preflight') return 'Auto compact before turn';
+    if (phase === 't3_upgrade') return 'Auto compact before model upgrade';
+    if (phase === 'agent_inline_overflow') return 'Auto compact during provider retry';
+    if (phase) return phase.replace(/_/g, ' ');
+    return 'Automatic compact';
+  }
+
+  function _compactionStatusMessage(payload, source, status) {
+    if (status === 'started') {
+      return source === 'manual' ? 'Compacting context...' : 'Automatically compacting context...';
+    }
+    if (status === 'observed') return _compactionProgressMessage(payload || {});
+    if (status === 'emergency_ephemeral') return 'Continuing with temporary context compaction';
+    if (status === 'skipped') return _compactionSkipMessage(payload || {}, source);
+    if (status === 'failed' || status === 'error') return 'Compact failed';
+    if (status === 'cancelled') return 'Compact cancelled';
+    if (status === 'completed') {
+      return source === 'manual' ? 'Context compacted' : 'Context compacted; continuing the turn';
+    }
+    return source === 'manual' ? 'Compacting context' : 'Automatic context maintenance';
+  }
+
+  function _compactionRailDetail(payload, source, status) {
+    const event = String(payload && payload.event || '').toLowerCase();
+    const reasonDetail = _compactionStatusDetail(payload || {}, source, status);
+    if (status === 'started') {
+      return source === 'manual'
+        ? 'Manual request is rewriting older turns after safety checks.'
+        : 'OpenSquilla is preserving the current task while older turns are summarized.';
+    }
+    if (status === 'observed') {
+      if (event === 'compaction.summary_verified') {
+        return 'Carry-forward details were checked before the context window is rewritten.';
+      }
+      return 'Older context is being distilled into a compact carry-forward summary.';
+    }
+    if (status === 'completed') {
+      if (event === 'compaction.replayed') return 'Compacted context was replayed into the request window.';
+      return 'Compacted context was persisted for this session.';
+    }
+    if (status === 'emergency_ephemeral') {
+      return 'Request-scoped fallback; durable session history was not rewritten.';
+    }
+    if (status === 'skipped') return reasonDetail || 'No context rewrite was needed.';
+    if (status === 'failed' || status === 'error') {
+      return _compactSafeMessageDetail(payload || {}) || reasonDetail || 'Pending input is protected while compaction recovers.';
+    }
+    if (status === 'cancelled') return 'Pending input was recovered so the next turn can continue safely.';
+    return reasonDetail;
+  }
+
+  function _compactionRailTone(status, payload = {}) {
+    if (status === 'completed') return 'ok';
+    if (status === 'failed' || status === 'error') return 'err';
+    if (status === 'cancelled' || status === 'emergency_ephemeral') return 'warn';
+    if (status === 'skipped' && _compactionReason(payload)) return 'warn';
+    return 'info';
+  }
+
+  function _compactionMetricItems(payload, status) {
+    const items = [];
+    const before = Number(payload && payload.tokens_before);
+    const after = Number(payload && payload.tokens_after);
+    const remaining = Number(payload && payload.remaining_budget_tokens);
+    const shrink = _compactRatioPercent(before, after);
+    if (Number.isFinite(before) && before > 0 && Number.isFinite(after) && after >= 0) {
+      items.push({
+        label: 'window',
+        value: `${_compactNumber(before)} -> ${_compactNumber(after)}`,
+      });
+      if (shrink) items.push({ label: 'saved', value: shrink });
+    } else if (Number(payload && payload.summary_len) > 0) {
+      items.push({ label: 'summary', value: `${_compactNumber(payload.summary_len)} chars` });
+    }
+    if (Number.isFinite(remaining) && remaining > 0) {
+      items.push({ label: 'remaining', value: _compactNumber(remaining) });
+    }
+    const flush = String(payload && payload.flush_receipt_status || '');
+    if (flush && flush !== 'not_required') items.push({ label: 'memory', value: flush.replace(/_/g, ' ') });
+    const source = String(payload && payload.summary_source || '');
+    if (source && source !== 'unknown') items.push({ label: 'summary', value: source.replace(/_/g, ' ') });
+    const durability = String(payload && payload.durability || '');
+    if (durability && status !== 'started') items.push({ label: 'durability', value: durability.replace(/_/g, ' ') });
+    return items.slice(0, 4);
+  }
+
+  function _compactionLifecycleSteps(payload, status) {
+    const chain = new Set(Array.isArray(payload && payload.event_chain) ? payload.event_chain : []);
+    const event = String(payload && payload.event || '').toLowerCase();
+    const completed = status === 'completed';
+    const failed = status === 'failed' || status === 'error';
+    const skipped = status === 'skipped';
+    const ephemeral = status === 'emergency_ephemeral';
+    const steps = [
+      ['triggered', 'pressure'],
+      ['chunk_summarized', 'summarize'],
+      ['summary_verified', 'verify'],
+      ['persisted', event === 'compaction.replayed' || chain.has('compaction.replayed') ? 'replay' : 'persist'],
+    ];
+    return steps.map(([key, label], index) => {
+      const eventName = `compaction.${key}`;
+      let state = '';
+      if (completed) state = 'is-complete';
+      else if (ephemeral && index <= 1) state = 'is-complete';
+      else if (failed && index === 0) state = 'is-active';
+      else if (skipped && index === 0) state = 'is-muted';
+      else if (chain.has(eventName)) state = 'is-complete';
+      else if (event === eventName || (!event && status === 'started' && index === 0)) state = 'is-active';
+      return { label, state };
+    });
+  }
+
+  function _compactionProgressPercent(payload, status) {
+    if (status === 'completed') return 100;
+    if (status === 'emergency_ephemeral') return 58;
+    if (status === 'failed' || status === 'error' || status === 'cancelled') return 100;
+    if (status === 'skipped') return 20;
+    const event = String(payload && payload.event || '').toLowerCase();
+    if (event === 'compaction.summary_verified') return 72;
+    if (event === 'compaction.chunk_summarized') return 46;
+    if (status === 'observed') return 52;
+    return 24;
+  }
+
+  function _syncCompactionRail(payload, status, source) {
+    if (payload && Object.prototype.hasOwnProperty.call(payload, 'user_visible')
+        && payload.user_visible === false) {
+      _hideCompactionRail();
+      return;
+    }
+    if (status === 'skipped' && !_compactionUserVisible(payload || {}, source, status)) {
+      _hideCompactionRail();
+      return;
+    }
+    const rail = _ensureCompactionRail();
+    if (!rail) return;
+    _clearCompactionRailTimer();
+    const tone = _compactionRailTone(status, payload || {});
+    const title = _compactionStatusMessage(payload || {}, source, status);
+    const detail = _compactionRailDetail(payload || {}, source, status);
+    const phase = _compactionPhaseLabel(payload || {}, source);
+    const metrics = _compactionMetricItems(payload || {}, status);
+    const steps = _compactionLifecycleSteps(payload || {}, status);
+    const progress = _compactionProgressPercent(payload || {}, status);
+    rail.className = `chat-context-rail chat-context-rail--${tone} chat-context-rail--${status || 'unknown'}`;
+    rail.style.setProperty('--compact-progress', `${progress}%`);
+    rail.dataset.status = status || '';
+    rail.dataset.source = source || '';
+    rail.innerHTML = ''
+      + '<div class="chat-context-rail__rule" aria-hidden="true"><span></span></div>'
+      + '<div class="chat-context-rail__panel">'
+      + '  <div class="chat-context-rail__pulse" aria-hidden="true"></div>'
+      + '  <div class="chat-context-rail__copy">'
+      + `    <div class="chat-context-rail__kicker">${_esc(phase)}</div>`
+      + `    <div class="chat-context-rail__title">${_esc(title)}</div>`
+      + (detail ? `    <div class="chat-context-rail__detail">${_esc(detail)}</div>` : '')
+      + '  </div>'
+      + (metrics.length
+        ? '  <div class="chat-context-rail__metrics">'
+          + metrics.map((item) => (
+            `<span><b>${_esc(item.label)}</b>${_esc(item.value)}</span>`
+          )).join('')
+          + '  </div>'
+        : '')
+      + '  <div class="chat-context-rail__steps" aria-hidden="true">'
+      + steps.map((step) => (
+        `<span class="${_esc(step.state)}"><i></i>${_esc(step.label)}</span>`
+      )).join('')
+      + '  </div>'
+      + '</div>';
+    _placeCompactionRail();
+    if (['completed', 'skipped', 'failed', 'error', 'cancelled', 'emergency_ephemeral'].includes(status)) {
+      _compactionRailTimer = setTimeout(() => {
+        if (_compactionRailEl === rail) rail.classList.add('is-settled');
+      }, 4500);
+    }
+  }
+
   function _compactFailureBlocksPending(payload) {
     if (!payload) return false;
     if (payload.refused === true || payload.safe_to_send === false || payload.safeToSend === false) {
@@ -2861,7 +3127,8 @@ const ChatView = (() => {
     const event = String(payload && payload.event || '').toLowerCase();
     if (event === 'compaction.chunk_summarized') return 'Summarizing older context...';
     if (event === 'compaction.summary_verified') return 'Verifying compacted context...';
-    return 'Compacting context...';
+    const source = String(payload && payload.source || '').toLowerCase();
+    return source === 'manual' ? 'Compacting context...' : 'Automatically compacting context...';
   }
 
   const _INTERNAL_COMPACTION_SKIP_REASONS = new Set([
@@ -2935,9 +3202,10 @@ const ChatView = (() => {
     }
     const source = String(payload && payload.source || '').toLowerCase();
     if (_suppressDuplicateCompactionToast(payload || {}, status, source)) return;
+    _syncCompactionRail(payload || {}, status, source);
     if (status === 'started') {
       _setCompactInFlight(true, payload && payload.key || _sessionKey);
-      _setCompactStatus('started', 'Compacting context...', {
+      _setCompactStatus('started', _compactionStatusMessage(payload || {}, source, status), {
         tone: 'info',
         detail: _compactionStatusDetail(payload || {}, source, status),
       });
@@ -2967,6 +3235,7 @@ const ChatView = (() => {
       _settleCompactInFlight(payload || {});
       if (!_compactionUserVisible(payload || {}, source, status)) {
         _hideCompactStatus();
+        _hideCompactionRail();
         return;
       }
       const skippedMessage = _compactionSkipMessage(payload || {}, source);
@@ -5449,6 +5718,7 @@ const ChatView = (() => {
       }
 	      _lastSavingsPopupIdentity = historySavingsIdentity;
 	      _renderHistoryScopeRow();
+	      _placeCompactionRail();
 	      if (opts.preserveScroll) {
 	        const oldHeight = Number(opts.previousScrollHeight || 0);
 	        const oldTop = Number(opts.previousScrollTop || 0);
@@ -5999,6 +6269,7 @@ const ChatView = (() => {
       'session.event.tool_use_start',
       'session.event.tool_result',
       'session.event.artifact',
+      'session.event.compaction',
       'session.event.subagent_start',
       'session.event.subagent_progress',
       'session.event.subagent_result',
@@ -8209,6 +8480,7 @@ const ChatView = (() => {
     _clearPendingDrainAfterTerminalTimer();
     _setCompactInFlight(false);
     _hideCompactStatus();
+    _hideCompactionRail();
     _pendingAttachments = [];
     _pendingQueue = [];
     _stopRequestedByUser = false;

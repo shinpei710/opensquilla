@@ -1384,6 +1384,249 @@
 }
 .chat-pending-chip-remove:hover { color: var(--danger); }
 
+.chat-context-rail {
+  --rail-tone: var(--accent);
+  --rail-bg: color-mix(in srgb, var(--rail-tone) 7%, var(--bg-surface));
+  --rail-border: color-mix(in srgb, var(--rail-tone) 34%, var(--border));
+  --compact-progress: 22%;
+  width: min(960px, 100%);
+  align-self: center;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 7px;
+  margin: var(--sp-1) 0 var(--sp-2);
+  font-family: Bahnschrift, Aptos, "Segoe UI Variable", "Segoe UI", sans-serif;
+  animation: contextRailEnter 180ms ease-out;
+}
+
+.chat-context-rail--ok { --rail-tone: var(--ok); }
+.chat-context-rail--warn { --rail-tone: var(--warn); }
+.chat-context-rail--err { --rail-tone: var(--danger); }
+
+.chat-context-rail__rule {
+  position: relative;
+  height: 14px;
+  display: flex;
+  align-items: center;
+}
+
+.chat-context-rail__rule::before {
+  content: "";
+  width: 100%;
+  height: 1px;
+  background:
+    linear-gradient(90deg,
+      transparent,
+      color-mix(in srgb, var(--rail-tone) 36%, var(--border)) 10%,
+      color-mix(in srgb, var(--rail-tone) 36%, var(--border)) 90%,
+      transparent);
+}
+
+.chat-context-rail__rule span {
+  position: absolute;
+  left: 0;
+  width: var(--compact-progress);
+  height: 3px;
+  max-width: 100%;
+  background: var(--rail-tone);
+  box-shadow: 0 0 18px color-mix(in srgb, var(--rail-tone) 42%, transparent);
+  transition: width 260ms ease;
+}
+
+.chat-context-rail__panel {
+  position: relative;
+  display: grid;
+  grid-template-columns: 14px minmax(220px, 1fr) minmax(180px, max-content);
+  grid-template-areas:
+    "pulse copy metrics"
+    "pulse steps steps";
+  gap: var(--sp-2) var(--sp-3);
+  align-items: center;
+  padding: 10px 12px;
+  color: var(--text);
+  background:
+    linear-gradient(135deg,
+      color-mix(in srgb, var(--rail-tone) 10%, transparent),
+      transparent 34%),
+    var(--rail-bg);
+  border: 1px solid var(--rail-border);
+  border-radius: 8px;
+  box-shadow:
+    0 10px 24px color-mix(in srgb, #000 10%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #fff 22%, transparent);
+  overflow: hidden;
+}
+
+.chat-context-rail__panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.34;
+  background-image:
+    repeating-linear-gradient(135deg,
+      color-mix(in srgb, var(--rail-tone) 16%, transparent) 0 1px,
+      transparent 1px 10px);
+  mask-image: linear-gradient(90deg, transparent, #000 16%, #000 84%, transparent);
+}
+
+.chat-context-rail__pulse {
+  grid-area: pulse;
+  position: relative;
+  width: 12px;
+  height: 12px;
+  align-self: start;
+  margin-top: 4px;
+  border: 2px solid var(--rail-tone);
+  border-radius: 3px;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--rail-tone) 12%, transparent);
+  z-index: 1;
+}
+
+.chat-context-rail--started .chat-context-rail__pulse,
+.chat-context-rail--observed .chat-context-rail__pulse {
+  animation: contextPulse 900ms ease-in-out infinite;
+}
+
+.chat-context-rail__copy {
+  grid-area: copy;
+  min-width: 0;
+  z-index: 1;
+}
+
+.chat-context-rail__kicker {
+  color: color-mix(in srgb, var(--rail-tone) 74%, var(--text-muted));
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.chat-context-rail__title {
+  margin-top: 1px;
+  font-size: 14px;
+  font-weight: 760;
+  line-height: 1.25;
+}
+
+.chat-context-rail__detail {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.chat-context-rail__metrics {
+  grid-area: metrics;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+  z-index: 1;
+}
+
+.chat-context-rail__metrics span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  max-width: 220px;
+  padding: 4px 7px;
+  border: 1px solid color-mix(in srgb, var(--rail-tone) 24%, var(--border));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--bg) 62%, transparent);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.chat-context-rail__metrics b {
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.chat-context-rail__steps {
+  grid-area: steps;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+  min-width: 0;
+  z-index: 1;
+}
+
+.chat-context-rail__steps span {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 5px;
+  color: var(--text-dim);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.chat-context-rail__steps i {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+}
+
+.chat-context-rail__steps .is-active {
+  color: var(--rail-tone);
+  font-weight: 700;
+}
+
+.chat-context-rail__steps .is-active i {
+  background: var(--rail-tone);
+  box-shadow: 0 0 12px color-mix(in srgb, var(--rail-tone) 40%, transparent);
+}
+
+.chat-context-rail__steps .is-complete {
+  color: color-mix(in srgb, var(--rail-tone) 74%, var(--text));
+}
+
+.chat-context-rail__steps .is-complete i {
+  background: currentColor;
+}
+
+.chat-context-rail.is-settled {
+  opacity: 0.88;
+}
+
+@keyframes contextRailEnter {
+  from { opacity: 0; transform: translateY(5px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes contextPulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(0.74); }
+}
+
+@media (max-width: 760px) {
+  .chat-context-rail {
+    width: 100%;
+  }
+
+  .chat-context-rail__panel {
+    grid-template-columns: 14px minmax(0, 1fr);
+    grid-template-areas:
+      "pulse copy"
+      "metrics metrics"
+      "steps steps";
+  }
+
+  .chat-context-rail__metrics {
+    justify-content: flex-start;
+  }
+
+  .chat-context-rail__steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 .chat-compact-status {
   margin: 0 var(--sp-4) var(--sp-2);
   padding: var(--sp-2) var(--sp-3);
@@ -1518,6 +1761,13 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .chat-context-rail,
+  .chat-context-rail__pulse,
+  .chat-context-rail__rule span {
+    animation: none;
+    transition: none;
+  }
+
   .chat-compact-status__spinner {
     animation: none;
   }
