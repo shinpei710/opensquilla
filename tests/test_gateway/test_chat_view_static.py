@@ -1980,7 +1980,8 @@ def test_router_fx_single_visual_candidate_renders_nothing_live_or_history() -> 
     schedule_end = source.index("  // Render the routing visualisation", schedule_start)
     schedule_body = source[schedule_start:schedule_end]
     assert (
-        "if (_routerFxConfigTiers !== null && !_routerFxHasMultipleCandidates(requestKind, null)) {"
+        "if (_routerFxConfigTiers !== null "
+        "&& !_routerFxHasMultipleCandidates(requestKind, null)) {"
         in schedule_body
     )
     assert "_chatDiag('router_scan.schedule.skip.single_candidate'" in schedule_body
