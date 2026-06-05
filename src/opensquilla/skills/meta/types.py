@@ -216,3 +216,7 @@ class MetaResult:
     # New in PR3 (design §8.1, §8.3): pause signal vs failure distinction.
     paused: bool = False
     paused_payload: MetaPaused | None = None
+    # Optional metacognitive reliability report attached by the MetaSkill
+    # scheduler. Kept as a plain dict so persistence and surfaces can consume
+    # it without importing the controller module.
+    metacognition: dict[str, Any] | None = None

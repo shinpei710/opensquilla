@@ -47,6 +47,10 @@ from opensquilla.skills.meta.executors.llm_classify import (
 from opensquilla.skills.meta.executors.skill_exec import run_skill_exec_step
 from opensquilla.skills.meta.executors.tool_call import run_tool_call_step
 from opensquilla.skills.meta.inputs import language_instruction_for_user_message
+from opensquilla.skills.meta.metacognition import (
+    MetacognitiveController,
+    refresh_report_final_text,
+)
 from opensquilla.skills.meta.scheduler import run_dag
 from opensquilla.skills.meta.templating import (
     _coerce_to_choice,  # noqa: F401 — re-exported for tests/back-compat
@@ -128,6 +132,7 @@ class MetaOrchestrator:
         session_key: str | None = None,
         turn_id: str | None = None,
         memory_persist_enabled: bool = True,
+        metacognition_enabled: bool = True,
         usage_tracker: Any | None = None,
         # PR3: ``dao`` is the preferred alias for ``run_writer`` when the
         # caller only needs the DAO surface (try_claim_resume /
@@ -173,11 +178,19 @@ class MetaOrchestrator:
         self._session_key = session_key
         self._turn_id = turn_id
         self._usage_tracker = usage_tracker
+        self._metacognition_enabled = metacognition_enabled
         # When False the orchestrator skips any ``skill: memory`` step
         # (the conventional last-step archive pattern). Honoured by
         # ``_dispatch_step_stream`` — see GatewayConfig.meta_skill
         # .persistence.memory_persist_enabled for the wiring.
         self._memory_persist_enabled = memory_persist_enabled
+
+    def _new_metacognition_controller(self) -> MetacognitiveController | None:
+        """Create a fresh controller per run so concurrent runs cannot share state."""
+
+        if not self._metacognition_enabled:
+            return None
+        return MetacognitiveController()
 
     async def run(self, match: MetaMatch) -> MetaResult:
         """Execute the plan, draining the streaming generator for the final result.
@@ -321,6 +334,7 @@ class MetaOrchestrator:
                 usage_tracker=self._usage_tracker,
                 session_key=self._session_key,
                 usage_scope_prefix=run_id or f"meta:{match.plan.name}:{id(match)}",
+                metacognition_controller=self._new_metacognition_controller(),
             ):
                 if isinstance(item, MetaResult):
                     # Resolve user-facing ``final_text`` per
@@ -340,6 +354,10 @@ class MetaOrchestrator:
                         )
                         item.final_text = await self._repair_final_text_language(
                             match.inputs,
+                            item.final_text,
+                        )
+                        item.metacognition = refresh_report_final_text(
+                            item.metacognition,
                             item.final_text,
                         )
                     final_result = item
@@ -656,6 +674,7 @@ class MetaOrchestrator:
             match,
             dispatch_step_stream=dispatch_step_stream,
             yield_skill_view_preface=yield_skill_view_preface,
+            metacognition_controller=self._new_metacognition_controller(),
         ):
             if isinstance(ev, MetaResult):
                 final = ev
@@ -761,6 +780,7 @@ class MetaOrchestrator:
                 dispatch_step_stream=dispatch_step_stream,
                 yield_skill_view_preface=yield_skill_view_preface,
                 seed_outputs=outputs,
+                metacognition_controller=self._new_metacognition_controller(),
             ):
                 if isinstance(ev, MetaResult):
                     final = ev
@@ -847,6 +867,7 @@ class MetaOrchestrator:
                 usage_tracker=self._usage_tracker,
                 session_key=self._session_key,
                 usage_scope_prefix=run_id,
+                metacognition_controller=self._new_metacognition_controller(),
             ):
                 if isinstance(ev, MetaResult):
                     if ev.ok:
@@ -858,6 +879,10 @@ class MetaOrchestrator:
                         )
                         ev.final_text = await self._repair_final_text_language(
                             inputs,
+                            ev.final_text,
+                        )
+                        ev.metacognition = refresh_report_final_text(
+                            ev.metacognition,
                             ev.final_text,
                         )
                     final = ev

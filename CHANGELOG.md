@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- MetaSkill runs now attach an observational metacognition report with run
+  state, completion evidence, and reliability signals for future controller
+  policies.
+
 ### Changed
 
 ### Fixed

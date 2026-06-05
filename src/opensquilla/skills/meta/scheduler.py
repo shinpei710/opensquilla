@@ -29,6 +29,7 @@ from opensquilla.engine.types import (
 )
 from opensquilla.engine.usage import usage_scope
 from opensquilla.skills.meta.events import _FailoverTriggered, _StepDone
+from opensquilla.skills.meta.metacognition import MetacognitiveController
 from opensquilla.skills.meta.parser import topological_order
 from opensquilla.skills.meta.templating import (
     evaluate_when,
@@ -149,6 +150,7 @@ async def run_dag(
     session_key: str | None = None,
     usage_scope_prefix: str | None = None,
     seed_outputs: dict[str, str] | None = None,
+    metacognition_controller: MetacognitiveController | None = None,
 ) -> AsyncIterator[AgentEvent | MetaResult]:
     """Run the plan and stream a flat sequence of events for the UI.
 
@@ -195,8 +197,18 @@ async def run_dag(
         return
 
     if not ordered:
-        yield MetaResult(ok=True, final_text="", step_outputs={})
+        report = None
+        if metacognition_controller is not None:
+            metacognition_controller.start_run(match, ordered)
+            report = metacognition_controller.complete(
+                ok=True,
+                final_text="",
+                step_outputs={},
+            )
+        yield MetaResult(ok=True, final_text="", step_outputs={}, metacognition=report)
         return
+    if metacognition_controller is not None:
+        metacognition_controller.start_run(match, ordered)
 
     steps_by_id: dict[str, MetaStep] = {s.id: s for s in ordered}
     pending_deps: dict[str, set[str]] = {
@@ -288,6 +300,11 @@ async def run_dag(
                     skill=step.skill,
                     when=step.when,
                 )
+                if metacognition_controller is not None:
+                    metacognition_controller.record_skip(
+                        step,
+                        reason=f"when={step.when!r} evaluated false",
+                    )
                 step_use_id = f"meta_step_{step.id}"
                 step_tool_name = f"meta-step:{step.id}"
                 await event_queue.put(
@@ -375,6 +392,13 @@ async def run_dag(
                         inputs=dict(match.inputs),
                         outputs=outputs,
                     )
+                    if metacognition_controller is not None:
+                        metacognition_controller.before_step(
+                            step,
+                            effective_skill,
+                            rendered_inputs,
+                            outputs,
+                        )
                     await on_step_begin(
                         step.id, effective_skill, rendered_inputs,
                     )
@@ -384,6 +408,26 @@ async def run_dag(
                         step=step.id,
                         error=str(exc),
                     )
+            elif metacognition_controller is not None:
+                try:
+                    rendered_inputs = render_with_args(
+                        step.with_args,
+                        inputs=dict(match.inputs),
+                        outputs=outputs,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning(
+                        "scheduler.metacognition_render_inputs_failed",
+                        step=step.id,
+                        error=str(exc),
+                    )
+                    rendered_inputs = {}
+                metacognition_controller.before_step(
+                    step,
+                    effective_skill,
+                    rendered_inputs,
+                    outputs,
+                )
 
             final_text = ""
             with usage_scope(f"{scope_prefix}:{step.id}"):
@@ -396,6 +440,12 @@ async def run_dag(
                         await event_queue.put((step.id, ev))
 
             outputs[step.id] = final_text
+            if metacognition_controller is not None:
+                metacognition_controller.after_step(
+                    step,
+                    effective_skill,
+                    final_text,
+                )
             log.info(
                 "meta_orchestrator.step_finished",
                 step=step.id,
@@ -436,6 +486,8 @@ async def run_dag(
             )
             await event_queue.put((step.id, _StepDone(text=final_text)))
         except MetaPaused as paused:
+            if metacognition_controller is not None:
+                metacognition_controller.record_pause(paused)
             # Pause is not failure. Stash on the queue so the main loop
             # can shut down siblings cleanly and emit a single terminal
             # MetaResult(paused=True). on_failure substitute is intentionally
@@ -450,6 +502,12 @@ async def run_dag(
             raise
         except Exception as exc:  # noqa: BLE001
             has_substitute = bool(step.on_failure)
+            if metacognition_controller is not None:
+                metacognition_controller.record_failure(
+                    step,
+                    str(exc),
+                    has_substitute=has_substitute,
+                )
             log.warning(
                 "meta_orchestrator.step_failed",
                 step=step.id,
@@ -588,6 +646,12 @@ async def run_dag(
                             error=str(exc),
                         )
                 failover_aliases[item.substitute_step_id] = item.failed_step_id
+                if metacognition_controller is not None:
+                    metacognition_controller.record_failover(
+                        failed_step_id=item.failed_step_id,
+                        substitute_step_id=item.substitute_step_id,
+                        error=item.error,
+                    )
                 if item.substitute_step_id in pending_deps:
                     pending_deps[item.substitute_step_id] = set()
                 if item.substitute_step_id in substitute_only:
@@ -639,11 +703,20 @@ async def run_dag(
                         task.cancel()
                 if running:
                     await asyncio.gather(*running.values(), return_exceptions=True)
+                report = None
+                if metacognition_controller is not None:
+                    report = metacognition_controller.complete(
+                        ok=False,
+                        final_text="",
+                        step_outputs=dict(outputs),
+                        paused=True,
+                    )
                 yield MetaResult(
                     ok=False,
                     paused=True,
                     paused_payload=item,
                     step_outputs=dict(outputs),
+                    metacognition=report,
                 )
                 return
             if isinstance(item, Exception):
@@ -728,18 +801,37 @@ async def run_dag(
             )
 
     if failure is not None:
+        report = None
+        if metacognition_controller is not None:
+            report = metacognition_controller.complete(
+                ok=False,
+                final_text="",
+                step_outputs=outputs,
+                error=str(failure),
+                failed_step_id=failed_step_id,
+            )
         yield MetaResult(
             ok=False,
             step_outputs=outputs,
             error=str(failure),
             failed_step_id=failed_step_id,
+            metacognition=report,
         )
         return
 
+    final_text = outputs.get(last_step_id, "")
+    report = None
+    if metacognition_controller is not None:
+        report = metacognition_controller.complete(
+            ok=True,
+            final_text=final_text,
+            step_outputs=outputs,
+        )
     yield MetaResult(
         ok=True,
-        final_text=outputs.get(last_step_id, ""),
+        final_text=final_text,
         step_outputs=outputs,
+        metacognition=report,
     )
 
 

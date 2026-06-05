@@ -118,6 +118,24 @@ Preview replay shape without executing live work:
 opensquilla skills meta runs replay <run-id> --dry-run
 ```
 
+## Metacognitive Monitoring
+
+MetaSkill runs now attach an observational metacognition report to the terminal
+`MetaResult`. The report is a lightweight reliability snapshot, not an
+auto-rewrite policy:
+
+- run state: total, started, finished, skipped, failed, paused, and failover
+  counts;
+- completion evidence: whether the run completed, paused, produced final text,
+  and captured step outputs;
+- reliability signals: empty outputs, hard failures, failovers, missing inputs,
+  and pause events.
+
+This first layer deliberately avoids changing the workflow plan while it runs.
+It gives replay, diagnostics, and future control policies a stable state model
+before OpenSquilla attempts stronger interventions such as pausing a run,
+switching a MetaSkill, or requiring additional verification.
+
 ## Proposals
 
 Meta-skill creation workflows may write proposals before they become managed
