@@ -89,6 +89,8 @@ async def test_linear_success_writes_run_and_steps(writer_db) -> None:
     assert run.session_key == "sess-test"
     assert {s.step_id for s in run.steps} == {"s1", "s2"}
     assert all(s.status == "ok" for s in run.steps)
+    assert run.metacognition_json is not None
+    assert '"status": "passed"' in run.metacognition_json
 
 
 @pytest.mark.asyncio

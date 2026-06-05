@@ -17,7 +17,10 @@ from typing import Any
 
 from opensquilla.engine.types import AgentEvent
 from opensquilla.skills.meta.events import _StepDone
-from opensquilla.skills.meta.metacognition import MetacognitiveController
+from opensquilla.skills.meta.metacognition import (
+    MetacognitiveController,
+    format_report_notice,
+)
 from opensquilla.skills.meta.scheduler import run_dag
 from opensquilla.skills.meta.types import MetaMatch, MetaPlan, MetaResult, MetaStep
 
@@ -80,6 +83,7 @@ async def _run_scenario(scenario: str) -> dict[str, Any]:
         "final_text": final.final_text,
         "error": final.error,
         "metacognition": final.metacognition,
+        "tool_result_notice": format_report_notice(final.metacognition),
     }
 
 

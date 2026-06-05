@@ -5025,6 +5025,7 @@ class Agent:
         from opensquilla.skills.creator.runtime_e2e import make_runtime_e2e_context
         from opensquilla.skills.meta.enabled import is_meta_skill_enabled
         from opensquilla.skills.meta.inputs import make_meta_inputs
+        from opensquilla.skills.meta.metacognition import format_report_notice
         from opensquilla.skills.meta.orchestrator import (
             MetaOrchestrator,
             make_agent_runner_from_parent,
@@ -5338,12 +5339,16 @@ class Agent:
                     paused_text = render_paused_outcome(result)
                     if paused_text:
                         yield TextDeltaEvent(text=paused_text)
+                pause_content = (
+                    f"meta-skill {name!r} paused awaiting user input."
+                )
+                report_notice = format_report_notice(result.metacognition)
+                if report_notice:
+                    pause_content = f"{pause_content}\n{report_notice}"
                 yield ToolResult(
                     tool_use_id=tc.tool_use_id,
                     tool_name="meta_invoke",
-                    content=(
-                        f"meta-skill {name!r} paused awaiting user input."
-                    ),
+                    content=pause_content,
                     is_error=False,
                     terminates_turn=True,
                 )
@@ -5353,14 +5358,18 @@ class Agent:
                 return
             if result.final_text:
                 yield TextDeltaEvent(text=result.final_text)
+            success_content = (
+                f"meta-skill {name!r} completed."
+                if result.final_text
+                else "(meta-skill completed with no output text)"
+            )
+            report_notice = format_report_notice(result.metacognition)
+            if report_notice:
+                success_content = f"{success_content}\n{report_notice}"
             yield ToolResult(
                 tool_use_id=tc.tool_use_id,
                 tool_name="meta_invoke",
-                content=(
-                    f"meta-skill {name!r} completed."
-                    if result.final_text
-                    else "(meta-skill completed with no output text)"
-                ),
+                content=success_content,
                 is_error=False,
                 terminates_turn=True,
             )
@@ -5635,6 +5644,8 @@ class Agent:
         result: Any,
         plan: Any,
     ) -> ToolResult:
+        from opensquilla.skills.meta.metacognition import format_report_notice
+
         per_step_cap = 1200
         lines: list[str] = [
             f"Meta-skill `{getattr(plan, 'name', '?')}` failed at step "
@@ -5649,6 +5660,9 @@ class Agent:
                 continue
             snippet = text if len(text) <= per_step_cap else text[:per_step_cap] + "..."
             lines.extend([f"- {sid}:", snippet, ""])
+        report_notice = format_report_notice(getattr(result, "metacognition", None))
+        if report_notice:
+            lines.extend(["", report_notice])
         lines.append(f"Original meta-skill requested: {tc.arguments.get('name', '')}")
         return ToolResult(
             tool_use_id=tc.tool_use_id,

@@ -49,7 +49,39 @@ def seeded_db(tmp_path: Path, monkeypatch):
     )
     w.finish_run_sync(
         run_id=rid_ok, status="ok",
-        result=MetaResult(ok=True, final_text="alpha-out"),
+        result=MetaResult(
+            ok=True,
+            final_text="alpha-out",
+            metacognition={
+                "status": "warning",
+                "summary": "The run completed with metacognitive warnings to inspect.",
+                "plan": "alpha-skill",
+                "state": {
+                    "steps_total": 1,
+                    "steps_started": 1,
+                    "steps_finished": 1,
+                    "steps_skipped": 0,
+                    "steps_failed": 0,
+                    "paused_step_id": None,
+                },
+                "completion_check": {
+                    "ok": True,
+                    "paused": False,
+                    "final_text_present": True,
+                    "step_outputs_present": True,
+                    "failed_step_id": None,
+                },
+                "signals": [
+                    {
+                        "kind": "empty_step_output",
+                        "severity": "warning",
+                        "message": "Step completed successfully but produced no output.",
+                        "step_id": "s1",
+                        "details": {},
+                    },
+                ],
+            },
+        ),
     )
 
     rid_fail = w.begin_run_sync(
@@ -93,6 +125,19 @@ def test_runs_show(runner: CliRunner, seeded_db) -> None:
     data = json.loads(result.output)
     assert data["meta_skill_name"] == "alpha-skill"
     assert data["status"] == "ok"
+    assert data["metacognition"]["status"] == "warning"
+    assert "metacognition_json" not in data
+
+
+def test_runs_show_text_includes_metacognition_summary(
+    runner: CliRunner, seeded_db
+) -> None:
+    result = runner.invoke(
+        cli_app, ["skills", "meta", "runs", "show", seeded_db["rid_ok"]],
+    )
+    assert result.exit_code == 0
+    assert "metacognition: warning (warning=1)" in result.output
+    assert "meta_summary:" in result.output
 
 
 def test_runs_steps(runner: CliRunner, seeded_db) -> None:

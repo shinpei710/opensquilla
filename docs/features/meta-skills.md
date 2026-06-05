@@ -136,6 +136,16 @@ It gives replay, diagnostics, and future control policies a stable state model
 before OpenSquilla attempts stronger interventions such as pausing a run,
 switching a MetaSkill, or requiring additional verification.
 
+The report is also surfaced through the normal execution tools:
+
+- clean `passed` reports stay quiet so successful `meta_invoke` output is not
+  polluted;
+- `warning` and `blocked` reports add a compact `Metacognition:` notice to the
+  terminal `meta_invoke` tool result;
+- completed reports are stored on `meta_skill_runs.metacognition_json` and are
+  visible with `opensquilla skills meta runs show <run-id>` or its `--json`
+  output.
+
 ## Proposals
 
 Meta-skill creation workflows may write proposals before they become managed

@@ -11,6 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - MetaSkill runs now attach an observational metacognition report with run
   state, completion evidence, and reliability signals for future controller
   policies.
+- MetaSkill metacognition reports are now persisted and surfaced through
+  warning/blocked `meta_invoke` tool results and `skills meta runs show`.
 
 ### Changed
 

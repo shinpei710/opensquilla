@@ -15,6 +15,7 @@ from opensquilla.skills.meta.types import MetaMatch, MetaPaused, MetaStep
 
 Severity = Literal["info", "warning", "blocked"]
 ReportStatus = Literal["passed", "warning", "blocked"]
+_SEVERITIES: tuple[Severity, ...] = ("info", "warning", "blocked")
 
 
 @dataclass(frozen=True)
@@ -298,10 +299,116 @@ def refresh_report_final_text(
     return report
 
 
+def summarize_report(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return a compact, surface-friendly summary of a metacognition report."""
+
+    if not report:
+        return None
+    signals = [
+        signal for signal in report.get("signals", [])
+        if isinstance(signal, dict)
+    ]
+    signal_counts = {severity: 0 for severity in _SEVERITIES}
+    for signal in signals:
+        severity = signal.get("severity")
+        if severity in signal_counts:
+            signal_counts[severity] += 1
+
+    state = report.get("state", {})
+    if not isinstance(state, dict):
+        state = {}
+    completion = report.get("completion_check", {})
+    if not isinstance(completion, dict):
+        completion = {}
+
+    return {
+        "status": str(report.get("status") or "passed"),
+        "summary": str(report.get("summary") or ""),
+        "plan": str(report.get("plan") or ""),
+        "signal_counts": signal_counts,
+        "state": {
+            "steps_total": state.get("steps_total", 0),
+            "steps_started": state.get("steps_started", 0),
+            "steps_finished": state.get("steps_finished", 0),
+            "steps_skipped": state.get("steps_skipped", 0),
+            "steps_failed": state.get("steps_failed", 0),
+            "paused_step_id": state.get("paused_step_id"),
+        },
+        "completion_check": {
+            "ok": completion.get("ok"),
+            "paused": completion.get("paused"),
+            "final_text_present": completion.get("final_text_present"),
+            "step_outputs_present": completion.get("step_outputs_present"),
+            "failed_step_id": completion.get("failed_step_id"),
+        },
+    }
+
+
+def format_report_notice(report: dict[str, Any] | None) -> str:
+    """Format a one-line warning for non-passing metacognition reports.
+
+    Clean runs intentionally produce no notice so normal meta_invoke output
+    remains stable. Warning and blocked runs expose enough signal for tool
+    consumers, logs, and CLI surfaces to know there is something to inspect.
+    """
+
+    summary = summarize_report(report)
+    if summary is None or summary["status"] == "passed":
+        return ""
+
+    counts = summary["signal_counts"]
+    count_bits = [
+        f"{severity}={counts[severity]}"
+        for severity in ("blocked", "warning", "info")
+        if counts[severity]
+    ]
+    counts_text = ", ".join(count_bits) if count_bits else "none"
+    first_signal = _first_actionable_signal(report)
+    signal_text = f" First signal: {_format_signal_brief(first_signal)}" if first_signal else ""
+    return (
+        f"Metacognition: {summary['status']} ({counts_text}). "
+        f"{summary['summary']}{signal_text}"
+    )
+
+
+def _first_actionable_signal(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not report:
+        return None
+    signals = [
+        signal for signal in report.get("signals", [])
+        if isinstance(signal, dict)
+    ]
+    for severity in ("blocked", "warning", "info"):
+        for signal in signals:
+            if signal.get("severity") == severity:
+                return signal
+    return None
+
+
+def _format_signal_brief(signal: dict[str, Any]) -> str:
+    kind = str(signal.get("kind") or "unknown_signal")
+    step_id = signal.get("step_id")
+    message = str(signal.get("message") or "").strip()
+    bits = [kind]
+    if step_id:
+        bits.append(f"step={step_id}")
+    if message:
+        bits.append(_clip(message, 180))
+    return " | ".join(bits)
+
+
+def _clip(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
 __all__ = [
     "MetacognitiveController",
     "MetacognitiveSignal",
     "ReportStatus",
     "Severity",
+    "format_report_notice",
     "refresh_report_final_text",
+    "summarize_report",
 ]

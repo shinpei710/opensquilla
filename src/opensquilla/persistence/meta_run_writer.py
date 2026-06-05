@@ -93,6 +93,7 @@ class RunRecord:
     final_text: str | None
     failed_step_id: str | None
     error: str | None
+    metacognition_json: str | None
     truncated_fields: tuple[str, ...]
     steps: tuple[StepRecord, ...] = ()
 
@@ -246,6 +247,15 @@ def _serialize_plan(plan: MetaPlan) -> tuple[str, str]:
     snapshot_json = json.dumps(snapshot, sort_keys=True, ensure_ascii=False)
     digest = plan_digest(plan)
     return snapshot_json, digest
+
+
+def _row_get(row: sqlite3.Row, key: str, default: Any = None) -> Any:
+    """Read a sqlite row key while tolerating older optional columns."""
+
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +420,7 @@ class MetaRunWriter:
     ) -> None:
         truncated: list[str] = []
         final_text: str | None = None
+        metacognition_json: str | None = None
         failed_step_id: str | None = None
         error: str | None = None
         if result is not None:
@@ -419,8 +430,66 @@ class MetaRunWriter:
             )
             if was_t:
                 truncated.append("final_text")
+            if result.metacognition is not None:
+                report_raw = json.dumps(
+                    result.metacognition,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+                metacognition_json, was_t = _truncate(
+                    report_raw,
+                    "metacognition_json",
+                    max_bytes=self._max_field_bytes,
+                )
+                if was_t:
+                    truncated.append("metacognition_json")
             failed_step_id = result.failed_step_id
             error = result.error
+        try:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    UPDATE meta_skill_runs
+                       SET status=?, ended_at_ms=?, final_text=?,
+                           failed_step_id=?, error=?, metacognition_json=?,
+                           truncated_fields=?
+                     WHERE run_id=?
+                    """,
+                    (
+                        status, self._clock(), final_text,
+                        failed_step_id, error, metacognition_json,
+                        ",".join(truncated),
+                        run_id,
+                    ),
+                )
+                self._conn.commit()
+        except sqlite3.OperationalError as exc:
+            if "metacognition_json" in str(exc):
+                self._finish_run_sync_legacy_schema(
+                    run_id=run_id,
+                    status=status,
+                    final_text=final_text,
+                    failed_step_id=failed_step_id,
+                    error=error,
+                    truncated_fields=truncated,
+                )
+                return
+            log.warning("meta_run_writer.finish_run_failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("meta_run_writer.finish_run_failed: %s", exc)
+
+    def _finish_run_sync_legacy_schema(
+        self,
+        *,
+        run_id: str,
+        status: Literal["ok", "failed", "cancelled"],
+        final_text: str | None,
+        failed_step_id: str | None,
+        error: str | None,
+        truncated_fields: list[str],
+    ) -> None:
+        """Finalize older DBs that have not applied V015 yet."""
+
         try:
             with self._lock:
                 self._conn.execute(
@@ -432,7 +501,7 @@ class MetaRunWriter:
                     """,
                     (
                         status, self._clock(), final_text,
-                        failed_step_id, error, ",".join(truncated),
+                        failed_step_id, error, ",".join(truncated_fields),
                         run_id,
                     ),
                 )
@@ -822,6 +891,7 @@ class MetaRunWriter:
             final_text=row["final_text"],
             failed_step_id=row["failed_step_id"],
             error=row["error"],
+            metacognition_json=_row_get(row, "metacognition_json"),
             truncated_fields=tuple(
                 f for f in (row["truncated_fields"] or "").split(",") if f
             ),

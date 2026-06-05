@@ -23,6 +23,7 @@ from opensquilla.persistence.meta_run_writer import (
     StepRecord,
     open_meta_run_writer,
 )
+from opensquilla.skills.meta.metacognition import summarize_report
 from opensquilla.skills.meta.parser import parse_meta_plan
 from opensquilla.skills.meta.types import MetaPlan
 
@@ -95,6 +96,8 @@ def _parse_since(value: str | None) -> int | None:
 def _serialize_record(rec: RunRecord) -> dict[str, Any]:
     d = asdict(rec)
     d["steps"] = [asdict(s) for s in rec.steps]
+    report_raw = d.pop("metacognition_json", None)
+    d["metacognition"] = _parse_metacognition_json(report_raw)
     return d
 
 
@@ -113,6 +116,28 @@ def _print_runs_table(rows: list[RunRecord]) -> None:
             f"{r.run_id:28} {r.meta_skill_name:30.30} {r.status:10} "
             f"{r.triggered_by:17} {started}"
         )
+
+
+def _parse_metacognition_json(raw: str | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"status": "unknown", "summary": "Stored report is not valid JSON."}
+    return payload if isinstance(payload, dict) else None
+
+
+def _metacognition_counts_text(summary: dict[str, Any]) -> str:
+    counts = summary.get("signal_counts", {})
+    if not isinstance(counts, dict):
+        return ""
+    parts = [
+        f"{name}={counts.get(name, 0)}"
+        for name in ("blocked", "warning", "info")
+        if counts.get(name, 0)
+    ]
+    return ", ".join(parts) if parts else "none"
 
 
 @runs_app.command("list")
@@ -181,6 +206,16 @@ def runs_show(
         typer.echo(f"final_text:    {rec.final_text[:200]}...")
     if rec.error:
         typer.echo(f"error:         {rec.error}")
+    report = _parse_metacognition_json(rec.metacognition_json)
+    report_summary = summarize_report(report)
+    if report_summary is not None:
+        typer.echo(
+            "metacognition: "
+            f"{report_summary['status']} "
+            f"({_metacognition_counts_text(report_summary)})"
+        )
+        if report_summary["summary"]:
+            typer.echo(f"meta_summary:  {report_summary['summary']}")
     typer.echo(f"steps:         {len(rec.steps)}")
 
 
