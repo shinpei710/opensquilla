@@ -15,6 +15,7 @@ from opensquilla.skills.meta.types import MetaMatch, MetaPaused, MetaStep
 
 Severity = Literal["info", "warning", "blocked"]
 ReportStatus = Literal["passed", "warning", "blocked"]
+DecisionAction = Literal["pass", "warn", "block", "needs_review"]
 _SEVERITIES: tuple[Severity, ...] = ("info", "warning", "blocked")
 
 
@@ -27,6 +28,19 @@ class MetacognitiveSignal:
     message: str
     step_id: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MetacognitiveDecision:
+    """Completion-gate decision derived from a metacognition report."""
+
+    action: DecisionAction
+    reason: str
+    surface_notice: str
+    suggested_next_step: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -344,6 +358,86 @@ def summarize_report(report: dict[str, Any] | None) -> dict[str, Any] | None:
     }
 
 
+def decide_completion(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Decide whether a MetaSkill result can be treated as complete.
+
+    This is a conservative completion gate, not an auto-repair policy. It
+    converts observational evidence into a small decision contract that
+    surfaces can act on without re-reading every signal.
+    """
+
+    summary = summarize_report(report)
+    if summary is None:
+        return None
+
+    action: DecisionAction
+    reason: str
+    suggested_next_step: str
+    completion = summary["completion_check"]
+    status = summary["status"]
+
+    if completion.get("paused") is True:
+        action = "needs_review"
+        reason = "MetaSkill paused before completion and is waiting for user input."
+        suggested_next_step = "Collect the requested user input, then resume the run."
+    elif status == "blocked" or completion.get("ok") is False:
+        action = "block"
+        reason = "Blocked metacognitive reliability signals were detected."
+        suggested_next_step = (
+            "Do not treat the output as final; inspect the run and retry or "
+            "fall back."
+        )
+    elif completion.get("final_text_present") is False:
+        action = "block"
+        reason = "MetaSkill reported success but produced no user-facing final text."
+        suggested_next_step = (
+            "Regenerate the final response or inspect the step outputs before "
+            "delivery."
+        )
+    elif completion.get("step_outputs_present") is False:
+        action = "block"
+        reason = "MetaSkill reported success but no step outputs were captured."
+        suggested_next_step = "Inspect the run trace before trusting this result."
+    elif status == "warning":
+        action = "warn"
+        reason = "Metacognitive warnings were detected, but the run produced a deliverable."
+        suggested_next_step = (
+            "Deliver with the warning visible, or review the run trace if "
+            "stakes are high."
+        )
+    else:
+        action = "pass"
+        reason = "No metacognitive completion issues were detected."
+        suggested_next_step = "Deliver the MetaSkill result normally."
+
+    return MetacognitiveDecision(
+        action=action,
+        reason=reason,
+        surface_notice=_decision_notice(
+            action=action,
+            reason=reason,
+            suggested_next_step=suggested_next_step,
+            summary=summary,
+        ),
+        suggested_next_step=suggested_next_step,
+    ).to_dict()
+
+
+def format_decision_notice(decision: dict[str, Any] | None) -> str:
+    """Return the user/tool-facing notice for non-pass decisions."""
+
+    if not decision or decision.get("action") == "pass":
+        return ""
+    notice = str(decision.get("surface_notice") or "").strip()
+    if notice:
+        return notice
+    action = str(decision.get("action") or "unknown")
+    reason = str(decision.get("reason") or "Metacognitive decision requires attention.")
+    next_step = str(decision.get("suggested_next_step") or "")
+    suffix = f" Suggested next step: {next_step}" if next_step else ""
+    return f"Metacognitive decision: {action}. {reason}{suffix}"
+
+
 def format_report_notice(report: dict[str, Any] | None) -> str:
     """Format a one-line warning for non-passing metacognition reports.
 
@@ -368,6 +462,29 @@ def format_report_notice(report: dict[str, Any] | None) -> str:
     return (
         f"Metacognition: {summary['status']} ({counts_text}). "
         f"{summary['summary']}{signal_text}"
+    )
+
+
+def _decision_notice(
+    *,
+    action: DecisionAction,
+    reason: str,
+    suggested_next_step: str,
+    summary: dict[str, Any],
+) -> str:
+    if action == "pass":
+        return ""
+    counts = summary["signal_counts"]
+    count_bits = [
+        f"{severity}={counts[severity]}"
+        for severity in ("blocked", "warning", "info")
+        if counts[severity]
+    ]
+    counts_text = ", ".join(count_bits) if count_bits else "none"
+    return (
+        f"Metacognitive decision: {action} "
+        f"(report={summary['status']}, signals={counts_text}). "
+        f"{reason} Suggested next step: {suggested_next_step}"
     )
 
 
@@ -404,10 +521,14 @@ def _clip(text: str, max_chars: int) -> str:
 
 
 __all__ = [
+    "DecisionAction",
     "MetacognitiveController",
+    "MetacognitiveDecision",
     "MetacognitiveSignal",
     "ReportStatus",
     "Severity",
+    "decide_completion",
+    "format_decision_notice",
     "format_report_notice",
     "refresh_report_final_text",
     "summarize_report",

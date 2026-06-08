@@ -140,11 +140,26 @@ The report is also surfaced through the normal execution tools:
 
 - clean `passed` reports stay quiet so successful `meta_invoke` output is not
   polluted;
-- `warning` and `blocked` reports add a compact `Metacognition:` notice to the
+- non-passing decisions add a compact `Metacognitive decision:` notice to the
   terminal `meta_invoke` tool result;
 - completed reports are stored on `meta_skill_runs.metacognition_json` and are
   visible with `opensquilla skills meta runs show <run-id>` or its `--json`
   output.
+
+### Metacognitive Completion Gate
+
+The report now feeds a conservative completion-gate decision:
+
+- `pass`: no completion issues were detected;
+- `warn`: a deliverable exists, but warning signals should remain visible;
+- `block`: the run should not be treated as a normal completed answer;
+- `needs_review`: the run paused or requires user/operator attention before
+  completion.
+
+This policy still does not rewrite the DAG or auto-select a different
+MetaSkill. It creates a stable decision boundary first: `meta_invoke` can avoid
+presenting blocked results as ordinary success, while `skills meta runs show`
+and `--json` expose the stored `metacognition_decision`.
 
 ## Proposals
 

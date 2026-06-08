@@ -783,8 +783,121 @@ async def test_meta_invoke_surfaces_warning_metacognition_in_tool_result(
     assert final is not None
     assert final.is_error is False
     assert final.content.startswith("meta-skill 'meta-tiny' completed.")
-    assert "Metacognition: warning" in final.content
-    assert "empty_step_output" in final.content
+    assert "Metacognitive decision: warn" in final.content
+    assert "Deliver with the warning" in final.content
+
+
+@pytest.mark.asyncio
+async def test_meta_invoke_blocks_metacognitive_completion_gate(
+    tmp_path,
+) -> None:
+    from opensquilla.engine.agent import Agent
+    from opensquilla.engine.types import AgentConfig, TextDeltaEvent
+    from opensquilla.skills.loader import SkillLoader
+    from opensquilla.tool_boundary import ToolCall, ToolResult
+    from opensquilla.tools.builtin import meta_tools  # noqa: F401
+    from opensquilla.tools.registry import get_default_registry
+    from opensquilla.tools.types import ToolContext
+
+    bundled = tmp_path / "skills" / "bundled"
+    bundled.mkdir(parents=True)
+    skill_dir = bundled / "meta-tiny"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: meta-tiny\n"
+        "kind: meta\n"
+        "description: t\n"
+        "triggers: [t]\n"
+        "composition:\n"
+        "  steps:\n"
+        "    - id: c\n"
+        "      kind: llm_classify\n"
+        "      output_choices: [A, B]\n"
+        "      with: {text: x}\n"
+        "---\n# meta-tiny\n",
+        encoding="utf-8",
+    )
+    loader = SkillLoader(bundled_dir=bundled, snapshot_path=tmp_path / "snap.json")
+    loader.invalidate_cache()
+    loader.load_all()
+
+    class _NullProvider:
+        provider_name = "null"
+
+        async def chat(self, *_a, **_kw):
+            raise AssertionError("provider.chat must not fire")
+
+        async def list_models(self):
+            return []
+
+    agent = Agent(
+        provider=_NullProvider(),  # type: ignore[arg-type]
+        config=AgentConfig(
+            model_id="stub",
+            max_iterations=1,
+            metadata={"skill_loader": loader, "bootstrap_workspace_dir": str(tmp_path)},
+        ),
+        tool_definitions=[],
+        tool_handler=None,
+        tool_registry=get_default_registry(),
+    )
+
+    import opensquilla.skills.meta.orchestrator as orch_mod
+    from opensquilla.skills.meta.types import MetaResult
+
+    original_iter_events = orch_mod.MetaOrchestrator.iter_events
+
+    async def fake_iter_events(self, match):  # noqa: ARG001
+        yield MetaResult(
+            ok=True,
+            final_text="",
+            metacognition={
+                "status": "warning",
+                "summary": "The run completed with metacognitive warnings to inspect.",
+                "completion_check": {
+                    "ok": True,
+                    "paused": False,
+                    "final_text_present": False,
+                    "step_outputs_present": True,
+                },
+                "signals": [
+                    {
+                        "kind": "empty_final_text",
+                        "severity": "warning",
+                        "message": "Run completed successfully but produced empty final_text.",
+                        "step_id": None,
+                        "details": {},
+                    },
+                ],
+            },
+        )
+
+    orch_mod.MetaOrchestrator.iter_events = fake_iter_events  # type: ignore[assignment]
+    try:
+        final: ToolResult | None = None
+        text_chunks: list[str] = []
+        async for ev in agent._run_one_streaming(
+            ToolCall(
+                tool_use_id="u1",
+                tool_name="meta_invoke",
+                arguments={"name": "meta-tiny"},
+            ),
+            ToolContext(workspace_dir=str(tmp_path), is_owner=True),
+        ):
+            if isinstance(ev, ToolResult):
+                final = ev
+            elif isinstance(ev, TextDeltaEvent):
+                text_chunks.append(ev.text)
+    finally:
+        orch_mod.MetaOrchestrator.iter_events = original_iter_events  # type: ignore[assignment]
+
+    assert final is not None
+    assert final.is_error is True
+    assert final.terminates_turn is False
+    assert "blocked by metacognitive completion gate" in final.content
+    assert "Metacognitive decision: block" in final.content
+    assert text_chunks == []
 
 
 # ---------------------------------------------------------------------------

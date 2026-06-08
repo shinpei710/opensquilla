@@ -220,3 +220,7 @@ class MetaResult:
     # scheduler. Kept as a plain dict so persistence and surfaces can consume
     # it without importing the controller module.
     metacognition: dict[str, Any] | None = None
+    # Optional completion-gate decision derived from ``metacognition`` after
+    # final-text post-processing. Plain dict for the same persistence/surface
+    # boundary as the report.
+    metacognition_decision: dict[str, Any] | None = None

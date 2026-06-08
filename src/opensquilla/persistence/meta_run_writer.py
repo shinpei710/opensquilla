@@ -27,6 +27,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from opensquilla.skills.meta.metacognition import decide_completion
 from opensquilla.skills.meta.types import MetaPlan, MetaResult, MetaStep
 
 log = logging.getLogger(__name__)
@@ -94,6 +95,7 @@ class RunRecord:
     failed_step_id: str | None
     error: str | None
     metacognition_json: str | None
+    metacognition_decision_json: str | None
     truncated_fields: tuple[str, ...]
     steps: tuple[StepRecord, ...] = ()
 
@@ -421,6 +423,7 @@ class MetaRunWriter:
         truncated: list[str] = []
         final_text: str | None = None
         metacognition_json: str | None = None
+        metacognition_decision_json: str | None = None
         failed_step_id: str | None = None
         error: str | None = None
         if result is not None:
@@ -443,8 +446,88 @@ class MetaRunWriter:
                 )
                 if was_t:
                     truncated.append("metacognition_json")
+            decision = result.metacognition_decision
+            if decision is None and result.metacognition is not None:
+                decision = decide_completion(result.metacognition)
+            if decision is not None:
+                result.metacognition_decision = decision
+                decision_raw = json.dumps(
+                    decision,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+                metacognition_decision_json, was_t = _truncate(
+                    decision_raw,
+                    "metacognition_decision_json",
+                    max_bytes=self._max_field_bytes,
+                )
+                if was_t:
+                    truncated.append("metacognition_decision_json")
             failed_step_id = result.failed_step_id
             error = result.error
+        try:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    UPDATE meta_skill_runs
+                       SET status=?, ended_at_ms=?, final_text=?,
+                           failed_step_id=?, error=?, metacognition_json=?,
+                           metacognition_decision_json=?,
+                           truncated_fields=?
+                     WHERE run_id=?
+                    """,
+                    (
+                        status, self._clock(), final_text,
+                        failed_step_id, error, metacognition_json,
+                        metacognition_decision_json,
+                        ",".join(truncated),
+                        run_id,
+                    ),
+                )
+                self._conn.commit()
+        except sqlite3.OperationalError as exc:
+            if "metacognition_decision_json" in str(exc):
+                self._finish_run_sync_without_decision_schema(
+                    run_id=run_id,
+                    status=status,
+                    final_text=final_text,
+                    metacognition_json=metacognition_json,
+                    failed_step_id=failed_step_id,
+                    error=error,
+                    truncated_fields=truncated,
+                )
+                return
+            if "metacognition_json" in str(exc):
+                self._finish_run_sync_legacy_schema(
+                    run_id=run_id,
+                    status=status,
+                    final_text=final_text,
+                    failed_step_id=failed_step_id,
+                    error=error,
+                    truncated_fields=truncated,
+                )
+                return
+            log.warning("meta_run_writer.finish_run_failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("meta_run_writer.finish_run_failed: %s", exc)
+
+    def _finish_run_sync_without_decision_schema(
+        self,
+        *,
+        run_id: str,
+        status: Literal["ok", "failed", "cancelled"],
+        final_text: str | None,
+        metacognition_json: str | None,
+        failed_step_id: str | None,
+        error: str | None,
+        truncated_fields: list[str],
+    ) -> None:
+        """Finalize DBs that have V015 but not V016 yet."""
+
+        truncated = [
+            field for field in truncated_fields
+            if field != "metacognition_decision_json"
+        ]
         try:
             with self._lock:
                 self._conn.execute(
@@ -490,6 +573,10 @@ class MetaRunWriter:
     ) -> None:
         """Finalize older DBs that have not applied V015 yet."""
 
+        truncated = [
+            field for field in truncated_fields
+            if field not in {"metacognition_json", "metacognition_decision_json"}
+        ]
         try:
             with self._lock:
                 self._conn.execute(
@@ -501,7 +588,7 @@ class MetaRunWriter:
                     """,
                     (
                         status, self._clock(), final_text,
-                        failed_step_id, error, ",".join(truncated_fields),
+                        failed_step_id, error, ",".join(truncated),
                         run_id,
                     ),
                 )
@@ -892,6 +979,10 @@ class MetaRunWriter:
             failed_step_id=row["failed_step_id"],
             error=row["error"],
             metacognition_json=_row_get(row, "metacognition_json"),
+            metacognition_decision_json=_row_get(
+                row,
+                "metacognition_decision_json",
+            ),
             truncated_fields=tuple(
                 f for f in (row["truncated_fields"] or "").split(",") if f
             ),

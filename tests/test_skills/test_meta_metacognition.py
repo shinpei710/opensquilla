@@ -7,6 +7,7 @@ import pytest
 from opensquilla.skills.meta.events import _StepDone
 from opensquilla.skills.meta.metacognition import (
     MetacognitiveController,
+    decide_completion,
     refresh_report_final_text,
 )
 from opensquilla.skills.meta.scheduler import run_dag
@@ -54,6 +55,8 @@ async def test_metacognition_report_passes_clean_success() -> None:
     assert final.metacognition["state"]["steps_total"] == 1
     assert final.metacognition["state"]["steps_finished"] == 1
     assert final.metacognition["completion_check"]["final_text_present"] is True
+    assert final.metacognition_decision is not None
+    assert final.metacognition_decision["action"] == "pass"
 
 
 @pytest.mark.asyncio
@@ -68,6 +71,8 @@ async def test_metacognition_warns_on_empty_success_output() -> None:
     signal_kinds = {signal["kind"] for signal in final.metacognition["signals"]}
     assert "empty_step_output" in signal_kinds
     assert "empty_final_text" in signal_kinds
+    assert final.metacognition_decision is not None
+    assert final.metacognition_decision["action"] == "block"
 
 
 @pytest.mark.asyncio
@@ -83,6 +88,8 @@ async def test_metacognition_blocks_failed_run() -> None:
     signal_kinds = {signal["kind"] for signal in final.metacognition["signals"]}
     assert "step_failed" in signal_kinds
     assert "run_failed" in signal_kinds
+    assert final.metacognition_decision is not None
+    assert final.metacognition_decision["action"] == "block"
 
 
 def test_refresh_report_final_text_clears_empty_final_warning() -> None:
@@ -107,3 +114,61 @@ def test_refresh_report_final_text_clears_empty_final_warning() -> None:
     assert report["status"] == "passed"
     assert report["completion_check"]["final_text_present"] is True
     assert report["signals"] == []
+    decision = decide_completion(report)
+    assert decision is not None
+    assert decision["action"] == "pass"
+
+
+def test_decide_completion_warns_when_deliverable_has_warnings() -> None:
+    report = {
+        "status": "warning",
+        "summary": "warning",
+        "completion_check": {
+            "ok": True,
+            "paused": False,
+            "final_text_present": True,
+            "step_outputs_present": True,
+        },
+        "signals": [
+            {
+                "kind": "step_failover",
+                "severity": "warning",
+                "message": "failover",
+                "step_id": "draft",
+                "details": {},
+            },
+        ],
+    }
+
+    decision = decide_completion(report)
+
+    assert decision is not None
+    assert decision["action"] == "warn"
+    assert "Deliver with the warning" in decision["suggested_next_step"]
+
+
+def test_decide_completion_marks_pause_needs_review() -> None:
+    report = {
+        "status": "warning",
+        "summary": "paused",
+        "completion_check": {
+            "ok": False,
+            "paused": True,
+            "final_text_present": False,
+            "step_outputs_present": True,
+        },
+        "signals": [
+            {
+                "kind": "run_paused",
+                "severity": "warning",
+                "message": "paused",
+                "step_id": "collect",
+                "details": {},
+            },
+        ],
+    }
+
+    decision = decide_completion(report)
+
+    assert decision is not None
+    assert decision["action"] == "needs_review"

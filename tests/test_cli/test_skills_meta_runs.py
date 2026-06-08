@@ -126,7 +126,9 @@ def test_runs_show(runner: CliRunner, seeded_db) -> None:
     assert data["meta_skill_name"] == "alpha-skill"
     assert data["status"] == "ok"
     assert data["metacognition"]["status"] == "warning"
+    assert data["metacognition_decision"]["action"] == "warn"
     assert "metacognition_json" not in data
+    assert "metacognition_decision_json" not in data
 
 
 def test_runs_show_text_includes_metacognition_summary(
@@ -138,6 +140,9 @@ def test_runs_show_text_includes_metacognition_summary(
     assert result.exit_code == 0
     assert "metacognition: warning (warning=1)" in result.output
     assert "meta_summary:" in result.output
+    assert "meta_decision: warn" in result.output
+    assert "decision_reason:" in result.output
+    assert "decision_next:" in result.output
 
 
 def test_runs_steps(runner: CliRunner, seeded_db) -> None:

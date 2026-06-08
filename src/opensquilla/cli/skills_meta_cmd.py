@@ -23,7 +23,10 @@ from opensquilla.persistence.meta_run_writer import (
     StepRecord,
     open_meta_run_writer,
 )
-from opensquilla.skills.meta.metacognition import summarize_report
+from opensquilla.skills.meta.metacognition import (
+    decide_completion,
+    summarize_report,
+)
 from opensquilla.skills.meta.parser import parse_meta_plan
 from opensquilla.skills.meta.types import MetaPlan
 
@@ -97,7 +100,13 @@ def _serialize_record(rec: RunRecord) -> dict[str, Any]:
     d = asdict(rec)
     d["steps"] = [asdict(s) for s in rec.steps]
     report_raw = d.pop("metacognition_json", None)
-    d["metacognition"] = _parse_metacognition_json(report_raw)
+    decision_raw = d.pop("metacognition_decision_json", None)
+    report = _parse_metacognition_json(report_raw)
+    d["metacognition"] = report
+    d["metacognition_decision"] = _decision_from_json_or_report(
+        decision_raw,
+        report,
+    )
     return d
 
 
@@ -126,6 +135,16 @@ def _parse_metacognition_json(raw: str | None) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return {"status": "unknown", "summary": "Stored report is not valid JSON."}
     return payload if isinstance(payload, dict) else None
+
+
+def _decision_from_json_or_report(
+    raw: str | None,
+    report: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    decision = _parse_metacognition_json(raw)
+    if decision is not None:
+        return decision
+    return decide_completion(report)
 
 
 def _metacognition_counts_text(summary: dict[str, Any]) -> str:
@@ -207,6 +226,10 @@ def runs_show(
     if rec.error:
         typer.echo(f"error:         {rec.error}")
     report = _parse_metacognition_json(rec.metacognition_json)
+    decision = _decision_from_json_or_report(
+        rec.metacognition_decision_json,
+        report,
+    )
     report_summary = summarize_report(report)
     if report_summary is not None:
         typer.echo(
@@ -216,6 +239,14 @@ def runs_show(
         )
         if report_summary["summary"]:
             typer.echo(f"meta_summary:  {report_summary['summary']}")
+    if decision is not None:
+        typer.echo(f"meta_decision: {decision.get('action', 'unknown')}")
+        reason = str(decision.get("reason") or "").strip()
+        if reason:
+            typer.echo(f"decision_reason: {reason}")
+        next_step = str(decision.get("suggested_next_step") or "").strip()
+        if next_step:
+            typer.echo(f"decision_next: {next_step}")
     typer.echo(f"steps:         {len(rec.steps)}")
 
 

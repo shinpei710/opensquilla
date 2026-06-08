@@ -13,6 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   policies.
 - MetaSkill metacognition reports are now persisted and surfaced through
   warning/blocked `meta_invoke` tool results and `skills meta runs show`.
+- MetaSkill runs now derive a metacognitive completion-gate decision
+  (`pass`, `warn`, `block`, or `needs_review`) so blocked results are not
+  presented as ordinary successful completions.
 
 ### Changed
 

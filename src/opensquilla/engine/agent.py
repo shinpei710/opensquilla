@@ -5025,7 +5025,10 @@ class Agent:
         from opensquilla.skills.creator.runtime_e2e import make_runtime_e2e_context
         from opensquilla.skills.meta.enabled import is_meta_skill_enabled
         from opensquilla.skills.meta.inputs import make_meta_inputs
-        from opensquilla.skills.meta.metacognition import format_report_notice
+        from opensquilla.skills.meta.metacognition import (
+            decide_completion,
+            format_decision_notice,
+        )
         from opensquilla.skills.meta.orchestrator import (
             MetaOrchestrator,
             make_agent_runner_from_parent,
@@ -5342,9 +5345,14 @@ class Agent:
                 pause_content = (
                     f"meta-skill {name!r} paused awaiting user input."
                 )
-                report_notice = format_report_notice(result.metacognition)
-                if report_notice:
-                    pause_content = f"{pause_content}\n{report_notice}"
+                decision = result.metacognition_decision or decide_completion(
+                    result.metacognition,
+                )
+                if result.metacognition_decision is None:
+                    result.metacognition_decision = decision
+                decision_notice = format_decision_notice(decision)
+                if decision_notice:
+                    pause_content = f"{pause_content}\n{decision_notice}"
                 yield ToolResult(
                     tool_use_id=tc.tool_use_id,
                     tool_name="meta_invoke",
@@ -5356,6 +5364,27 @@ class Agent:
             if not result.ok:
                 yield self._format_meta_invoke_failure(tc, result, plan)
                 return
+            decision = result.metacognition_decision or decide_completion(
+                result.metacognition,
+            )
+            if result.metacognition_decision is None:
+                result.metacognition_decision = decision
+            decision_notice = format_decision_notice(decision)
+            if decision is not None and decision.get("action") == "block":
+                content = (
+                    f"meta-skill {name!r} blocked by metacognitive "
+                    "completion gate."
+                )
+                if decision_notice:
+                    content = f"{content}\n{decision_notice}"
+                yield ToolResult(
+                    tool_use_id=tc.tool_use_id,
+                    tool_name="meta_invoke",
+                    content=content,
+                    is_error=True,
+                    terminates_turn=False,
+                )
+                return
             if result.final_text:
                 yield TextDeltaEvent(text=result.final_text)
             success_content = (
@@ -5363,9 +5392,8 @@ class Agent:
                 if result.final_text
                 else "(meta-skill completed with no output text)"
             )
-            report_notice = format_report_notice(result.metacognition)
-            if report_notice:
-                success_content = f"{success_content}\n{report_notice}"
+            if decision_notice:
+                success_content = f"{success_content}\n{decision_notice}"
             yield ToolResult(
                 tool_use_id=tc.tool_use_id,
                 tool_name="meta_invoke",
@@ -5644,7 +5672,10 @@ class Agent:
         result: Any,
         plan: Any,
     ) -> ToolResult:
-        from opensquilla.skills.meta.metacognition import format_report_notice
+        from opensquilla.skills.meta.metacognition import (
+            decide_completion,
+            format_decision_notice,
+        )
 
         per_step_cap = 1200
         lines: list[str] = [
@@ -5660,9 +5691,12 @@ class Agent:
                 continue
             snippet = text if len(text) <= per_step_cap else text[:per_step_cap] + "..."
             lines.extend([f"- {sid}:", snippet, ""])
-        report_notice = format_report_notice(getattr(result, "metacognition", None))
-        if report_notice:
-            lines.extend(["", report_notice])
+        decision = getattr(result, "metacognition_decision", None) or decide_completion(
+            getattr(result, "metacognition", None),
+        )
+        decision_notice = format_decision_notice(decision)
+        if decision_notice:
+            lines.extend(["", decision_notice])
         lines.append(f"Original meta-skill requested: {tc.arguments.get('name', '')}")
         return ToolResult(
             tool_use_id=tc.tool_use_id,

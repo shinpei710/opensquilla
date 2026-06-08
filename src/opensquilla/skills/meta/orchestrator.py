@@ -49,6 +49,7 @@ from opensquilla.skills.meta.executors.tool_call import run_tool_call_step
 from opensquilla.skills.meta.inputs import language_instruction_for_user_message
 from opensquilla.skills.meta.metacognition import (
     MetacognitiveController,
+    decide_completion,
     refresh_report_final_text,
 )
 from opensquilla.skills.meta.scheduler import run_dag
@@ -360,6 +361,9 @@ class MetaOrchestrator:
                             item.metacognition,
                             item.final_text,
                         )
+                    item.metacognition_decision = decide_completion(
+                        item.metacognition,
+                    )
                     final_result = item
                 yield item
         except asyncio.CancelledError:
@@ -680,6 +684,7 @@ class MetaOrchestrator:
                 final = ev
         if final is None:
             return MetaResult(ok=False, error="run_dag yielded no MetaResult")
+        final.metacognition_decision = decide_completion(final.metacognition)
         return final
 
     async def resume(
@@ -788,6 +793,7 @@ class MetaOrchestrator:
             self._current_run_id = previous_run_id
         if final is None:
             final = MetaResult(ok=False, error="resume run_dag yielded no MetaResult")
+        final.metacognition_decision = decide_completion(final.metacognition)
 
         # Finalize the run lifecycle unless re-paused. If re-paused,
         # try_claim_awaiting has already moved the row back to
@@ -885,6 +891,7 @@ class MetaOrchestrator:
                             ev.metacognition,
                             ev.final_text,
                         )
+                    ev.metacognition_decision = decide_completion(ev.metacognition)
                     final = ev
                 yield ev
         finally:

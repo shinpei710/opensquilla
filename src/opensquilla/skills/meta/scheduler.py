@@ -29,7 +29,10 @@ from opensquilla.engine.types import (
 )
 from opensquilla.engine.usage import usage_scope
 from opensquilla.skills.meta.events import _FailoverTriggered, _StepDone
-from opensquilla.skills.meta.metacognition import MetacognitiveController
+from opensquilla.skills.meta.metacognition import (
+    MetacognitiveController,
+    decide_completion,
+)
 from opensquilla.skills.meta.parser import topological_order
 from opensquilla.skills.meta.templating import (
     evaluate_when,
@@ -205,7 +208,13 @@ async def run_dag(
                 final_text="",
                 step_outputs={},
             )
-        yield MetaResult(ok=True, final_text="", step_outputs={}, metacognition=report)
+        yield MetaResult(
+            ok=True,
+            final_text="",
+            step_outputs={},
+            metacognition=report,
+            metacognition_decision=decide_completion(report),
+        )
         return
     if metacognition_controller is not None:
         metacognition_controller.start_run(match, ordered)
@@ -717,6 +726,7 @@ async def run_dag(
                     paused_payload=item,
                     step_outputs=dict(outputs),
                     metacognition=report,
+                    metacognition_decision=decide_completion(report),
                 )
                 return
             if isinstance(item, Exception):
@@ -816,6 +826,7 @@ async def run_dag(
             error=str(failure),
             failed_step_id=failed_step_id,
             metacognition=report,
+            metacognition_decision=decide_completion(report),
         )
         return
 
@@ -832,6 +843,7 @@ async def run_dag(
         final_text=final_text,
         step_outputs=outputs,
         metacognition=report,
+        metacognition_decision=decide_completion(report),
     )
 
 
