@@ -5028,6 +5028,8 @@ class Agent:
         from opensquilla.skills.meta.metacognition import (
             decide_completion,
             format_decision_notice,
+            format_recovery_notice,
+            plan_recovery,
         )
         from opensquilla.skills.meta.orchestrator import (
             MetaOrchestrator,
@@ -5350,9 +5352,18 @@ class Agent:
                 )
                 if result.metacognition_decision is None:
                     result.metacognition_decision = decision
+                recovery = result.metacognition_recovery or plan_recovery(
+                    result.metacognition,
+                    decision,
+                )
+                if result.metacognition_recovery is None:
+                    result.metacognition_recovery = recovery
                 decision_notice = format_decision_notice(decision)
+                recovery_notice = format_recovery_notice(recovery)
                 if decision_notice:
                     pause_content = f"{pause_content}\n{decision_notice}"
+                if recovery_notice:
+                    pause_content = f"{pause_content}\n{recovery_notice}"
                 yield ToolResult(
                     tool_use_id=tc.tool_use_id,
                     tool_name="meta_invoke",
@@ -5369,7 +5380,14 @@ class Agent:
             )
             if result.metacognition_decision is None:
                 result.metacognition_decision = decision
+            recovery = result.metacognition_recovery or plan_recovery(
+                result.metacognition,
+                decision,
+            )
+            if result.metacognition_recovery is None:
+                result.metacognition_recovery = recovery
             decision_notice = format_decision_notice(decision)
+            recovery_notice = format_recovery_notice(recovery)
             if decision is not None and decision.get("action") == "block":
                 content = (
                     f"meta-skill {name!r} blocked by metacognitive "
@@ -5377,6 +5395,8 @@ class Agent:
                 )
                 if decision_notice:
                     content = f"{content}\n{decision_notice}"
+                if recovery_notice:
+                    content = f"{content}\n{recovery_notice}"
                 yield ToolResult(
                     tool_use_id=tc.tool_use_id,
                     tool_name="meta_invoke",
@@ -5394,6 +5414,8 @@ class Agent:
             )
             if decision_notice:
                 success_content = f"{success_content}\n{decision_notice}"
+            if recovery_notice:
+                success_content = f"{success_content}\n{recovery_notice}"
             yield ToolResult(
                 tool_use_id=tc.tool_use_id,
                 tool_name="meta_invoke",
@@ -5675,6 +5697,8 @@ class Agent:
         from opensquilla.skills.meta.metacognition import (
             decide_completion,
             format_decision_notice,
+            format_recovery_notice,
+            plan_recovery,
         )
 
         per_step_cap = 1200
@@ -5697,6 +5721,13 @@ class Agent:
         decision_notice = format_decision_notice(decision)
         if decision_notice:
             lines.extend(["", decision_notice])
+        recovery = getattr(result, "metacognition_recovery", None) or plan_recovery(
+            getattr(result, "metacognition", None),
+            decision,
+        )
+        recovery_notice = format_recovery_notice(recovery)
+        if recovery_notice:
+            lines.extend(["", recovery_notice])
         lines.append(f"Original meta-skill requested: {tc.arguments.get('name', '')}")
         return ToolResult(
             tool_use_id=tc.tool_use_id,

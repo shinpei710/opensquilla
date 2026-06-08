@@ -50,6 +50,7 @@ from opensquilla.skills.meta.inputs import language_instruction_for_user_message
 from opensquilla.skills.meta.metacognition import (
     MetacognitiveController,
     decide_completion,
+    plan_recovery,
     refresh_report_final_text,
 )
 from opensquilla.skills.meta.scheduler import run_dag
@@ -363,6 +364,10 @@ class MetaOrchestrator:
                         )
                     item.metacognition_decision = decide_completion(
                         item.metacognition,
+                    )
+                    item.metacognition_recovery = plan_recovery(
+                        item.metacognition,
+                        item.metacognition_decision,
                     )
                     final_result = item
                 yield item
@@ -685,6 +690,10 @@ class MetaOrchestrator:
         if final is None:
             return MetaResult(ok=False, error="run_dag yielded no MetaResult")
         final.metacognition_decision = decide_completion(final.metacognition)
+        final.metacognition_recovery = plan_recovery(
+            final.metacognition,
+            final.metacognition_decision,
+        )
         return final
 
     async def resume(
@@ -794,6 +803,10 @@ class MetaOrchestrator:
         if final is None:
             final = MetaResult(ok=False, error="resume run_dag yielded no MetaResult")
         final.metacognition_decision = decide_completion(final.metacognition)
+        final.metacognition_recovery = plan_recovery(
+            final.metacognition,
+            final.metacognition_decision,
+        )
 
         # Finalize the run lifecycle unless re-paused. If re-paused,
         # try_claim_awaiting has already moved the row back to
@@ -892,6 +905,10 @@ class MetaOrchestrator:
                             ev.final_text,
                         )
                     ev.metacognition_decision = decide_completion(ev.metacognition)
+                    ev.metacognition_recovery = plan_recovery(
+                        ev.metacognition,
+                        ev.metacognition_decision,
+                    )
                     final = ev
                 yield ev
         finally:

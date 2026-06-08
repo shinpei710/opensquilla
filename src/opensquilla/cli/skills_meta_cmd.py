@@ -25,6 +25,7 @@ from opensquilla.persistence.meta_run_writer import (
 )
 from opensquilla.skills.meta.metacognition import (
     decide_completion,
+    plan_recovery,
     summarize_report,
 )
 from opensquilla.skills.meta.parser import parse_meta_plan
@@ -101,11 +102,18 @@ def _serialize_record(rec: RunRecord) -> dict[str, Any]:
     d["steps"] = [asdict(s) for s in rec.steps]
     report_raw = d.pop("metacognition_json", None)
     decision_raw = d.pop("metacognition_decision_json", None)
+    recovery_raw = d.pop("metacognition_recovery_json", None)
     report = _parse_metacognition_json(report_raw)
-    d["metacognition"] = report
-    d["metacognition_decision"] = _decision_from_json_or_report(
+    decision = _decision_from_json_or_report(
         decision_raw,
         report,
+    )
+    d["metacognition"] = report
+    d["metacognition_decision"] = decision
+    d["metacognition_recovery"] = _recovery_from_json_or_decision(
+        recovery_raw,
+        report,
+        decision,
     )
     return d
 
@@ -145,6 +153,17 @@ def _decision_from_json_or_report(
     if decision is not None:
         return decision
     return decide_completion(report)
+
+
+def _recovery_from_json_or_decision(
+    raw: str | None,
+    report: dict[str, Any] | None,
+    decision: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    recovery = _parse_metacognition_json(raw)
+    if recovery is not None:
+        return recovery
+    return plan_recovery(report, decision)
 
 
 def _metacognition_counts_text(summary: dict[str, Any]) -> str:
@@ -230,6 +249,11 @@ def runs_show(
         rec.metacognition_decision_json,
         report,
     )
+    recovery = _recovery_from_json_or_decision(
+        rec.metacognition_recovery_json,
+        report,
+        decision,
+    )
     report_summary = summarize_report(report)
     if report_summary is not None:
         typer.echo(
@@ -247,6 +271,18 @@ def runs_show(
         next_step = str(decision.get("suggested_next_step") or "").strip()
         if next_step:
             typer.echo(f"decision_next: {next_step}")
+    if recovery is not None:
+        typer.echo(
+            "recovery:      "
+            f"{recovery.get('primary_action', 'none')}"
+        )
+        options = [
+            str(option.get("id"))
+            for option in recovery.get("options", [])
+            if isinstance(option, dict) and option.get("id")
+        ]
+        if options:
+            typer.echo(f"recovery_opts: {', '.join(options)}")
     typer.echo(f"steps:         {len(rec.steps)}")
 
 

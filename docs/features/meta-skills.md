@@ -161,6 +161,19 @@ MetaSkill. It creates a stable decision boundary first: `meta_invoke` can avoid
 presenting blocked results as ordinary success, while `skills meta runs show`
 and `--json` expose the stored `metacognition_decision`.
 
+### Controlled Recovery Options
+
+Completion-gate decisions also produce a `metacognition_recovery` plan with a
+machine-readable `primary_action` and ordered `options`. Examples include
+`deliver_with_warning`, `regenerate_final_text`, `collect_user_input`,
+`retry_or_fallback`, and `inspect_run`.
+
+Recovery plans are intentionally advisory in this release. They are persisted
+on `meta_skill_runs.metacognition_recovery_json` and surfaced in `meta_invoke`
+tool results, but OpenSquilla does not execute them automatically. This keeps
+the intervention boundary explicit while making the next safe action visible
+to operators and future controller policies.
+
 ## Proposals
 
 Meta-skill creation workflows may write proposals before they become managed

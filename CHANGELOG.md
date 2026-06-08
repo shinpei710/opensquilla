@@ -16,6 +16,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - MetaSkill runs now derive a metacognitive completion-gate decision
   (`pass`, `warn`, `block`, or `needs_review`) so blocked results are not
   presented as ordinary successful completions.
+- MetaSkill completion decisions now include controlled recovery plans with
+  machine-readable actions such as `regenerate_final_text`,
+  `collect_user_input`, and `retry_or_fallback`; these plans are persisted and
+  surfaced but not executed automatically.
 
 ### Changed
 

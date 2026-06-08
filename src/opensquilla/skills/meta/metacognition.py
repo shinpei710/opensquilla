@@ -16,6 +16,14 @@ from opensquilla.skills.meta.types import MetaMatch, MetaPaused, MetaStep
 Severity = Literal["info", "warning", "blocked"]
 ReportStatus = Literal["passed", "warning", "blocked"]
 DecisionAction = Literal["pass", "warn", "block", "needs_review"]
+RecoveryAction = Literal[
+    "none",
+    "deliver_with_warning",
+    "regenerate_final_text",
+    "collect_user_input",
+    "retry_or_fallback",
+    "inspect_run",
+]
 _SEVERITIES: tuple[Severity, ...] = ("info", "warning", "blocked")
 
 
@@ -41,6 +49,33 @@ class MetacognitiveDecision:
     reason: str
     surface_notice: str
     suggested_next_step: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MetacognitiveRecoveryOption:
+    """One controlled recovery option for a metacognitive decision."""
+
+    id: str
+    label: str
+    description: str
+    requires_user_confirmation: bool = True
+    automatic: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class MetacognitiveRecoveryPlan:
+    """Machine-readable recovery plan. V4 surfaces this; it does not execute it."""
+
+    primary_action: RecoveryAction
+    reason: str
+    options: list[dict[str, Any]]
+    automatic: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -438,6 +473,169 @@ def format_decision_notice(decision: dict[str, Any] | None) -> str:
     return f"Metacognitive decision: {action}. {reason}{suffix}"
 
 
+def plan_recovery(
+    report: dict[str, Any] | None,
+    decision: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Translate a completion decision into controlled recovery options."""
+
+    if not decision:
+        return None
+    summary = summarize_report(report)
+    completion = summary["completion_check"] if summary is not None else {}
+    action = str(decision.get("action") or "pass")
+
+    if action == "pass":
+        return MetacognitiveRecoveryPlan(
+            primary_action="none",
+            reason="No recovery is needed.",
+            options=[],
+        ).to_dict()
+
+    if action == "warn":
+        return MetacognitiveRecoveryPlan(
+            primary_action="deliver_with_warning",
+            reason="A deliverable exists, but metacognitive warnings should remain visible.",
+            options=[
+                _recovery_option(
+                    "deliver_with_warning",
+                    "Deliver With Warning",
+                    "Keep the deliverable and surface the warning notice.",
+                    requires_user_confirmation=False,
+                ),
+                _recovery_option(
+                    "inspect_run",
+                    "Inspect Run",
+                    "Review the persisted MetaSkill run trace before relying on it.",
+                ),
+            ],
+        ).to_dict()
+
+    if action == "needs_review":
+        return MetacognitiveRecoveryPlan(
+            primary_action="collect_user_input",
+            reason="The run paused and needs user input before it can complete.",
+            options=[
+                _recovery_option(
+                    "resume_after_user_input",
+                    "Resume After Input",
+                    "Collect the requested fields and resume the awaiting MetaSkill run.",
+                ),
+                _recovery_option(
+                    "cancel_run",
+                    "Cancel Run",
+                    "Cancel the awaiting MetaSkill run instead of resuming it.",
+                ),
+                _recovery_option(
+                    "inspect_run",
+                    "Inspect Run",
+                    "Review the run trace and awaiting form payload.",
+                ),
+            ],
+        ).to_dict()
+
+    if completion.get("final_text_present") is False and completion.get(
+        "step_outputs_present",
+    ) is True:
+        return MetacognitiveRecoveryPlan(
+            primary_action="regenerate_final_text",
+            reason="The run has step outputs but no user-facing final text.",
+            options=[
+                _recovery_option(
+                    "regenerate_final_text",
+                    "Regenerate Final Text",
+                    "Ask the model to synthesize a final answer from captured step outputs.",
+                ),
+                _recovery_option(
+                    "inspect_run",
+                    "Inspect Run",
+                    "Review the step outputs and metacognitive signals.",
+                ),
+                _recovery_option(
+                    "fallback_to_normal_turn",
+                    "Fallback To Normal Turn",
+                    "Let the parent agent continue with the blocked MetaSkill context.",
+                ),
+            ],
+        ).to_dict()
+
+    if completion.get("failed_step_id"):
+        return MetacognitiveRecoveryPlan(
+            primary_action="retry_or_fallback",
+            reason="The run failed or was blocked around a specific step.",
+            options=[
+                _recovery_option(
+                    "inspect_failed_step",
+                    "Inspect Failed Step",
+                    "Review the failed step, partial outputs, and error details.",
+                ),
+                _recovery_option(
+                    "retry_run",
+                    "Retry Run",
+                    "Retry the MetaSkill after addressing the failed step.",
+                ),
+                _recovery_option(
+                    "fallback_to_normal_turn",
+                    "Fallback To Normal Turn",
+                    "Let the parent agent continue with the failure context.",
+                ),
+            ],
+        ).to_dict()
+
+    return MetacognitiveRecoveryPlan(
+        primary_action="inspect_run",
+        reason="The completion gate blocked the result and no narrower recovery matched.",
+        options=[
+            _recovery_option(
+                "inspect_run",
+                "Inspect Run",
+                "Review the run trace, signals, and captured outputs.",
+            ),
+            _recovery_option(
+                "fallback_to_normal_turn",
+                "Fallback To Normal Turn",
+                "Let the parent agent continue with the blocked MetaSkill context.",
+            ),
+        ],
+    ).to_dict()
+
+
+def format_recovery_notice(recovery: dict[str, Any] | None) -> str:
+    """Return a compact notice for controlled recovery options."""
+
+    if not recovery or recovery.get("primary_action") == "none":
+        return ""
+    primary = str(recovery.get("primary_action") or "inspect_run")
+    options = [
+        str(option.get("id"))
+        for option in recovery.get("options", [])
+        if isinstance(option, dict) and option.get("id")
+    ]
+    options_text = ", ".join(options) if options else "none"
+    reason = str(recovery.get("reason") or "").strip()
+    reason_text = f" {reason}" if reason else ""
+    return (
+        f"Metacognitive recovery: primary={primary}; "
+        f"options={options_text}; automatic=false.{reason_text}"
+    )
+
+
+def _recovery_option(
+    option_id: str,
+    label: str,
+    description: str,
+    *,
+    requires_user_confirmation: bool = True,
+) -> dict[str, Any]:
+    return MetacognitiveRecoveryOption(
+        id=option_id,
+        label=label,
+        description=description,
+        requires_user_confirmation=requires_user_confirmation,
+        automatic=False,
+    ).to_dict()
+
+
 def format_report_notice(report: dict[str, Any] | None) -> str:
     """Format a one-line warning for non-passing metacognition reports.
 
@@ -524,12 +722,17 @@ __all__ = [
     "DecisionAction",
     "MetacognitiveController",
     "MetacognitiveDecision",
+    "MetacognitiveRecoveryOption",
+    "MetacognitiveRecoveryPlan",
     "MetacognitiveSignal",
     "ReportStatus",
+    "RecoveryAction",
     "Severity",
     "decide_completion",
     "format_decision_notice",
+    "format_recovery_notice",
     "format_report_notice",
+    "plan_recovery",
     "refresh_report_final_text",
     "summarize_report",
 ]

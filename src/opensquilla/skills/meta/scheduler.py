@@ -32,6 +32,7 @@ from opensquilla.skills.meta.events import _FailoverTriggered, _StepDone
 from opensquilla.skills.meta.metacognition import (
     MetacognitiveController,
     decide_completion,
+    plan_recovery,
 )
 from opensquilla.skills.meta.parser import topological_order
 from opensquilla.skills.meta.templating import (
@@ -208,12 +209,14 @@ async def run_dag(
                 final_text="",
                 step_outputs={},
             )
+        decision = decide_completion(report)
         yield MetaResult(
             ok=True,
             final_text="",
             step_outputs={},
             metacognition=report,
-            metacognition_decision=decide_completion(report),
+            metacognition_decision=decision,
+            metacognition_recovery=plan_recovery(report, decision),
         )
         return
     if metacognition_controller is not None:
@@ -720,13 +723,15 @@ async def run_dag(
                         step_outputs=dict(outputs),
                         paused=True,
                     )
+                decision = decide_completion(report)
                 yield MetaResult(
                     ok=False,
                     paused=True,
                     paused_payload=item,
                     step_outputs=dict(outputs),
                     metacognition=report,
-                    metacognition_decision=decide_completion(report),
+                    metacognition_decision=decision,
+                    metacognition_recovery=plan_recovery(report, decision),
                 )
                 return
             if isinstance(item, Exception):
@@ -820,13 +825,15 @@ async def run_dag(
                 error=str(failure),
                 failed_step_id=failed_step_id,
             )
+        decision = decide_completion(report)
         yield MetaResult(
             ok=False,
             step_outputs=outputs,
             error=str(failure),
             failed_step_id=failed_step_id,
             metacognition=report,
-            metacognition_decision=decide_completion(report),
+            metacognition_decision=decision,
+            metacognition_recovery=plan_recovery(report, decision),
         )
         return
 
@@ -838,12 +845,14 @@ async def run_dag(
             final_text=final_text,
             step_outputs=outputs,
         )
+    decision = decide_completion(report)
     yield MetaResult(
         ok=True,
         final_text=final_text,
         step_outputs=outputs,
         metacognition=report,
-        metacognition_decision=decide_completion(report),
+        metacognition_decision=decision,
+        metacognition_recovery=plan_recovery(report, decision),
     )
 
 

@@ -127,8 +127,10 @@ def test_runs_show(runner: CliRunner, seeded_db) -> None:
     assert data["status"] == "ok"
     assert data["metacognition"]["status"] == "warning"
     assert data["metacognition_decision"]["action"] == "warn"
+    assert data["metacognition_recovery"]["primary_action"] == "deliver_with_warning"
     assert "metacognition_json" not in data
     assert "metacognition_decision_json" not in data
+    assert "metacognition_recovery_json" not in data
 
 
 def test_runs_show_text_includes_metacognition_summary(
@@ -143,6 +145,8 @@ def test_runs_show_text_includes_metacognition_summary(
     assert "meta_decision: warn" in result.output
     assert "decision_reason:" in result.output
     assert "decision_next:" in result.output
+    assert "recovery:      deliver_with_warning" in result.output
+    assert "recovery_opts: deliver_with_warning, inspect_run" in result.output
 
 
 def test_runs_steps(runner: CliRunner, seeded_db) -> None:

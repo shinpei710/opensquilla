@@ -21,6 +21,8 @@ from opensquilla.skills.meta.metacognition import (
     MetacognitiveController,
     decide_completion,
     format_decision_notice,
+    format_recovery_notice,
+    plan_recovery,
 )
 from opensquilla.skills.meta.scheduler import run_dag
 from opensquilla.skills.meta.types import MetaMatch, MetaPlan, MetaResult, MetaStep
@@ -79,6 +81,10 @@ async def _run_scenario(scenario: str) -> dict[str, Any]:
     if final is None:
         raise RuntimeError("demo run did not produce a MetaResult")
     decision = final.metacognition_decision or decide_completion(final.metacognition)
+    recovery = final.metacognition_recovery or plan_recovery(
+        final.metacognition,
+        decision,
+    )
     return {
         "scenario": scenario,
         "ok": final.ok,
@@ -86,7 +92,14 @@ async def _run_scenario(scenario: str) -> dict[str, Any]:
         "error": final.error,
         "metacognition": final.metacognition,
         "metacognition_decision": decision,
-        "tool_result_notice": format_decision_notice(decision),
+        "metacognition_recovery": recovery,
+        "tool_result_notice": "\n".join(
+            part for part in (
+                format_decision_notice(decision),
+                format_recovery_notice(recovery),
+            )
+            if part
+        ),
     }
 
 

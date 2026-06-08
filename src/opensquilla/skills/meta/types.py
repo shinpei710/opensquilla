@@ -224,3 +224,7 @@ class MetaResult:
     # final-text post-processing. Plain dict for the same persistence/surface
     # boundary as the report.
     metacognition_decision: dict[str, Any] | None = None
+    # Optional controlled recovery plan derived from the completion decision.
+    # This is intentionally advisory in V4: no recovery action is executed
+    # implicitly by storing it here.
+    metacognition_recovery: dict[str, Any] | None = None

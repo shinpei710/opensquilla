@@ -8,6 +8,7 @@ from opensquilla.skills.meta.events import _StepDone
 from opensquilla.skills.meta.metacognition import (
     MetacognitiveController,
     decide_completion,
+    plan_recovery,
     refresh_report_final_text,
 )
 from opensquilla.skills.meta.scheduler import run_dag
@@ -57,6 +58,8 @@ async def test_metacognition_report_passes_clean_success() -> None:
     assert final.metacognition["completion_check"]["final_text_present"] is True
     assert final.metacognition_decision is not None
     assert final.metacognition_decision["action"] == "pass"
+    assert final.metacognition_recovery is not None
+    assert final.metacognition_recovery["primary_action"] == "none"
 
 
 @pytest.mark.asyncio
@@ -73,6 +76,8 @@ async def test_metacognition_warns_on_empty_success_output() -> None:
     assert "empty_final_text" in signal_kinds
     assert final.metacognition_decision is not None
     assert final.metacognition_decision["action"] == "block"
+    assert final.metacognition_recovery is not None
+    assert final.metacognition_recovery["primary_action"] == "regenerate_final_text"
 
 
 @pytest.mark.asyncio
@@ -90,6 +95,8 @@ async def test_metacognition_blocks_failed_run() -> None:
     assert "run_failed" in signal_kinds
     assert final.metacognition_decision is not None
     assert final.metacognition_decision["action"] == "block"
+    assert final.metacognition_recovery is not None
+    assert final.metacognition_recovery["primary_action"] == "retry_or_fallback"
 
 
 def test_refresh_report_final_text_clears_empty_final_warning() -> None:
@@ -145,6 +152,14 @@ def test_decide_completion_warns_when_deliverable_has_warnings() -> None:
     assert decision is not None
     assert decision["action"] == "warn"
     assert "Deliver with the warning" in decision["suggested_next_step"]
+    recovery = plan_recovery(report, decision)
+    assert recovery is not None
+    assert recovery["primary_action"] == "deliver_with_warning"
+    assert recovery["automatic"] is False
+    assert {option["id"] for option in recovery["options"]} == {
+        "deliver_with_warning",
+        "inspect_run",
+    }
 
 
 def test_decide_completion_marks_pause_needs_review() -> None:
@@ -172,3 +187,9 @@ def test_decide_completion_marks_pause_needs_review() -> None:
 
     assert decision is not None
     assert decision["action"] == "needs_review"
+    recovery = plan_recovery(report, decision)
+    assert recovery is not None
+    assert recovery["primary_action"] == "collect_user_input"
+    assert "resume_after_user_input" in {
+        option["id"] for option in recovery["options"]
+    }

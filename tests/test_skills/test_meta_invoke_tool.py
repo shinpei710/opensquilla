@@ -785,6 +785,8 @@ async def test_meta_invoke_surfaces_warning_metacognition_in_tool_result(
     assert final.content.startswith("meta-skill 'meta-tiny' completed.")
     assert "Metacognitive decision: warn" in final.content
     assert "Deliver with the warning" in final.content
+    assert "Metacognitive recovery: primary=deliver_with_warning" in final.content
+    assert "options=deliver_with_warning, inspect_run" in final.content
 
 
 @pytest.mark.asyncio
@@ -897,6 +899,8 @@ async def test_meta_invoke_blocks_metacognitive_completion_gate(
     assert final.terminates_turn is False
     assert "blocked by metacognitive completion gate" in final.content
     assert "Metacognitive decision: block" in final.content
+    assert "Metacognitive recovery: primary=regenerate_final_text" in final.content
+    assert "fallback_to_normal_turn" in final.content
     assert text_chunks == []
 
 
