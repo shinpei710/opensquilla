@@ -25,6 +25,7 @@ from opensquilla.persistence.meta_run_writer import (
 )
 from opensquilla.skills.meta.metacognition import (
     decide_completion,
+    format_recovery_option_brief,
     plan_recovery,
     summarize_report,
 )
@@ -284,7 +285,7 @@ def runs_show(
             f"{recovery.get('primary_action', 'none')}"
         )
         options = [
-            str(option.get("id"))
+            format_recovery_option_brief(option)
             for option in recovery.get("options", [])
             if isinstance(option, dict) and option.get("id")
         ]

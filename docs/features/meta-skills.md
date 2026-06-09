@@ -172,6 +172,17 @@ Most recovery plans are advisory. They are persisted on
 `meta_skill_runs.metacognition_recovery_json` and surfaced in `meta_invoke`
 tool results so operators can see the next safe action.
 
+Each recovery option now carries an `execution` contract that tells surfaces
+how to treat it:
+
+- `mode=automatic`: the orchestrator may run the action inside a bounded
+  policy;
+- `mode=confirm`: a surface may offer a confirm/cancel action, but runtime must
+  not execute it without user confirmation;
+- `mode=manual`: the operator should inspect or perform the action manually;
+- `mode=surface`: the surface can deliver or display the result without a new
+  runtime action.
+
 OpenSquilla can now execute one bounded recovery action automatically:
 `regenerate_final_text`. It only runs when the completion gate blocked a
 successful MetaSkill run because no user-facing final text was produced, the
@@ -182,9 +193,9 @@ step outputs, refreshes the metacognition report, and records the execution
 result on `meta_skill_runs.metacognition_recovery_result_json`.
 
 This recovery does not rerun the DAG, switch MetaSkills, retry failed steps, or
-execute arbitrary recovery options. Skipped and failed attempts are recorded so
-`meta_invoke` and `skills meta runs show` can explain why no recovery was
-applied.
+execute arbitrary recovery options. Skipped and failed attempts are written
+back into the matching option's `execution.last_status`, so `meta_invoke` and
+`skills meta runs show` can explain why no recovery was applied.
 
 ## Proposals
 

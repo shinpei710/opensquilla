@@ -7,6 +7,7 @@ import pytest
 from opensquilla.skills.meta.events import _StepDone
 from opensquilla.skills.meta.metacognition import (
     MetacognitiveController,
+    annotate_recovery_with_result,
     decide_completion,
     plan_recovery,
     refresh_report_final_text,
@@ -78,6 +79,13 @@ async def test_metacognition_warns_on_empty_success_output() -> None:
     assert final.metacognition_decision["action"] == "block"
     assert final.metacognition_recovery is not None
     assert final.metacognition_recovery["primary_action"] == "regenerate_final_text"
+    assert final.metacognition_recovery["automatic"] is True
+    regenerate = final.metacognition_recovery["options"][0]
+    assert regenerate["id"] == "regenerate_final_text"
+    assert regenerate["automatic"] is True
+    assert regenerate["requires_user_confirmation"] is False
+    assert regenerate["execution"]["mode"] == "automatic"
+    assert regenerate["execution"]["state"] == "available"
 
 
 @pytest.mark.asyncio
@@ -156,10 +164,16 @@ def test_decide_completion_warns_when_deliverable_has_warnings() -> None:
     assert recovery is not None
     assert recovery["primary_action"] == "deliver_with_warning"
     assert recovery["automatic"] is False
-    assert {option["id"] for option in recovery["options"]} == {
+    by_id = {option["id"]: option for option in recovery["options"]}
+    assert set(by_id) == {
         "deliver_with_warning",
         "inspect_run",
     }
+    assert by_id["deliver_with_warning"]["execution"]["mode"] == "surface"
+    assert by_id["deliver_with_warning"]["execution"]["state"] == "available"
+    assert by_id["inspect_run"]["requires_user_confirmation"] is False
+    assert by_id["inspect_run"]["execution"]["mode"] == "manual"
+    assert by_id["inspect_run"]["execution"]["state"] == "manual_only"
 
 
 def test_decide_completion_marks_pause_needs_review() -> None:
@@ -190,6 +204,41 @@ def test_decide_completion_marks_pause_needs_review() -> None:
     recovery = plan_recovery(report, decision)
     assert recovery is not None
     assert recovery["primary_action"] == "collect_user_input"
-    assert "resume_after_user_input" in {
-        option["id"] for option in recovery["options"]
+    by_id = {option["id"]: option for option in recovery["options"]}
+    assert "resume_after_user_input" in by_id
+    resume_execution = by_id["resume_after_user_input"]["execution"]
+    assert resume_execution["mode"] == "confirm"
+    assert resume_execution["state"] == "requires_confirmation"
+    assert resume_execution["confirmation_required"] is True
+    assert "Resume this MetaSkill run" in resume_execution["confirmation_prompt"]
+
+
+def test_recovery_result_annotation_marks_matching_option() -> None:
+    recovery = {
+        "primary_action": "regenerate_final_text",
+        "reason": "missing final",
+        "automatic": True,
+        "options": [
+            {
+                "id": "regenerate_final_text",
+                "execution": {"mode": "automatic", "state": "available"},
+            },
+        ],
     }
+
+    annotated = annotate_recovery_with_result(
+        recovery,
+        {
+            "action": "regenerate_final_text",
+            "status": "skipped",
+            "reason": "No llm_chat dependency is available for regeneration.",
+            "final_text_changed": False,
+            "final_text_chars": 0,
+        },
+    )
+
+    assert annotated is recovery
+    execution = recovery["options"][0]["execution"]
+    assert execution["state"] == "skipped"
+    assert execution["last_status"] == "skipped"
+    assert execution["final_text_changed"] is False

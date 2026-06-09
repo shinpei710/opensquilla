@@ -135,6 +135,9 @@ def test_runs_show(runner: CliRunner, seeded_db) -> None:
     assert data["metacognition"]["status"] == "warning"
     assert data["metacognition_decision"]["action"] == "warn"
     assert data["metacognition_recovery"]["primary_action"] == "deliver_with_warning"
+    recovery_options = data["metacognition_recovery"]["options"]
+    assert recovery_options[0]["execution"]["mode"] == "surface"
+    assert recovery_options[1]["execution"]["mode"] == "manual"
     assert data["metacognition_recovery_result"]["status"] == "applied"
     assert "metacognition_json" not in data
     assert "metacognition_decision_json" not in data
@@ -155,7 +158,10 @@ def test_runs_show_text_includes_metacognition_summary(
     assert "decision_reason:" in result.output
     assert "decision_next:" in result.output
     assert "recovery:      deliver_with_warning" in result.output
-    assert "recovery_opts: deliver_with_warning, inspect_run" in result.output
+    assert (
+        "recovery_opts: deliver_with_warning(surface:available), "
+        "inspect_run(manual:manual_only)"
+    ) in result.output
     assert "recovery_result: applied" in result.output
     assert "recovery_detail:" in result.output
 

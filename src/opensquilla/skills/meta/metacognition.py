@@ -1,9 +1,9 @@
 """Metacognitive monitoring for MetaSkill runs.
 
-The first implementation is intentionally observational: it models the run,
-records reliability signals, and attaches a completion report. It does not
-rewrite plans or auto-intervene yet, which keeps the runtime behaviour stable
-while giving future control policies a real hook surface.
+The controller models the run, records reliability signals, attaches a
+completion report, and exposes a bounded recovery contract. Runtime
+interventions stay deliberately narrow: only explicitly automatic recovery
+actions may run without user confirmation.
 """
 
 from __future__ import annotations
@@ -23,6 +23,16 @@ RecoveryAction = Literal[
     "collect_user_input",
     "retry_or_fallback",
     "inspect_run",
+]
+RecoveryExecutionMode = Literal["automatic", "confirm", "manual", "surface", "none"]
+RecoveryExecutionState = Literal[
+    "available",
+    "requires_confirmation",
+    "manual_only",
+    "not_needed",
+    "applied",
+    "skipped",
+    "failed",
 ]
 _SEVERITIES: tuple[Severity, ...] = ("info", "warning", "blocked")
 
@@ -63,6 +73,7 @@ class MetacognitiveRecoveryOption:
     description: str
     requires_user_confirmation: bool = True
     automatic: bool = False
+    execution: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -70,7 +81,7 @@ class MetacognitiveRecoveryOption:
 
 @dataclass(frozen=True)
 class MetacognitiveRecoveryPlan:
-    """Machine-readable recovery plan. V4 surfaces this; it does not execute it."""
+    """Machine-readable recovery plan with explicit execution boundaries."""
 
     primary_action: RecoveryAction
     reason: str
@@ -545,6 +556,8 @@ def plan_recovery(
                     "regenerate_final_text",
                     "Regenerate Final Text",
                     "Ask the model to synthesize a final answer from captured step outputs.",
+                    requires_user_confirmation=False,
+                    automatic=True,
                 ),
                 _recovery_option(
                     "inspect_run",
@@ -557,6 +570,7 @@ def plan_recovery(
                     "Let the parent agent continue with the blocked MetaSkill context.",
                 ),
             ],
+            automatic=True,
         ).to_dict()
 
     if completion.get("failed_step_id"):
@@ -607,17 +621,36 @@ def format_recovery_notice(recovery: dict[str, Any] | None) -> str:
         return ""
     primary = str(recovery.get("primary_action") or "inspect_run")
     options = [
-        str(option.get("id"))
+        format_recovery_option_brief(option)
         for option in recovery.get("options", [])
         if isinstance(option, dict) and option.get("id")
     ]
     options_text = ", ".join(options) if options else "none"
+    automatic = str(bool(recovery.get("automatic"))).lower()
     reason = str(recovery.get("reason") or "").strip()
     reason_text = f" {reason}" if reason else ""
     return (
         f"Metacognitive recovery: primary={primary}; "
-        f"options={options_text}; automatic=false.{reason_text}"
+        f"options={options_text}; automatic={automatic}.{reason_text}"
     )
+
+
+def format_recovery_option_brief(option: dict[str, Any]) -> str:
+    """Return one recovery option with its V6 execution state."""
+
+    option_id = str(option.get("id") or "unknown")
+    execution = option.get("execution")
+    if not isinstance(execution, dict):
+        return option_id
+    mode = str(execution.get("mode") or "").strip()
+    state = str(execution.get("state") or "").strip()
+    if mode and state:
+        return f"{option_id}({mode}:{state})"
+    if mode:
+        return f"{option_id}({mode})"
+    if state:
+        return f"{option_id}({state})"
+    return option_id
 
 
 def format_recovery_result_notice(result: dict[str, Any] | None) -> str:
@@ -643,20 +676,125 @@ def format_recovery_result_notice(result: dict[str, Any] | None) -> str:
     return notice
 
 
+def annotate_recovery_with_result(
+    recovery: dict[str, Any] | None,
+    result: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Attach a last-attempt record to the matching recovery option."""
+
+    if not recovery or not result:
+        return recovery
+    action = str(result.get("action") or "")
+    status = str(result.get("status") or "")
+    if not action or not status:
+        return recovery
+    for option in recovery.get("options", []):
+        if not isinstance(option, dict) or option.get("id") != action:
+            continue
+        execution = option.setdefault("execution", {})
+        if not isinstance(execution, dict):
+            execution = {}
+            option["execution"] = execution
+        if status in {"applied", "skipped", "failed"}:
+            execution["state"] = status
+        execution["last_status"] = status
+        reason = str(result.get("reason") or "").strip()
+        if reason:
+            execution["last_reason"] = reason
+        changed = result.get("final_text_changed")
+        if changed is not None:
+            execution["final_text_changed"] = bool(changed)
+        chars = result.get("final_text_chars")
+        if isinstance(chars, int):
+            execution["final_text_chars"] = chars
+        break
+    return recovery
+
+
 def _recovery_option(
     option_id: str,
     label: str,
     description: str,
     *,
     requires_user_confirmation: bool = True,
+    automatic: bool = False,
 ) -> dict[str, Any]:
+    if option_id in {"inspect_run", "inspect_failed_step"}:
+        requires_user_confirmation = False
+    execution = _recovery_execution_contract(
+        option_id,
+        requires_user_confirmation=requires_user_confirmation,
+        automatic=automatic,
+    )
     return MetacognitiveRecoveryOption(
         id=option_id,
         label=label,
         description=description,
         requires_user_confirmation=requires_user_confirmation,
-        automatic=False,
+        automatic=automatic,
+        execution=execution,
     ).to_dict()
+
+
+def _recovery_execution_contract(
+    option_id: str,
+    *,
+    requires_user_confirmation: bool,
+    automatic: bool,
+) -> dict[str, Any]:
+    if automatic:
+        return {
+            "mode": "automatic",
+            "state": "available",
+            "confirmation_required": False,
+            "confirmation_prompt": "",
+            "operator_hint": "Runs only inside the orchestrator's bounded recovery policy.",
+        }
+    if option_id == "deliver_with_warning":
+        return {
+            "mode": "surface",
+            "state": "available",
+            "confirmation_required": False,
+            "confirmation_prompt": "",
+            "operator_hint": "Surface the deliverable with the metacognitive warning visible.",
+        }
+    if option_id in {"inspect_run", "inspect_failed_step"}:
+        return {
+            "mode": "manual",
+            "state": "manual_only",
+            "confirmation_required": False,
+            "confirmation_prompt": "",
+            "operator_hint": "Inspect the persisted run trace before choosing another action.",
+        }
+    if requires_user_confirmation:
+        return {
+            "mode": "confirm",
+            "state": "requires_confirmation",
+            "confirmation_required": True,
+            "confirmation_prompt": _confirmation_prompt(option_id),
+            "operator_hint": "A surface may offer this as a confirm/cancel action.",
+        }
+    return {
+        "mode": "manual",
+        "state": "available",
+        "confirmation_required": False,
+        "confirmation_prompt": "",
+        "operator_hint": "",
+    }
+
+
+def _confirmation_prompt(option_id: str) -> str:
+    prompts = {
+        "resume_after_user_input": (
+            "Resume this MetaSkill run using the collected user input?"
+        ),
+        "cancel_run": "Cancel this awaiting MetaSkill run?",
+        "retry_run": "Retry this MetaSkill run after reviewing the failure?",
+        "fallback_to_normal_turn": (
+            "Stop using this MetaSkill result and let the parent agent continue?"
+        ),
+    }
+    return prompts.get(option_id, f"Confirm recovery action {option_id!r}?")
 
 
 def format_report_notice(report: dict[str, Any] | None) -> str:
@@ -743,6 +881,8 @@ def _clip(text: str, max_chars: int) -> str:
 
 __all__ = [
     "DecisionAction",
+    "RecoveryExecutionMode",
+    "RecoveryExecutionState",
     "MetacognitiveController",
     "MetacognitiveDecision",
     "MetacognitiveRecoveryOption",
@@ -751,9 +891,12 @@ __all__ = [
     "ReportStatus",
     "RecoveryAction",
     "Severity",
+    "annotate_recovery_with_result",
     "decide_completion",
     "format_decision_notice",
     "format_recovery_notice",
+    "format_recovery_option_brief",
+    "format_recovery_result_notice",
     "format_report_notice",
     "plan_recovery",
     "refresh_report_final_text",

@@ -49,6 +49,7 @@ from opensquilla.skills.meta.executors.tool_call import run_tool_call_step
 from opensquilla.skills.meta.inputs import language_instruction_for_user_message
 from opensquilla.skills.meta.metacognition import (
     MetacognitiveController,
+    annotate_recovery_with_result,
     decide_completion,
     plan_recovery,
     refresh_report_final_text,
@@ -1084,23 +1085,39 @@ class MetaOrchestrator:
         recovery = result.metacognition_recovery or {}
         if recovery.get("primary_action") != "regenerate_final_text":
             return None
+
+        def attempt(
+            *,
+            status: str,
+            reason: str,
+            final_text_changed: bool = False,
+        ) -> dict[str, Any]:
+            payload = self._recovery_result(
+                status=status,
+                reason=reason,
+                result=result,
+                final_text_changed=final_text_changed,
+            )
+            result.metacognition_recovery = annotate_recovery_with_result(
+                result.metacognition_recovery,
+                payload,
+            )
+            return payload
+
         if result.paused or not result.ok:
-            return self._recovery_result(
+            return attempt(
                 status="skipped",
                 reason="Run is not in a successful terminal state.",
-                result=result,
             )
         if result.final_text.strip():
-            return self._recovery_result(
+            return attempt(
                 status="skipped",
                 reason="Final text is already present.",
-                result=result,
             )
         if self._llm_chat is None:
-            return self._recovery_result(
+            return attempt(
                 status="skipped",
                 reason="No llm_chat dependency is available for regeneration.",
-                result=result,
             )
         usable_outputs = {
             sid: text
@@ -1108,10 +1125,9 @@ class MetaOrchestrator:
             if isinstance(text, str) and text.strip()
         }
         if not usable_outputs:
-            return self._recovery_result(
+            return attempt(
                 status="skipped",
                 reason="No non-empty step outputs are available to synthesize from.",
-                result=result,
             )
         try:
             regenerated = await self._regenerate_final_text_from_step_outputs(
@@ -1125,16 +1141,14 @@ class MetaOrchestrator:
                 plan.name,
                 exc,
             )
-            return self._recovery_result(
+            return attempt(
                 status="failed",
                 reason=f"Regeneration failed: {exc}",
-                result=result,
             )
         if not regenerated.strip():
-            return self._recovery_result(
+            return attempt(
                 status="skipped",
                 reason="Regeneration returned empty final text.",
-                result=result,
             )
 
         result.final_text = await self._repair_final_text_language(
@@ -1150,10 +1164,9 @@ class MetaOrchestrator:
             result.metacognition,
             result.metacognition_decision,
         )
-        return self._recovery_result(
+        return attempt(
             status="applied",
             reason="Final text was synthesized from captured step outputs.",
-            result=result,
             final_text_changed=True,
         )
 

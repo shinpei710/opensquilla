@@ -24,6 +24,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `regenerate_final_text` synthesizes missing final text from captured
   non-empty step outputs, records the recovery result, and keeps all other
   recovery options advisory.
+- MetaSkill recovery options now include an execution contract describing
+  whether each action is automatic, confirmation-gated, manual-only, or a
+  surface display action, with skipped/failed automatic attempts reflected
+  back into the option state.
 
 ### Changed
 

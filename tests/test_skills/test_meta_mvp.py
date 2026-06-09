@@ -2109,6 +2109,10 @@ async def test_orchestrator_skips_final_text_recovery_without_llm_chat() -> None
     assert result.metacognition_recovery_result is not None
     assert result.metacognition_recovery_result["status"] == "skipped"
     assert "No llm_chat" in result.metacognition_recovery_result["reason"]
+    recovery_option = result.metacognition_recovery["options"][0]
+    assert recovery_option["id"] == "regenerate_final_text"
+    assert recovery_option["execution"]["state"] == "skipped"
+    assert recovery_option["execution"]["last_status"] == "skipped"
 
 
 @pytest.mark.asyncio
@@ -2149,6 +2153,9 @@ async def test_orchestrator_skips_final_text_recovery_without_non_empty_outputs(
     assert "No non-empty step outputs" in result.metacognition_recovery_result["reason"]
     assert result.metacognition_decision is not None
     assert result.metacognition_decision["action"] == "block"
+    recovery_option = result.metacognition_recovery["options"][0]
+    assert recovery_option["id"] == "regenerate_final_text"
+    assert recovery_option["execution"]["state"] == "skipped"
 
 
 @pytest.mark.asyncio
