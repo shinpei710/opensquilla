@@ -110,10 +110,40 @@ def seeded_db(tmp_path: Path, monkeypatch):
         triggered_by="soft_meta_invoke", inputs={"user_message": "need info"},
         session_key="sess-wait", turn_id="turn-wait",
     )
+    wait_schema = {
+        "mode": "form",
+        "fields": [
+            {
+                "name": "destination",
+                "type": "string",
+                "required": True,
+                "prompt": "Where should we go?",
+            },
+            {
+                "name": "days",
+                "type": "int",
+                "required": True,
+                "prompt": "How many days?",
+                "min": 1,
+                "max": 30,
+            },
+            {
+                "name": "budget",
+                "type": "enum",
+                "required": False,
+                "prompt": "Budget level?",
+                "choices": ["low", "mid", "high"],
+                "default": "mid",
+            },
+        ],
+        "intro": "Need trip details.",
+        "cancel_keywords": ["cancel"],
+        "timeout_hours": 24,
+    }
     assert w.try_claim_awaiting(
         run_id=rid_wait,
         step_id="collect",
-        schema_json='{"mode":"form","fields":[]}',
+        schema_json=json.dumps(wait_schema, sort_keys=True),
         session_id="sess-wait",
         inputs_json='{"user_message":"need info"}',
         step_outputs_json="{}",
@@ -301,6 +331,135 @@ def test_runs_recover_cancel_rejects_finished_run(
             seeded_db["rid_ok"],
             "--action",
             "cancel_run",
+            "--confirm",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 2
+    data = json.loads(result.output)
+    assert data["status"] == "not_applicable"
+    assert "awaiting_user" in data["reason"]
+
+
+def test_runs_recover_resume_requires_confirm_and_keeps_run_awaiting(
+    runner: CliRunner,
+    seeded_db,
+) -> None:
+    result = runner.invoke(
+        cli_app,
+        [
+            "skills",
+            "meta",
+            "runs",
+            "recover",
+            seeded_db["rid_wait"],
+            "--action",
+            "resume_after_user_input",
+            "--fields-json",
+            json.dumps({"destination": "Tokyo", "days": 5}),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 2
+    data = json.loads(result.output)
+    assert data["status"] == "requires_confirmation"
+    assert data["gateway_required"] is True
+    assert data["filled_fields"] == {"destination": "Tokyo", "days": 5}
+    assert data["missing_fields"] == []
+    assert "Resume this MetaSkill run" in data["confirmation_prompt"]
+
+    w = open_meta_run_writer(seeded_db["db"])
+    try:
+        rec = w.get_run(seeded_db["rid_wait"])
+    finally:
+        w.close()
+    assert rec is not None
+    assert rec.status == "awaiting_user"
+
+
+def test_runs_recover_resume_reports_missing_required_fields(
+    runner: CliRunner,
+    seeded_db,
+) -> None:
+    result = runner.invoke(
+        cli_app,
+        [
+            "skills",
+            "meta",
+            "runs",
+            "recover",
+            seeded_db["rid_wait"],
+            "--action",
+            "resume_after_user_input",
+            "--fields-json",
+            json.dumps({"destination": "Tokyo"}),
+            "--json",
+        ],
+    )
+    assert result.exit_code == 2
+    data = json.loads(result.output)
+    assert data["status"] == "validation_error"
+    assert data["filled_fields"] == {"destination": "Tokyo"}
+    assert data["missing_fields"] == ["days"]
+    assert any("required field 'days'" in err for err in data["validation_errors"])
+
+
+def test_runs_recover_resume_confirm_prepares_payload_without_claiming(
+    runner: CliRunner,
+    seeded_db,
+) -> None:
+    result = runner.invoke(
+        cli_app,
+        [
+            "skills",
+            "meta",
+            "runs",
+            "recover",
+            seeded_db["rid_wait"],
+            "--action",
+            "resume_after_user_input",
+            "--fields-json",
+            json.dumps({"destination": "Tokyo", "days": 5, "budget": "high"}),
+            "--confirm",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["status"] == "prepared"
+    assert data["gateway_required"] is True
+    assert data["filled_fields"] == {
+        "destination": "Tokyo",
+        "days": 5,
+        "budget": "high",
+    }
+    assert data["validation_errors"] == []
+
+    w = open_meta_run_writer(seeded_db["db"])
+    try:
+        rec = w.get_run(seeded_db["rid_wait"])
+    finally:
+        w.close()
+    assert rec is not None
+    assert rec.status == "awaiting_user"
+
+
+def test_runs_recover_resume_rejects_finished_run(
+    runner: CliRunner,
+    seeded_db,
+) -> None:
+    result = runner.invoke(
+        cli_app,
+        [
+            "skills",
+            "meta",
+            "runs",
+            "recover",
+            seeded_db["rid_ok"],
+            "--action",
+            "resume_after_user_input",
+            "--fields-json",
+            json.dumps({"destination": "Tokyo", "days": 5}),
             "--confirm",
             "--json",
         ],

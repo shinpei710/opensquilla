@@ -32,6 +32,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   confirmation-gated recovery action: `cancel_run` for awaiting MetaSkill runs.
   Other recovery actions return explicit unsupported status until their
   runtime execution paths exist.
+- `opensquilla skills meta runs recover` can now validate and prepare
+  `resume_after_user_input` payloads with `--fields-json`, returning the
+  awaiting schema, filled fields, missing fields, and a clear gateway-required
+  boundary without claiming or resuming the run from CLI-only context.
 
 ### Changed
 

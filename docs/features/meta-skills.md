@@ -213,6 +213,23 @@ recovery action. Higher-impact actions such as `retry_run` and
 explicit unsupported status until their gateway/runtime execution paths are
 implemented.
 
+The CLI can also validate and prepare `resume_after_user_input` payloads for an
+awaiting run:
+
+```sh
+opensquilla skills meta runs recover <run-id> \
+  --action resume_after_user_input \
+  --fields-json '{"destination":"Tokyo","days":5}' \
+  --json
+```
+
+Without `--confirm`, this behaves as a dry run: it returns the awaiting schema,
+required fields, submitted fields, filled fields, missing fields, and the
+confirmation prompt while leaving the run unchanged. With `--confirm`, the
+payload status becomes `prepared` when validation succeeds, but the run remains
+`awaiting_user`; the actual resume still requires a live gateway/runtime
+surface to claim the row and continue the DAG.
+
 ## Proposals
 
 Meta-skill creation workflows may write proposals before they become managed

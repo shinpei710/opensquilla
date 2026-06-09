@@ -204,6 +204,7 @@ def _recover_payload(
     status: str,
     reason: str,
     confirmation_prompt: str = "",
+    extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "run_id": run_id,
@@ -213,7 +214,316 @@ def _recover_payload(
     }
     if confirmation_prompt:
         payload["confirmation_prompt"] = confirmation_prompt
+    if extra:
+        payload.update(extra)
     return payload
+
+
+def _json_object_or_errors(raw: str | None, *, label: str) -> tuple[dict[str, Any], list[str]]:
+    if raw is None or not raw.strip():
+        return {}, []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return {}, [f"{label} is not valid JSON: {exc}"]
+    if not isinstance(parsed, dict):
+        return {}, [f"{label} must be a JSON object, got {type(parsed).__name__}"]
+    return parsed, []
+
+
+def _clarify_value_to_string(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _validate_resume_fields(
+    *,
+    schema: Any,
+    stored_fields: dict[str, Any],
+    submitted_fields: dict[str, Any],
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    from opensquilla.skills.meta.clarify_text import _coerce_and_validate
+
+    fields = tuple(getattr(schema, "fields", ()) or ())
+    field_by_name = {str(field.name): field for field in fields}
+    known_stored = {
+        name: value
+        for name, value in stored_fields.items()
+        if name in field_by_name
+    }
+    combined_raw = {**known_stored, **submitted_fields}
+    errors: list[str] = []
+    filled: dict[str, Any] = {}
+
+    for name in submitted_fields:
+        if name not in field_by_name:
+            errors.append(
+                f"unknown field {name!r}; valid fields: "
+                f"{', '.join(field_by_name)}",
+            )
+
+    for name, raw_value in combined_raw.items():
+        field = field_by_name.get(name)
+        if field is None:
+            continue
+        coerced, field_errors = _coerce_and_validate(
+            field,
+            _clarify_value_to_string(raw_value),
+        )
+        if field_errors:
+            errors.extend(field_errors)
+        else:
+            filled[name] = coerced
+
+    missing = [
+        str(field.name)
+        for field in fields
+        if bool(getattr(field, "required", False)) and field.name not in filled
+    ]
+    for name in missing:
+        errors.append(f"required field {name!r}: no value provided")
+
+    if errors:
+        return filled, errors, missing
+    return filled, [], []
+
+
+def _schema_field_names(schema: Any) -> list[str]:
+    return [str(field.name) for field in getattr(schema, "fields", ()) or ()]
+
+
+def _schema_required_field_names(schema: Any) -> list[str]:
+    return [
+        str(field.name)
+        for field in getattr(schema, "fields", ()) or ()
+        if bool(getattr(field, "required", False))
+    ]
+
+
+def _resume_recovery_payload_extra(
+    *,
+    awaiting: Any,
+    schema: Any,
+    submitted_fields: dict[str, Any],
+    stored_fields: dict[str, Any],
+    filled_fields: dict[str, Any],
+    missing_fields: list[str],
+    validation_errors: list[str],
+) -> dict[str, Any]:
+    from opensquilla.skills.meta.clarify_schema import schema_to_protocol
+
+    extra: dict[str, Any] = {
+        "awaiting_step_id": awaiting.step_id,
+        "awaiting_session_id": awaiting.awaiting_session_id,
+        "field_names": _schema_field_names(schema),
+        "required_fields": _schema_required_field_names(schema),
+        "submitted_fields": submitted_fields,
+        "stored_fields": stored_fields,
+        "filled_fields": filled_fields,
+        "missing_fields": missing_fields,
+        "validation_errors": validation_errors,
+        "schema": schema_to_protocol(schema),
+        "gateway_required": True,
+    }
+    return extra
+
+
+def _prepare_resume_after_user_input(
+    *,
+    writer: MetaRunWriter,
+    rec: RunRecord,
+    run_id: str,
+    action: str,
+    prompt: str,
+    fields_json: str | None,
+    confirm: bool,
+) -> tuple[dict[str, Any], int]:
+    if rec.status != "awaiting_user":
+        return (
+            _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="not_applicable",
+                reason=(
+                    "resume_after_user_input only applies to runs in "
+                    "awaiting_user status."
+                ),
+                confirmation_prompt=prompt,
+            ),
+            2,
+        )
+    if not rec.session_key:
+        return (
+            _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="not_applicable",
+                reason="Awaiting run has no session_key; cannot locate form state.",
+                confirmation_prompt=prompt,
+            ),
+            2,
+        )
+
+    awaiting = writer.peek_awaiting(session_id=rec.session_key)
+    if awaiting is None or awaiting.run_id != run_id:
+        return (
+            _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="not_applicable",
+                reason="No matching awaiting_user form state found for this run.",
+                confirmation_prompt=prompt,
+            ),
+            2,
+        )
+
+    schema_dict, schema_errors = _json_object_or_errors(
+        awaiting.awaiting_schema_json,
+        label="awaiting_schema_json",
+    )
+    submitted_fields, submitted_errors = _json_object_or_errors(
+        fields_json,
+        label="--fields-json",
+    )
+    stored_fields, stored_errors = _json_object_or_errors(
+        awaiting.awaiting_filled_json,
+        label="awaiting_filled_json",
+    )
+    stored_fields.pop("__prefill_audit__", None)
+    parse_errors = schema_errors + submitted_errors + stored_errors
+
+    schema: Any | None = None
+    if not schema_errors:
+        try:
+            from opensquilla.skills.meta.plan_serde import (
+                clarify_config_from_jsonable,
+            )
+
+            schema = clarify_config_from_jsonable(schema_dict)
+        except Exception as exc:  # noqa: BLE001
+            parse_errors.append(f"awaiting_schema_json is not a valid schema: {exc}")
+
+    if schema is None:
+        schema = type(
+            "_EmptyClarifySchema",
+            (),
+            {
+                "fields": (),
+                "mode": "form",
+                "intro": "",
+                "cancel_keywords": (),
+                "timeout_hours": 24,
+                "nl_extract": False,
+            },
+        )()
+
+    filled_fields: dict[str, Any] = {}
+    missing_fields: list[str] = []
+    validation_errors: list[str] = []
+    if not parse_errors:
+        filled_fields, validation_errors, missing_fields = _validate_resume_fields(
+            schema=schema,
+            stored_fields=stored_fields,
+            submitted_fields=submitted_fields,
+        )
+
+    errors = parse_errors + validation_errors
+    if errors:
+        return (
+            _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="validation_error",
+                reason="Submitted user input does not satisfy the awaiting schema.",
+                confirmation_prompt=prompt,
+                extra=_resume_recovery_payload_extra(
+                    awaiting=awaiting,
+                    schema=schema,
+                    submitted_fields=submitted_fields,
+                    stored_fields=stored_fields,
+                    filled_fields=filled_fields,
+                    missing_fields=missing_fields,
+                    validation_errors=errors,
+                ),
+            ),
+            2,
+        )
+
+    if not confirm:
+        return (
+            _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="requires_confirmation",
+                reason=(
+                    "User input payload is valid. Re-run with --confirm to "
+                    "prepare a gateway resume request."
+                ),
+                confirmation_prompt=prompt,
+                extra=_resume_recovery_payload_extra(
+                    awaiting=awaiting,
+                    schema=schema,
+                    submitted_fields=submitted_fields,
+                    stored_fields=stored_fields,
+                    filled_fields=filled_fields,
+                    missing_fields=[],
+                    validation_errors=[],
+                ),
+            ),
+            2,
+        )
+
+    return (
+        _recover_payload(
+            run_id=run_id,
+            action=action,
+            status="prepared",
+            reason=(
+                "User input payload validated. CLI does not claim or resume "
+                "the run; execute through a live gateway/runtime surface."
+            ),
+            confirmation_prompt=prompt,
+            extra=_resume_recovery_payload_extra(
+                awaiting=awaiting,
+                schema=schema,
+                submitted_fields=submitted_fields,
+                stored_fields=stored_fields,
+                filled_fields=filled_fields,
+                missing_fields=[],
+                validation_errors=[],
+            ),
+        ),
+        0,
+    )
+
+
+def _print_resume_recovery_payload(payload: dict[str, Any]) -> None:
+    typer.echo(f"status: {payload['status']}")
+    typer.echo(f"reason: {payload['reason']}")
+    prompt = str(payload.get("confirmation_prompt") or "").strip()
+    if prompt:
+        typer.echo(f"confirmation_prompt: {prompt}")
+    field_names = payload.get("field_names") or []
+    if field_names:
+        typer.echo(f"fields: {', '.join(str(v) for v in field_names)}")
+    required = payload.get("required_fields") or []
+    if required:
+        typer.echo(f"required: {', '.join(str(v) for v in required)}")
+    missing = payload.get("missing_fields") or []
+    if missing:
+        typer.echo(f"missing: {', '.join(str(v) for v in missing)}")
+    errors = payload.get("validation_errors") or []
+    for err in errors:
+        typer.echo(f"error: {err}", err=True)
+    filled = payload.get("filled_fields") or {}
+    if filled:
+        typer.echo(
+            "filled_fields: "
+            + json.dumps(filled, ensure_ascii=False, sort_keys=True),
+        )
 
 
 def _metacognition_counts_text(summary: dict[str, Any]) -> str:
@@ -530,6 +840,11 @@ def runs_replay(
 def runs_recover(
     run_id: str = typer.Argument(...),
     action: str = typer.Option(..., "--action", help="Recovery option id to execute"),
+    fields_json: str | None = typer.Option(
+        None,
+        "--fields-json",
+        help="JSON object of user_input fields for resume_after_user_input",
+    ),
     confirm: bool = typer.Option(
         False,
         "--confirm",
@@ -544,7 +859,9 @@ def runs_recover(
 ) -> None:
     """Execute a supported confirmed recovery action for one run.
 
-    V7 intentionally supports only ``cancel_run`` for awaiting MetaSkill runs.
+    ``cancel_run`` can be executed directly for awaiting MetaSkill runs.
+    ``resume_after_user_input`` validates and prepares a payload, but still
+    requires a live gateway/runtime surface to claim and continue the DAG.
     Other recovery options remain surfaced as contracts until their runtime
     execution paths are implemented.
     """
@@ -575,17 +892,43 @@ def runs_recover(
             decision,
         )
         option = _recovery_option_by_id(recovery, action)
-        if option is None and rec.status == "awaiting_user" and action == "cancel_run":
+        if (
+            option is None
+            and rec.status == "awaiting_user"
+            and action in {"cancel_run", "resume_after_user_input"}
+        ):
             option = {
-                "id": "cancel_run",
+                "id": action,
                 "execution": {
                     "mode": "confirm",
                     "state": "requires_confirmation",
                     "confirmation_required": True,
-                    "confirmation_prompt": "Cancel this awaiting MetaSkill run?",
+                    "confirmation_prompt": (
+                        "Cancel this awaiting MetaSkill run?"
+                        if action == "cancel_run"
+                        else "Resume this MetaSkill run using the collected user input?"
+                    ),
                 },
             }
         prompt = _confirmation_prompt_for_action(action, option)
+
+        if action == "resume_after_user_input":
+            payload, exit_code = _prepare_resume_after_user_input(
+                writer=writer,
+                rec=rec,
+                run_id=run_id,
+                action=action,
+                prompt=prompt,
+                fields_json=fields_json,
+                confirm=confirm,
+            )
+            if json_out:
+                typer.echo(json.dumps(payload, default=str))
+            else:
+                _print_resume_recovery_payload(payload)
+            if exit_code:
+                raise typer.Exit(exit_code)
+            return
 
         if action != "cancel_run":
             payload = _recover_payload(
