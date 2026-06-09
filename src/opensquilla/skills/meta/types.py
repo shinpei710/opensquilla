@@ -228,3 +228,7 @@ class MetaResult:
     # This is intentionally advisory in V4: no recovery action is executed
     # implicitly by storing it here.
     metacognition_recovery: dict[str, Any] | None = None
+    # Optional execution result for a bounded metacognitive recovery action.
+    # This is separate from the advisory recovery plan so surfaces can
+    # distinguish "what was recommended" from "what actually ran".
+    metacognition_recovery_result: dict[str, Any] | None = None

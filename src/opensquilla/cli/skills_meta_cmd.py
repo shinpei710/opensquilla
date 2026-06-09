@@ -103,6 +103,7 @@ def _serialize_record(rec: RunRecord) -> dict[str, Any]:
     report_raw = d.pop("metacognition_json", None)
     decision_raw = d.pop("metacognition_decision_json", None)
     recovery_raw = d.pop("metacognition_recovery_json", None)
+    recovery_result_raw = d.pop("metacognition_recovery_result_json", None)
     report = _parse_metacognition_json(report_raw)
     decision = _decision_from_json_or_report(
         decision_raw,
@@ -114,6 +115,9 @@ def _serialize_record(rec: RunRecord) -> dict[str, Any]:
         recovery_raw,
         report,
         decision,
+    )
+    d["metacognition_recovery_result"] = _parse_metacognition_json(
+        recovery_result_raw,
     )
     return d
 
@@ -254,6 +258,9 @@ def runs_show(
         report,
         decision,
     )
+    recovery_result = _parse_metacognition_json(
+        rec.metacognition_recovery_result_json,
+    )
     report_summary = summarize_report(report)
     if report_summary is not None:
         typer.echo(
@@ -283,6 +290,14 @@ def runs_show(
         ]
         if options:
             typer.echo(f"recovery_opts: {', '.join(options)}")
+    if recovery_result is not None:
+        typer.echo(
+            "recovery_result: "
+            f"{recovery_result.get('status', 'unknown')}"
+        )
+        reason = str(recovery_result.get("reason") or "").strip()
+        if reason:
+            typer.echo(f"recovery_detail: {reason}")
     typer.echo(f"steps:         {len(rec.steps)}")
 
 

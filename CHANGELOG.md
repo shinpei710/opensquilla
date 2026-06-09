@@ -20,6 +20,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   machine-readable actions such as `regenerate_final_text`,
   `collect_user_input`, and `retry_or_fallback`; these plans are persisted and
   surfaced but not executed automatically.
+- MetaSkill metacognition can now execute the first bounded recovery action:
+  `regenerate_final_text` synthesizes missing final text from captured
+  non-empty step outputs, records the recovery result, and keeps all other
+  recovery options advisory.
 
 ### Changed
 

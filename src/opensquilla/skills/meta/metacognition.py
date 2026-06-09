@@ -620,6 +620,29 @@ def format_recovery_notice(recovery: dict[str, Any] | None) -> str:
     )
 
 
+def format_recovery_result_notice(result: dict[str, Any] | None) -> str:
+    """Return a compact notice for a recovery action that was actually tried."""
+
+    if not result:
+        return ""
+    action = str(result.get("action") or "unknown")
+    status = str(result.get("status") or "unknown")
+    reason = str(result.get("reason") or "").strip()
+    changed = result.get("final_text_changed")
+    chars = result.get("final_text_chars")
+    parts = [
+        f"Metacognitive recovery result: action={action}; status={status}",
+    ]
+    if changed is not None:
+        parts.append(f"final_text_changed={str(bool(changed)).lower()}")
+    if isinstance(chars, int):
+        parts.append(f"final_text_chars={chars}")
+    notice = "; ".join(parts) + "."
+    if reason:
+        notice = f"{notice} {reason}"
+    return notice
+
+
 def _recovery_option(
     option_id: str,
     label: str,

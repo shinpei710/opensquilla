@@ -369,6 +369,13 @@ class MetaOrchestrator:
                         item.metacognition,
                         item.metacognition_decision,
                     )
+                    item.metacognition_recovery_result = (
+                        await self._apply_metacognitive_recovery(
+                            item,
+                            plan=match.plan,
+                            inputs=match.inputs,
+                        )
+                    )
                     final_result = item
                 yield item
         except asyncio.CancelledError:
@@ -694,6 +701,11 @@ class MetaOrchestrator:
             final.metacognition,
             final.metacognition_decision,
         )
+        final.metacognition_recovery_result = await self._apply_metacognitive_recovery(
+            final,
+            plan=match.plan,
+            inputs=match.inputs,
+        )
         return final
 
     async def resume(
@@ -807,6 +819,11 @@ class MetaOrchestrator:
             final.metacognition,
             final.metacognition_decision,
         )
+        final.metacognition_recovery_result = await self._apply_metacognitive_recovery(
+            final,
+            plan=plan,
+            inputs=inputs,
+        )
 
         # Finalize the run lifecycle unless re-paused. If re-paused,
         # try_claim_awaiting has already moved the row back to
@@ -908,6 +925,13 @@ class MetaOrchestrator:
                     ev.metacognition_recovery = plan_recovery(
                         ev.metacognition,
                         ev.metacognition_decision,
+                    )
+                    ev.metacognition_recovery_result = (
+                        await self._apply_metacognitive_recovery(
+                            ev,
+                            plan=plan,
+                            inputs=inputs,
+                        )
                     )
                     final = ev
                 yield ev
@@ -1040,6 +1064,145 @@ class MetaOrchestrator:
         user_msg = (
             f"Meta-skill: `{plan.name}`\n\n"
             + ("\n\n".join(snippets) if snippets else "(no step outputs)")
+        )
+        return (await self._llm_chat(system_prompt, user_msg)).strip()
+
+    async def _apply_metacognitive_recovery(
+        self,
+        result: MetaResult,
+        *,
+        plan: MetaPlan,
+        inputs: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Execute the one recovery action V5 permits: regenerate final_text.
+
+        Recovery remains deliberately narrow: no DAG rerun, no MetaSkill switch,
+        and no arbitrary option execution. The action can only synthesize a
+        missing final answer from already-captured non-empty step outputs.
+        """
+
+        recovery = result.metacognition_recovery or {}
+        if recovery.get("primary_action") != "regenerate_final_text":
+            return None
+        if result.paused or not result.ok:
+            return self._recovery_result(
+                status="skipped",
+                reason="Run is not in a successful terminal state.",
+                result=result,
+            )
+        if result.final_text.strip():
+            return self._recovery_result(
+                status="skipped",
+                reason="Final text is already present.",
+                result=result,
+            )
+        if self._llm_chat is None:
+            return self._recovery_result(
+                status="skipped",
+                reason="No llm_chat dependency is available for regeneration.",
+                result=result,
+            )
+        usable_outputs = {
+            sid: text
+            for sid, text in result.step_outputs.items()
+            if isinstance(text, str) and text.strip()
+        }
+        if not usable_outputs:
+            return self._recovery_result(
+                status="skipped",
+                reason="No non-empty step outputs are available to synthesize from.",
+                result=result,
+            )
+        try:
+            regenerated = await self._regenerate_final_text_from_step_outputs(
+                plan,
+                inputs,
+                usable_outputs,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "orchestrator.metacognitive_recovery_failed skill=%s error=%s",
+                plan.name,
+                exc,
+            )
+            return self._recovery_result(
+                status="failed",
+                reason=f"Regeneration failed: {exc}",
+                result=result,
+            )
+        if not regenerated.strip():
+            return self._recovery_result(
+                status="skipped",
+                reason="Regeneration returned empty final text.",
+                result=result,
+            )
+
+        result.final_text = await self._repair_final_text_language(
+            inputs,
+            regenerated.strip(),
+        )
+        result.metacognition = refresh_report_final_text(
+            result.metacognition,
+            result.final_text,
+        )
+        result.metacognition_decision = decide_completion(result.metacognition)
+        result.metacognition_recovery = plan_recovery(
+            result.metacognition,
+            result.metacognition_decision,
+        )
+        return self._recovery_result(
+            status="applied",
+            reason="Final text was synthesized from captured step outputs.",
+            result=result,
+            final_text_changed=True,
+        )
+
+    @staticmethod
+    def _recovery_result(
+        *,
+        status: str,
+        reason: str,
+        result: MetaResult,
+        final_text_changed: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "action": "regenerate_final_text",
+            "status": status,
+            "reason": reason,
+            "final_text_changed": final_text_changed,
+            "final_text_chars": len(result.final_text or ""),
+        }
+
+    async def _regenerate_final_text_from_step_outputs(
+        self,
+        plan: MetaPlan,
+        inputs: dict[str, Any],
+        step_outputs: dict[str, str],
+    ) -> str:
+        """Synthesize a missing final answer from bounded step-output snippets."""
+
+        if self._llm_chat is None:
+            return ""
+        system_prompt = (
+            "You are recovering a MetaSkill run that produced intermediate "
+            "step outputs but no user-facing final answer. Synthesize a "
+            "concise final response from the provided step outputs. Do not "
+            "invent missing facts; if the outputs are insufficient, return "
+            "an empty string. Preserve exact file paths, URLs, identifiers, "
+            "and verdict tokens. Reply in the user's language."
+        )
+        language_instruction = str(inputs.get("language_instruction") or "").strip()
+        if language_instruction:
+            system_prompt = f"{system_prompt}\n\n{language_instruction}"
+        snippets: list[str] = []
+        for sid, raw in step_outputs.items():
+            truncated = raw[:1200]
+            snippets.append(f"### step `{sid}`\n{truncated}")
+        user_msg = (
+            f"Meta-skill: `{plan.name}`\n\n"
+            f"Original user request:\n{str(inputs.get('user_message') or '')[:1600]}\n\n"
+            "Captured non-empty step outputs:\n"
+            + "\n\n".join(snippets)
         )
         return (await self._llm_chat(system_prompt, user_msg)).strip()
 

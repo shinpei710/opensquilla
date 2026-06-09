@@ -97,6 +97,7 @@ class RunRecord:
     metacognition_json: str | None
     metacognition_decision_json: str | None
     metacognition_recovery_json: str | None
+    metacognition_recovery_result_json: str | None
     truncated_fields: tuple[str, ...]
     steps: tuple[StepRecord, ...] = ()
 
@@ -426,6 +427,7 @@ class MetaRunWriter:
         metacognition_json: str | None = None
         metacognition_decision_json: str | None = None
         metacognition_recovery_json: str | None = None
+        metacognition_recovery_result_json: str | None = None
         failed_step_id: str | None = None
         error: str | None = None
         if result is not None:
@@ -482,8 +484,116 @@ class MetaRunWriter:
                 )
                 if was_t:
                     truncated.append("metacognition_recovery_json")
+            recovery_result = result.metacognition_recovery_result
+            if recovery_result is not None:
+                recovery_result_raw = json.dumps(
+                    recovery_result,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+                metacognition_recovery_result_json, was_t = _truncate(
+                    recovery_result_raw,
+                    "metacognition_recovery_result_json",
+                    max_bytes=self._max_field_bytes,
+                )
+                if was_t:
+                    truncated.append("metacognition_recovery_result_json")
             failed_step_id = result.failed_step_id
             error = result.error
+        try:
+            with self._lock:
+                self._conn.execute(
+                    """
+                    UPDATE meta_skill_runs
+                       SET status=?, ended_at_ms=?, final_text=?,
+                           failed_step_id=?, error=?, metacognition_json=?,
+                           metacognition_decision_json=?,
+                           metacognition_recovery_json=?,
+                           metacognition_recovery_result_json=?,
+                           truncated_fields=?
+                     WHERE run_id=?
+                    """,
+                    (
+                        status, self._clock(), final_text,
+                        failed_step_id, error, metacognition_json,
+                        metacognition_decision_json,
+                        metacognition_recovery_json,
+                        metacognition_recovery_result_json,
+                        ",".join(truncated),
+                        run_id,
+                    ),
+                )
+                self._conn.commit()
+        except sqlite3.OperationalError as exc:
+            if "metacognition_recovery_result_json" in str(exc):
+                self._finish_run_sync_without_recovery_result_schema(
+                    run_id=run_id,
+                    status=status,
+                    final_text=final_text,
+                    metacognition_json=metacognition_json,
+                    metacognition_decision_json=metacognition_decision_json,
+                    metacognition_recovery_json=metacognition_recovery_json,
+                    failed_step_id=failed_step_id,
+                    error=error,
+                    truncated_fields=truncated,
+                )
+                return
+            if "metacognition_recovery_json" in str(exc):
+                self._finish_run_sync_without_recovery_schema(
+                    run_id=run_id,
+                    status=status,
+                    final_text=final_text,
+                    metacognition_json=metacognition_json,
+                    metacognition_decision_json=metacognition_decision_json,
+                    failed_step_id=failed_step_id,
+                    error=error,
+                    truncated_fields=truncated,
+                )
+                return
+            if "metacognition_decision_json" in str(exc):
+                self._finish_run_sync_without_decision_schema(
+                    run_id=run_id,
+                    status=status,
+                    final_text=final_text,
+                    metacognition_json=metacognition_json,
+                    failed_step_id=failed_step_id,
+                    error=error,
+                    truncated_fields=truncated,
+                )
+                return
+            if "metacognition_json" in str(exc):
+                self._finish_run_sync_legacy_schema(
+                    run_id=run_id,
+                    status=status,
+                    final_text=final_text,
+                    failed_step_id=failed_step_id,
+                    error=error,
+                    truncated_fields=truncated,
+                )
+                return
+            log.warning("meta_run_writer.finish_run_failed: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("meta_run_writer.finish_run_failed: %s", exc)
+
+    def _finish_run_sync_without_recovery_result_schema(
+        self,
+        *,
+        run_id: str,
+        status: Literal["ok", "failed", "cancelled"],
+        final_text: str | None,
+        metacognition_json: str | None,
+        metacognition_decision_json: str | None,
+        metacognition_recovery_json: str | None,
+        failed_step_id: str | None,
+        error: str | None,
+        truncated_fields: list[str],
+    ) -> None:
+        """Finalize DBs that have V017 but not V018 yet."""
+
+        truncated = [
+            field for field in truncated_fields
+            if field != "metacognition_recovery_result_json"
+        ]
         try:
             with self._lock:
                 self._conn.execute(
@@ -560,7 +670,10 @@ class MetaRunWriter:
 
         truncated = [
             field for field in truncated_fields
-            if field != "metacognition_recovery_json"
+            if field not in {
+                "metacognition_recovery_json",
+                "metacognition_recovery_result_json",
+            }
         ]
         try:
             with self._lock:
@@ -626,6 +739,7 @@ class MetaRunWriter:
             if field not in {
                 "metacognition_decision_json",
                 "metacognition_recovery_json",
+                "metacognition_recovery_result_json",
             }
         ]
         try:
@@ -679,6 +793,7 @@ class MetaRunWriter:
                 "metacognition_json",
                 "metacognition_decision_json",
                 "metacognition_recovery_json",
+                "metacognition_recovery_result_json",
             }
         ]
         try:
@@ -1090,6 +1205,10 @@ class MetaRunWriter:
             metacognition_recovery_json=_row_get(
                 row,
                 "metacognition_recovery_json",
+            ),
+            metacognition_recovery_result_json=_row_get(
+                row,
+                "metacognition_recovery_result_json",
             ),
             truncated_fields=tuple(
                 f for f in (row["truncated_fields"] or "").split(",") if f
