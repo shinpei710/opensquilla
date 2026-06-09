@@ -197,6 +197,22 @@ execute arbitrary recovery options. Skipped and failed attempts are written
 back into the matching option's `execution.last_status`, so `meta_invoke` and
 `skills meta runs show` can explain why no recovery was applied.
 
+### CLI Recovery Execution
+
+The first confirmation-gated CLI recovery action is available for awaiting
+runs:
+
+```sh
+opensquilla skills meta runs recover <run-id> --action cancel_run --confirm
+```
+
+Without `--confirm`, the command prints the confirmation prompt and leaves the
+run unchanged. In this release, `cancel_run` is the only CLI-executable
+recovery action. Higher-impact actions such as `retry_run` and
+`fallback_to_normal_turn` remain visible in the recovery contract but return an
+explicit unsupported status until their gateway/runtime execution paths are
+implemented.
+
 ## Proposals
 
 Meta-skill creation workflows may write proposals before they become managed

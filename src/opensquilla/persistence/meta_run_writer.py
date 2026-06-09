@@ -1065,15 +1065,16 @@ class MetaRunWriter:
         except Exception as exc:  # noqa: BLE001
             log.warning("meta_run_writer.mark_expired_failed: %s", exc)
 
-    def mark_cancelled(self, *, run_id: str, reason: str) -> None:
+    def mark_cancelled(self, *, run_id: str, reason: str) -> bool:
         """Transition an awaiting_user run to 'cancelled' with a recorded reason.
 
         Reason is stored in the existing `error` column (with `cancelled:`
         prefix); callers must check `status` before interpreting `error`.
+        Returns True only when an awaiting run was actually updated.
         """
         try:
             with self._lock:
-                self._conn.execute(
+                cur = self._conn.execute(
                     """
                     UPDATE meta_skill_runs
                        SET status='cancelled', ended_at_ms=?, error=?
@@ -1081,9 +1082,14 @@ class MetaRunWriter:
                     """,
                     (self._clock(), f"cancelled:{reason}", run_id),
                 )
+                if cur.rowcount == 0:
+                    self._conn.rollback()
+                    return False
                 self._conn.commit()
+                return True
         except Exception as exc:  # noqa: BLE001
             log.warning("meta_run_writer.mark_cancelled_failed: %s", exc)
+            return False
 
     def increment_parse_failures(self, *, run_id: str) -> int:
         """Atomically increment parse_failure_count; return new value.

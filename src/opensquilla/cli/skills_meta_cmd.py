@@ -171,6 +171,51 @@ def _recovery_from_json_or_decision(
     return plan_recovery(report, decision)
 
 
+def _recovery_option_by_id(
+    recovery: dict[str, Any] | None,
+    action: str,
+) -> dict[str, Any] | None:
+    if not recovery:
+        return None
+    for option in recovery.get("options", []):
+        if isinstance(option, dict) and option.get("id") == action:
+            return option
+    return None
+
+
+def _confirmation_prompt_for_action(
+    action: str,
+    option: dict[str, Any] | None,
+) -> str:
+    execution = option.get("execution") if isinstance(option, dict) else None
+    if isinstance(execution, dict):
+        prompt = str(execution.get("confirmation_prompt") or "").strip()
+        if prompt:
+            return prompt
+    if action == "cancel_run":
+        return "Cancel this awaiting MetaSkill run?"
+    return f"Confirm recovery action {action!r}?"
+
+
+def _recover_payload(
+    *,
+    run_id: str,
+    action: str,
+    status: str,
+    reason: str,
+    confirmation_prompt: str = "",
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "action": action,
+        "status": status,
+        "reason": reason,
+    }
+    if confirmation_prompt:
+        payload["confirmation_prompt"] = confirmation_prompt
+    return payload
+
+
 def _metacognition_counts_text(summary: dict[str, Any]) -> str:
     counts = summary.get("signal_counts", {})
     if not isinstance(counts, dict):
@@ -479,6 +524,143 @@ def runs_replay(
     )
     typer.echo("Use --dry-run to inspect the DAG.", err=True)
     raise typer.Exit(2)
+
+
+@runs_app.command("recover")
+def runs_recover(
+    run_id: str = typer.Argument(...),
+    action: str = typer.Option(..., "--action", help="Recovery option id to execute"),
+    confirm: bool = typer.Option(
+        False,
+        "--confirm",
+        help="Actually execute confirmation-gated recovery actions",
+    ),
+    reason: str = typer.Option(
+        "cli_recover_cancel_run",
+        "--reason",
+        help="Audit reason for supported recovery actions",
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Execute a supported confirmed recovery action for one run.
+
+    V7 intentionally supports only ``cancel_run`` for awaiting MetaSkill runs.
+    Other recovery options remain surfaced as contracts until their runtime
+    execution paths are implemented.
+    """
+    writer = _open_writer()
+    try:
+        rec = writer.get_run(run_id)
+        if rec is None:
+            payload = _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="not_found",
+                reason="Run not found.",
+            )
+            if json_out:
+                typer.echo(json.dumps(payload, default=str))
+            else:
+                typer.echo(f"run not found: {run_id}", err=True)
+            raise typer.Exit(2)
+
+        report = _parse_metacognition_json(rec.metacognition_json)
+        decision = _decision_from_json_or_report(
+            rec.metacognition_decision_json,
+            report,
+        )
+        recovery = _recovery_from_json_or_decision(
+            rec.metacognition_recovery_json,
+            report,
+            decision,
+        )
+        option = _recovery_option_by_id(recovery, action)
+        if option is None and rec.status == "awaiting_user" and action == "cancel_run":
+            option = {
+                "id": "cancel_run",
+                "execution": {
+                    "mode": "confirm",
+                    "state": "requires_confirmation",
+                    "confirmation_required": True,
+                    "confirmation_prompt": "Cancel this awaiting MetaSkill run?",
+                },
+            }
+        prompt = _confirmation_prompt_for_action(action, option)
+
+        if action != "cancel_run":
+            payload = _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="unsupported",
+                reason=(
+                    "This recovery action is not executable by CLI yet; "
+                    "inspect the run or use a live gateway/runtime surface."
+                ),
+                confirmation_prompt=prompt,
+            )
+            if json_out:
+                typer.echo(json.dumps(payload, default=str))
+            else:
+                typer.echo(payload["reason"], err=True)
+            raise typer.Exit(2)
+
+        if rec.status != "awaiting_user":
+            payload = _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="not_applicable",
+                reason="cancel_run only applies to runs in awaiting_user status.",
+                confirmation_prompt=prompt,
+            )
+            if json_out:
+                typer.echo(json.dumps(payload, default=str))
+            else:
+                typer.echo(payload["reason"], err=True)
+            raise typer.Exit(2)
+
+        if not confirm:
+            payload = _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="requires_confirmation",
+                reason="Re-run with --confirm to cancel the awaiting MetaSkill run.",
+                confirmation_prompt=prompt,
+            )
+            if json_out:
+                typer.echo(json.dumps(payload, default=str))
+            else:
+                typer.echo(prompt)
+                typer.echo(
+                    "Re-run with --confirm to cancel the awaiting MetaSkill run.",
+                )
+            raise typer.Exit(2)
+
+        cancelled = writer.mark_cancelled(run_id=run_id, reason=reason)
+        if not cancelled:
+            payload = _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="not_applicable",
+                reason="Run was no longer awaiting user input.",
+            )
+            if json_out:
+                typer.echo(json.dumps(payload, default=str))
+            else:
+                typer.echo(payload["reason"], err=True)
+            raise typer.Exit(2)
+    finally:
+        writer.close()
+
+    payload = _recover_payload(
+        run_id=run_id,
+        action=action,
+        status="cancelled",
+        reason=reason,
+    )
+    if json_out:
+        typer.echo(json.dumps(payload, default=str))
+        return
+    typer.echo(f"cancelled awaiting MetaSkill run: {run_id}")
 
 
 # ─── Proposals: list / accept ─────────────────────────────────────────────

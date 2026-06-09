@@ -28,6 +28,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   whether each action is automatic, confirmation-gated, manual-only, or a
   surface display action, with skipped/failed automatic attempts reflected
   back into the option state.
+- `opensquilla skills meta runs recover` can now execute the first
+  confirmation-gated recovery action: `cancel_run` for awaiting MetaSkill runs.
+  Other recovery actions return explicit unsupported status until their
+  runtime execution paths exist.
 
 ### Changed
 

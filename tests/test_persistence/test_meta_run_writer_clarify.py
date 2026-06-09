@@ -190,7 +190,7 @@ def test_mark_expired_moves_awaiting_to_expired(writer):
 
 def test_mark_cancelled_records_reason_in_error_column(writer):
     _seed_awaiting(writer, run_id="r1", session_key="S1")
-    writer.mark_cancelled(run_id="r1", reason="user_cancel")
+    assert writer.mark_cancelled(run_id="r1", reason="user_cancel") is True
     with writer._lock:
         row = writer._conn.execute(
             "SELECT status, error FROM meta_skill_runs WHERE run_id=?",
@@ -198,6 +198,21 @@ def test_mark_cancelled_records_reason_in_error_column(writer):
         ).fetchone()
     assert row["status"] == "cancelled"
     assert "user_cancel" in (row["error"] or "")
+
+
+def test_mark_cancelled_returns_false_for_non_awaiting_run(writer):
+    with writer._lock:
+        writer._conn.execute(
+            "INSERT INTO meta_skill_runs "
+            "(run_id, meta_skill_name, meta_skill_digest, plan_snapshot_json, "
+            " triggered_by, session_key, status, started_at_ms, inputs_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("r2", "tskill", "d", "{}", "soft_meta_invoke", "S2",
+             "ok", 0, "{}"),
+        )
+        writer._conn.commit()
+
+    assert writer.mark_cancelled(run_id="r2", reason="user_cancel") is False
 
 
 def test_increment_parse_failures_returns_new_count(writer):

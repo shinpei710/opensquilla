@@ -100,17 +100,41 @@ def seeded_db(tmp_path: Path, monkeypatch):
         run_id=rid_fail, status="failed",
         result=MetaResult(ok=False, error="boom", failed_step_id="s1"),
     )
+
+    plan_wait = MetaPlan(
+        name="wait-skill", triggers=("t",), priority=10,
+        steps=(MetaStep(id="collect", skill="", kind="user_input"),),
+    )
+    rid_wait = w.begin_run_sync(
+        meta_skill_name="wait-skill", meta_plan=plan_wait,
+        triggered_by="soft_meta_invoke", inputs={"user_message": "need info"},
+        session_key="sess-wait", turn_id="turn-wait",
+    )
+    assert w.try_claim_awaiting(
+        run_id=rid_wait,
+        step_id="collect",
+        schema_json='{"mode":"form","fields":[]}',
+        session_id="sess-wait",
+        inputs_json='{"user_message":"need info"}',
+        step_outputs_json="{}",
+        awaiting_since=1700000000.0,
+    ) is True
     w.close()
 
     monkeypatch.setenv("OPENSQUILLA_META_RUNS_DB", db)
-    return {"db": db, "rid_ok": rid_ok, "rid_fail": rid_fail}
+    return {
+        "db": db,
+        "rid_ok": rid_ok,
+        "rid_fail": rid_fail,
+        "rid_wait": rid_wait,
+    }
 
 
 def test_runs_list(runner: CliRunner, seeded_db) -> None:
     result = runner.invoke(cli_app, ["skills", "meta", "runs", "list", "--json"])
     assert result.exit_code == 0, result.output
     data = json.loads(result.output)
-    assert len(data) == 2
+    assert len(data) == 3
 
 
 def test_runs_list_filter_status(runner: CliRunner, seeded_db) -> None:
@@ -196,6 +220,119 @@ def test_runs_replay_dry_run(runner: CliRunner, seeded_db) -> None:
     assert data["meta_skill_name"] == "alpha-skill"
     assert data["plan_source"] == "historical_snapshot"
     assert len(data["steps"]) == 1
+
+
+def test_runs_recover_cancel_requires_confirm(
+    runner: CliRunner,
+    seeded_db,
+) -> None:
+    result = runner.invoke(
+        cli_app,
+        [
+            "skills",
+            "meta",
+            "runs",
+            "recover",
+            seeded_db["rid_wait"],
+            "--action",
+            "cancel_run",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 2
+    data = json.loads(result.output)
+    assert data["status"] == "requires_confirmation"
+    assert "Cancel this awaiting MetaSkill run" in data["confirmation_prompt"]
+
+    w = open_meta_run_writer(seeded_db["db"])
+    try:
+        rec = w.get_run(seeded_db["rid_wait"])
+    finally:
+        w.close()
+    assert rec is not None
+    assert rec.status == "awaiting_user"
+
+
+def test_runs_recover_cancel_awaiting_run(
+    runner: CliRunner,
+    seeded_db,
+) -> None:
+    result = runner.invoke(
+        cli_app,
+        [
+            "skills",
+            "meta",
+            "runs",
+            "recover",
+            seeded_db["rid_wait"],
+            "--action",
+            "cancel_run",
+            "--confirm",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["status"] == "cancelled"
+    assert data["action"] == "cancel_run"
+
+    w = open_meta_run_writer(seeded_db["db"])
+    try:
+        rec = w.get_run(seeded_db["rid_wait"])
+    finally:
+        w.close()
+    assert rec is not None
+    assert rec.status == "cancelled"
+    assert rec.error is not None
+    assert "cli_recover_cancel_run" in rec.error
+
+
+def test_runs_recover_cancel_rejects_finished_run(
+    runner: CliRunner,
+    seeded_db,
+) -> None:
+    result = runner.invoke(
+        cli_app,
+        [
+            "skills",
+            "meta",
+            "runs",
+            "recover",
+            seeded_db["rid_ok"],
+            "--action",
+            "cancel_run",
+            "--confirm",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 2
+    data = json.loads(result.output)
+    assert data["status"] == "not_applicable"
+    assert "awaiting_user" in data["reason"]
+
+
+def test_runs_recover_reports_unsupported_action(
+    runner: CliRunner,
+    seeded_db,
+) -> None:
+    result = runner.invoke(
+        cli_app,
+        [
+            "skills",
+            "meta",
+            "runs",
+            "recover",
+            seeded_db["rid_fail"],
+            "--action",
+            "retry_run",
+            "--confirm",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 2
+    data = json.loads(result.output)
+    assert data["status"] == "unsupported"
+    assert data["action"] == "retry_run"
 
 
 def test_runs_show_bad_id(runner: CliRunner, seeded_db) -> None:
