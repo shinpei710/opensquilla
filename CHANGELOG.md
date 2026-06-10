@@ -36,6 +36,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `resume_after_user_input` payloads with `--fields-json`, returning the
   awaiting schema, filled fields, missing fields, and a clear gateway-required
   boundary without claiming or resuming the run from CLI-only context.
+- WebChat `chat.clarify_submit` now reuses the same MetaSkill resume-input
+  validator when a MetaRunWriter is available, rejecting run mismatches or
+  schema-invalid form submissions before accepting a runtime turn.
 
 ### Changed
 

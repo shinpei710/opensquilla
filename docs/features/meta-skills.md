@@ -230,6 +230,14 @@ payload status becomes `prepared` when validation succeeds, but the run remains
 `awaiting_user`; the actual resume still requires a live gateway/runtime
 surface to claim the row and continue the DAG.
 
+Gateway surfaces use the same validation contract for structured form
+submissions. When WebChat calls `chat.clarify_submit`, the gateway checks the
+submitted fields against the persisted awaiting schema and rejects run-id
+mismatches or invalid fields before accepting a runtime turn. Valid submissions
+still flow through the normal session runtime so the existing
+`awaiting_user -> running` compare-and-swap and streaming resume path remain
+the single execution path.
+
 ## Proposals
 
 Meta-skill creation workflows may write proposals before they become managed

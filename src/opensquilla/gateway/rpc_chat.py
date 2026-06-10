@@ -12,9 +12,19 @@ from opensquilla.chat.history import transcript_entries_to_chat_messages
 from opensquilla.chat.source import chat_source_metadata
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.context_overflow import apply_context_overflow_policy
-from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
+from opensquilla.gateway.rpc import (
+    RpcContext,
+    RpcHandlerError,
+    RpcUnavailableError,
+    get_dispatcher,
+)
 from opensquilla.session.compaction import build_compaction_config_from_provider
 from opensquilla.session.keys import build_webchat_key, canonicalize_session_key, parse_agent_id
+from opensquilla.skills.meta.recovery_input import (
+    clarify_value_to_string,
+    resume_input_protocol_payload,
+    validate_resume_input,
+)
 
 _d = get_dispatcher()
 log = structlog.get_logger(__name__)
@@ -526,12 +536,69 @@ def _clarify_fields_to_text(fields: dict[str, object]) -> str:
     for key, value in fields.items():
         if value is None or value == "":
             continue
-        if isinstance(value, bool):
-            rendered = "true" if value else "false"
-        else:
-            rendered = str(value)
-        lines.append(f"{key}: {rendered}")
+        lines.append(f"{key}: {clarify_value_to_string(value)}")
     return "\n".join(lines)
+
+
+def _meta_run_writer_from_context(ctx: RpcContext) -> Any | None:
+    turn_runner = getattr(ctx, "turn_runner", None)
+    if turn_runner is None:
+        return None
+    return getattr(turn_runner, "_meta_run_writer", None)
+
+
+def _clarify_submit_run_id(params: dict) -> str:
+    raw = params.get("run_id")
+    if raw is None:
+        raw = params.get("runId")
+    return str(raw or "").strip()
+
+
+def _validate_clarify_submit(
+    *,
+    ctx: RpcContext,
+    session_key: str,
+    run_id: str,
+    fields: dict[str, object],
+) -> dict[str, Any] | None:
+    writer = _meta_run_writer_from_context(ctx)
+    if writer is None:
+        return None
+
+    awaiting = writer.peek_awaiting(session_id=session_key)
+    if awaiting is None:
+        raise RpcHandlerError(
+            "meta_clarify.not_awaiting",
+            "No awaiting MetaSkill run exists for this session.",
+            details={"sessionKey": session_key, "run_id": run_id or None},
+        )
+    if run_id and awaiting.run_id != run_id:
+        raise RpcHandlerError(
+            "meta_clarify.run_mismatch",
+            "Submitted run_id does not match the awaiting MetaSkill run.",
+            details={
+                "sessionKey": session_key,
+                "run_id": run_id,
+                "awaiting_run_id": awaiting.run_id,
+            },
+        )
+
+    validation = validate_resume_input(
+        awaiting_schema_json=awaiting.awaiting_schema_json,
+        awaiting_filled_json=awaiting.awaiting_filled_json,
+        submitted_fields=fields,
+    )
+    if not validation.ok:
+        raise RpcHandlerError(
+            "meta_clarify.validation_error",
+            "Submitted user input does not satisfy the awaiting schema.",
+            details=resume_input_protocol_payload(
+                awaiting=awaiting,
+                validation=validation,
+                gateway_required=False,
+            ),
+        )
+    return validation.filled_fields
 
 
 @_d.method("chat.clarify_submit", scope="operator.write")
@@ -541,20 +608,21 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
     Params:
       ``sessionKey``  (str)  — same WebChat session that triggered the pause
       ``fields``      (dict) — ``{field_name: value}`` collected by the form
-      ``run_id``      (str, optional) — awaiting run id for trace/log only;
-                                          the awaiting branch in meta_resolution
-                                          uses ``session_key`` for the CAS
+      ``run_id``      (str, optional) — awaiting run id to validate before
+                                          routing through the runtime
 
     The fields dict is serialised into ``key: value\\n`` text and fed
     into the regular ``chat.send`` path so meta_resolution's awaiting
-    branch picks it up. This is purely a convenience surface — clients
-    can equivalently call ``chat.send`` with the same text.
+    branch picks it up. When the gateway has a MetaRunWriter, the submission
+    is validated against the persisted awaiting schema before any chat turn is
+    accepted.
     """
     if not isinstance(params, dict):
         raise ValueError("params required: sessionKey, fields")
     fields = params.get("fields")
     if not isinstance(fields, dict) or not fields:
         raise ValueError("params.fields must be a non-empty mapping")
+    fields = {str(key): value for key, value in fields.items()}
 
     session_key = _canonical_webchat_session_key(params.get("sessionKey"))
     text = _clarify_fields_to_text(fields)
@@ -571,8 +639,17 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
         # form submits from typed replies downstream.
         "inputProvenance": "clarify_form",
     }
-    run_id = params.get("run_id")
-    if isinstance(run_id, str) and run_id:
+    run_id = _clarify_submit_run_id(params)
+    validated_fields = _validate_clarify_submit(
+        ctx=ctx,
+        session_key=session_key,
+        run_id=run_id,
+        fields=fields,
+    )
+    if validated_fields is not None:
+        text = _clarify_fields_to_text(validated_fields)
+        send_params["message"] = text
+    if run_id:
         send_params["_source"] = {
             "caller_kind": "web",
             "channel_kind": "webchat",
