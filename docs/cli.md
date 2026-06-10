@@ -153,6 +153,9 @@ opensquilla skills meta runs list
 opensquilla skills meta runs show <run-id>
 opensquilla skills meta runs steps <run-id>
 opensquilla skills meta runs replay <run-id> --dry-run
+opensquilla skills meta runs recover <run-id> --action cancel_run --confirm
+opensquilla skills meta runs recover <run-id> --action resume_after_user_input --fields-json '{"field":"value"}' --json
+opensquilla skills meta runs recover <run-id> --action resume_after_user_input --fields-json '{"field":"value"}' --confirm --gateway
 ```
 
 Use `skills inspect` when you want to see the compiled step plan for a

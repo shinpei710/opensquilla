@@ -118,6 +118,142 @@ Preview replay shape without executing live work:
 opensquilla skills meta runs replay <run-id> --dry-run
 ```
 
+## Metacognitive Monitoring
+
+MetaSkill runs now attach an observational metacognition report to the terminal
+`MetaResult`. The report is a lightweight reliability snapshot, not an
+auto-rewrite policy:
+
+- run state: total, started, finished, skipped, failed, paused, and failover
+  counts;
+- completion evidence: whether the run completed, paused, produced final text,
+  and captured step outputs;
+- reliability signals: empty outputs, hard failures, failovers, missing inputs,
+  and pause events.
+
+This first layer deliberately avoids changing the workflow plan while it runs.
+It gives replay, diagnostics, and future control policies a stable state model
+before OpenSquilla attempts stronger interventions such as pausing a run,
+switching a MetaSkill, or requiring additional verification.
+
+The report is also surfaced through the normal execution tools:
+
+- clean `passed` reports stay quiet so successful `meta_invoke` output is not
+  polluted;
+- non-passing decisions add a compact `Metacognitive decision:` notice to the
+  terminal `meta_invoke` tool result;
+- completed reports are stored on `meta_skill_runs.metacognition_json` and are
+  visible with `opensquilla skills meta runs show <run-id>` or its `--json`
+  output.
+
+### Metacognitive Completion Gate
+
+The report now feeds a conservative completion-gate decision:
+
+- `pass`: no completion issues were detected;
+- `warn`: a deliverable exists, but warning signals should remain visible;
+- `block`: the run should not be treated as a normal completed answer;
+- `needs_review`: the run paused or requires user/operator attention before
+  completion.
+
+This policy still does not rewrite the DAG or auto-select a different
+MetaSkill. It creates a stable decision boundary first: `meta_invoke` can avoid
+presenting blocked results as ordinary success, while `skills meta runs show`
+and `--json` expose the stored `metacognition_decision`.
+
+### Controlled Recovery
+
+Completion-gate decisions also produce a `metacognition_recovery` plan with a
+machine-readable `primary_action` and ordered `options`. Examples include
+`deliver_with_warning`, `regenerate_final_text`, `collect_user_input`,
+`retry_or_fallback`, and `inspect_run`.
+
+Most recovery plans are advisory. They are persisted on
+`meta_skill_runs.metacognition_recovery_json` and surfaced in `meta_invoke`
+tool results so operators can see the next safe action.
+
+Each recovery option now carries an `execution` contract that tells surfaces
+how to treat it:
+
+- `mode=automatic`: the orchestrator may run the action inside a bounded
+  policy;
+- `mode=confirm`: a surface may offer a confirm/cancel action, but runtime must
+  not execute it without user confirmation;
+- `mode=manual`: the operator should inspect or perform the action manually;
+- `mode=surface`: the surface can deliver or display the result without a new
+  runtime action.
+
+OpenSquilla can now execute one bounded recovery action automatically:
+`regenerate_final_text`. It only runs when the completion gate blocked a
+successful MetaSkill run because no user-facing final text was produced, the
+recovery plan names `regenerate_final_text` as its `primary_action`, an
+`llm_chat` dependency is available, and at least one captured step output is
+non-empty. The orchestrator synthesizes a final answer from those existing
+step outputs, refreshes the metacognition report, and records the execution
+result on `meta_skill_runs.metacognition_recovery_result_json`.
+
+This recovery does not rerun the DAG, switch MetaSkills, retry failed steps, or
+execute arbitrary recovery options. Skipped and failed attempts are written
+back into the matching option's `execution.last_status`, so `meta_invoke` and
+`skills meta runs show` can explain why no recovery was applied.
+
+### CLI Recovery Execution
+
+The first confirmation-gated CLI recovery action is available for awaiting
+runs:
+
+```sh
+opensquilla skills meta runs recover <run-id> --action cancel_run --confirm
+```
+
+Without `--confirm`, the command prints the confirmation prompt and leaves the
+run unchanged. In this release, `cancel_run` is the only CLI-executable
+recovery action. Higher-impact actions such as `retry_run` and
+`fallback_to_normal_turn` remain visible in the recovery contract but return an
+explicit unsupported status until their gateway/runtime execution paths are
+implemented.
+
+The CLI can also validate and prepare `resume_after_user_input` payloads for an
+awaiting run:
+
+```sh
+opensquilla skills meta runs recover <run-id> \
+  --action resume_after_user_input \
+  --fields-json '{"destination":"Tokyo","days":5}' \
+  --json
+```
+
+Without `--confirm`, this behaves as a dry run: it returns the awaiting schema,
+required fields, submitted fields, filled fields, missing fields, and the
+confirmation prompt while leaving the run unchanged. With `--confirm`, the
+payload status becomes `prepared` when validation succeeds, but the run remains
+`awaiting_user`; the actual resume still requires a live gateway/runtime
+surface to claim the row and continue the DAG.
+
+To hand the validated payload to a running gateway from the CLI, add
+`--gateway`:
+
+```sh
+opensquilla skills meta runs recover <run-id> \
+  --action resume_after_user_input \
+  --fields-json '{"destination":"Tokyo","days":5}' \
+  --confirm \
+  --gateway
+```
+
+This calls `chat.clarify_submit` on the configured gateway. The CLI still does
+not claim the row directly; the gateway accepts the submitted fields as a
+normal session turn, then the existing runtime path performs the
+`awaiting_user -> running` compare-and-swap and streams the resumed DAG.
+
+Gateway surfaces use the same validation contract for structured form
+submissions. When WebChat calls `chat.clarify_submit`, the gateway checks the
+submitted fields against the persisted awaiting schema and rejects run-id
+mismatches or invalid fields before accepting a runtime turn. Valid submissions
+still flow through the normal session runtime so the existing
+`awaiting_user -> running` compare-and-swap and streaming resume path remain
+the single execution path.
+
 ## Proposals
 
 Meta-skill creation workflows may write proposals before they become managed

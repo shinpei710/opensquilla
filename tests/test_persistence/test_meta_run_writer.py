@@ -73,7 +73,17 @@ def test_begin_finish_run_roundtrip(writer: MetaRunWriter) -> None:
     writer.finish_run_sync(
         run_id=run_id,
         status="ok",
-        result=MetaResult(ok=True, final_text="hello"),
+        result=MetaResult(
+            ok=True,
+            final_text="hello",
+            metacognition_recovery_result={
+                "action": "regenerate_final_text",
+                "status": "applied",
+                "reason": "Final text was synthesized from captured step outputs.",
+                "final_text_changed": True,
+                "final_text_chars": 5,
+            },
+        ),
     )
 
     record = writer.get_run(run_id)
@@ -86,6 +96,8 @@ def test_begin_finish_run_roundtrip(writer: MetaRunWriter) -> None:
     assert record.owner_pid == os.getpid()
     assert record.plan_snapshot_json  # non-empty
     assert len(record.meta_skill_digest) == 64  # sha256 hex
+    assert record.metacognition_recovery_result_json is not None
+    assert '"status": "applied"' in record.metacognition_recovery_result_json
 
 
 def test_step_lifecycle(writer: MetaRunWriter) -> None:
