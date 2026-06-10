@@ -39,6 +39,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - WebChat `chat.clarify_submit` now reuses the same MetaSkill resume-input
   validator when a MetaRunWriter is available, rejecting run mismatches or
   schema-invalid form submissions before accepting a runtime turn.
+- `opensquilla skills meta runs recover --action resume_after_user_input` can
+  now submit a validated payload to a live gateway with `--confirm --gateway`,
+  routing through `chat.clarify_submit` so the runtime keeps ownership of the
+  awaiting-run claim and DAG continuation.
 
 ### Changed
 

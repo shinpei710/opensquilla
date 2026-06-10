@@ -347,6 +347,69 @@ def _print_resume_recovery_payload(payload: dict[str, Any]) -> None:
             "filled_fields: "
             + json.dumps(filled, ensure_ascii=False, sort_keys=True),
         )
+    gateway_response = payload.get("gateway_response")
+    if isinstance(gateway_response, dict):
+        typer.echo(
+            "gateway_response: "
+            + json.dumps(gateway_response, ensure_ascii=False, sort_keys=True),
+        )
+
+
+def _submit_resume_to_gateway(
+    *,
+    payload: dict[str, Any],
+    gateway_url: str | None,
+    config_path: Path | None,
+    json_out: bool,
+) -> dict[str, Any]:
+    from opensquilla.cli.gateway_rpc import run_gateway_sync
+
+    run_id = str(payload["run_id"])
+    session_key = str(payload.get("awaiting_session_id") or "")
+    fields = payload.get("filled_fields")
+    if not session_key or not isinstance(fields, dict) or not fields:
+        extra = {
+            k: v
+            for k, v in payload.items()
+            if k not in {"run_id", "action", "status", "reason"}
+        }
+        return _recover_payload(
+            run_id=run_id,
+            action=str(payload["action"]),
+            status="validation_error",
+            reason="Prepared resume payload is missing session or fields.",
+            extra=extra,
+        )
+
+    async def _run(client: Any) -> Any:
+        return await client.call(
+            "chat.clarify_submit",
+            {
+                "sessionKey": session_key,
+                "run_id": run_id,
+                "fields": fields,
+            },
+        )
+
+    gateway_response = run_gateway_sync(
+        _run,
+        gateway_url=gateway_url,
+        config_path=config_path,
+        json_output=json_out,
+    )
+    submitted = dict(payload)
+    submitted.update(
+        {
+            "status": "submitted",
+            "reason": (
+                "Submitted validated user input to the live gateway; "
+                "runtime will claim and resume the awaiting MetaSkill run."
+            ),
+            "gateway_required": False,
+            "gateway_response": gateway_response,
+        }
+    )
+    return submitted
 
 
 def _metacognition_counts_text(summary: dict[str, Any]) -> str:
@@ -673,6 +736,21 @@ def runs_recover(
         "--confirm",
         help="Actually execute confirmation-gated recovery actions",
     ),
+    gateway: bool = typer.Option(
+        False,
+        "--gateway",
+        help="Submit a validated resume_after_user_input payload to a live gateway",
+    ),
+    gateway_url: str | None = typer.Option(
+        None,
+        "--gateway-url",
+        help="Gateway WebSocket URL for --gateway",
+    ),
+    config_path: Path | None = typer.Option(
+        None,
+        "--config",
+        help="Gateway config path used to resolve URL/auth for --gateway",
+    ),
     reason: str = typer.Option(
         "cli_recover_cancel_run",
         "--reason",
@@ -745,6 +823,13 @@ def runs_recover(
                 fields_json=fields_json,
                 confirm=confirm,
             )
+            if exit_code == 0 and gateway:
+                payload = _submit_resume_to_gateway(
+                    payload=payload,
+                    gateway_url=gateway_url,
+                    config_path=config_path,
+                    json_out=json_out,
+                )
             if json_out:
                 typer.echo(json.dumps(payload, default=str))
             else:

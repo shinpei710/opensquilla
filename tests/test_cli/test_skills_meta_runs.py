@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -407,7 +408,16 @@ def test_runs_recover_resume_reports_missing_required_fields(
 def test_runs_recover_resume_confirm_prepares_payload_without_claiming(
     runner: CliRunner,
     seeded_db,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    def _unexpected_gateway(*args, **kwargs):
+        raise AssertionError("--gateway was not passed; gateway RPC must not run")
+
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_rpc.run_gateway_sync",
+        _unexpected_gateway,
+    )
+
     result = runner.invoke(
         cli_app,
         [
@@ -434,6 +444,75 @@ def test_runs_recover_resume_confirm_prepares_payload_without_claiming(
         "budget": "high",
     }
     assert data["validation_errors"] == []
+
+    w = open_meta_run_writer(seeded_db["db"])
+    try:
+        rec = w.get_run(seeded_db["rid_wait"])
+    finally:
+        w.close()
+    assert rec is not None
+    assert rec.status == "awaiting_user"
+
+
+def test_runs_recover_resume_gateway_submits_validated_payload(
+    runner: CliRunner,
+    seeded_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class _FakeClient:
+        async def call(self, method: str, params: dict | None = None):
+            calls.append({"method": method, "params": params})
+            return {"ok": True, "status": "accepted", "task_id": "task-1"}
+
+    def _fake_gateway_sync(action, *, gateway_url=None, config_path=None, json_output=False):
+        calls.append({
+            "gateway_url": gateway_url,
+            "config_path": str(config_path) if config_path is not None else None,
+            "json_output": json_output,
+        })
+        return asyncio.run(action(_FakeClient()))
+
+    monkeypatch.setattr(
+        "opensquilla.cli.gateway_rpc.run_gateway_sync",
+        _fake_gateway_sync,
+    )
+
+    result = runner.invoke(
+        cli_app,
+        [
+            "skills",
+            "meta",
+            "runs",
+            "recover",
+            seeded_db["rid_wait"],
+            "--action",
+            "resume_after_user_input",
+            "--fields-json",
+            json.dumps({"destination": "Tokyo", "days": 5}),
+            "--confirm",
+            "--gateway",
+            "--gateway-url",
+            "ws://127.0.0.1:18791/ws",
+            "--json",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["status"] == "submitted"
+    assert data["gateway_required"] is False
+    assert data["gateway_response"]["status"] == "accepted"
+
+    rpc_call = calls[1]
+    assert rpc_call["method"] == "chat.clarify_submit"
+    assert rpc_call["params"] == {
+        "sessionKey": "sess-wait",
+        "run_id": seeded_db["rid_wait"],
+        "fields": {"destination": "Tokyo", "days": 5},
+    }
+    assert calls[0]["gateway_url"] == "ws://127.0.0.1:18791/ws"
+    assert calls[0]["json_output"] is True
 
     w = open_meta_run_writer(seeded_db["db"])
     try:

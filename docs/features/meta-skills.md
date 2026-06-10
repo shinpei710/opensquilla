@@ -230,6 +230,22 @@ payload status becomes `prepared` when validation succeeds, but the run remains
 `awaiting_user`; the actual resume still requires a live gateway/runtime
 surface to claim the row and continue the DAG.
 
+To hand the validated payload to a running gateway from the CLI, add
+`--gateway`:
+
+```sh
+opensquilla skills meta runs recover <run-id> \
+  --action resume_after_user_input \
+  --fields-json '{"destination":"Tokyo","days":5}' \
+  --confirm \
+  --gateway
+```
+
+This calls `chat.clarify_submit` on the configured gateway. The CLI still does
+not claim the row directly; the gateway accepts the submitted fields as a
+normal session turn, then the existing runtime path performs the
+`awaiting_user -> running` compare-and-swap and streams the resumed DAG.
+
 Gateway surfaces use the same validation contract for structured form
 submissions. When WebChat calls `chat.clarify_submit`, the gateway checks the
 submitted fields against the persisted awaiting schema and rejects run-id
