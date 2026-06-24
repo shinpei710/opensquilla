@@ -8,6 +8,42 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- MetaSkill runs now attach an observational metacognition report with run
+  state, completion evidence, and reliability signals for future controller
+  policies.
+- MetaSkill metacognition reports are now persisted and surfaced through
+  warning/blocked `meta_invoke` tool results and `skills meta runs show`.
+- MetaSkill runs now derive a metacognitive completion-gate decision
+  (`pass`, `warn`, `block`, or `needs_review`) so blocked results are not
+  presented as ordinary successful completions.
+- MetaSkill completion decisions now include controlled recovery plans with
+  machine-readable actions such as `regenerate_final_text`,
+  `collect_user_input`, and `retry_or_fallback`; these plans are persisted and
+  surfaced but not executed automatically.
+- MetaSkill metacognition can now execute the first bounded recovery action:
+  `regenerate_final_text` synthesizes missing final text from captured
+  non-empty step outputs, records the recovery result, and keeps all other
+  recovery options advisory.
+- MetaSkill recovery options now include an execution contract describing
+  whether each action is automatic, confirmation-gated, manual-only, or a
+  surface display action, with skipped/failed automatic attempts reflected
+  back into the option state.
+- `opensquilla skills meta runs recover` can now execute the first
+  confirmation-gated recovery action: `cancel_run` for awaiting MetaSkill runs.
+  Other recovery actions return explicit unsupported status until their
+  runtime execution paths exist.
+- `opensquilla skills meta runs recover` can now validate and prepare
+  `resume_after_user_input` payloads with `--fields-json`, returning the
+  awaiting schema, filled fields, missing fields, and a clear gateway-required
+  boundary without claiming or resuming the run from CLI-only context.
+- WebChat `chat.clarify_submit` now reuses the same MetaSkill resume-input
+  validator when a MetaRunWriter is available, rejecting run mismatches or
+  schema-invalid form submissions before accepting a runtime turn.
+- `opensquilla skills meta runs recover --action resume_after_user_input` can
+  now submit a validated payload to a live gateway with `--confirm --gateway`,
+  routing through `chat.clarify_submit` so the runtime keeps ownership of the
+  awaiting-run claim and DAG continuation.
+
 ### Changed
 
 ### Fixed

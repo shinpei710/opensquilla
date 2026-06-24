@@ -15,11 +15,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from opensquilla.gateway.rpc import RpcContext
+from opensquilla.gateway.rpc import RpcContext, RpcHandlerError
 from opensquilla.gateway.rpc_chat import (
     _clarify_fields_to_text,
     _handle_chat_clarify_submit,
 )
+from opensquilla.persistence.meta_run_writer import AwaitingPeek
 from opensquilla.skills.meta.clarify_text import parse_clarify_reply
 from opensquilla.skills.meta.types import ClarifyField, ClarifyStepConfig
 
@@ -90,6 +91,53 @@ def test_clarify_fields_to_text_roundtrips_through_real_parser():
 
 
 # ── RPC handler ──
+
+
+def _awaiting(
+    *,
+    run_id: str = "r-await",
+    session_id: str = "agent:main:webchat:abc",
+    filled_json: str = "{}",
+) -> AwaitingPeek:
+    return AwaitingPeek(
+        run_id=run_id,
+        step_id="collect",
+        awaiting_since=1700000000.0,
+        awaiting_session_id=session_id,
+        awaiting_schema_json=(
+            '{"mode":"form","fields":['
+            '{"name":"destination","type":"string","required":true},'
+            '{"name":"days","type":"int","required":true,"min":1,"max":30}'
+            ']}'
+        ),
+        awaiting_filled_json=filled_json,
+        step_outputs_json="{}",
+        inputs_json="{}",
+        parse_failure_count=0,
+    )
+
+
+class _FakeMetaRunWriter:
+    def __init__(self, awaiting: AwaitingPeek | None) -> None:
+        self.awaiting = awaiting
+        self.peeked_sessions: list[str] = []
+
+    def peek_awaiting(self, *, session_id: str) -> AwaitingPeek | None:
+        self.peeked_sessions.append(session_id)
+        if self.awaiting is None:
+            return None
+        if self.awaiting.awaiting_session_id != session_id:
+            return None
+        return self.awaiting
+
+
+def _ctx_with_writer(writer: _FakeMetaRunWriter) -> RpcContext:
+    return RpcContext(
+        conn_id="c",
+        principal=SimpleNamespace(role="operator"),
+        turn_runner=SimpleNamespace(_meta_run_writer=writer),
+    )
+
 
 @pytest.mark.asyncio
 async def test_clarify_submit_rejects_non_dict_params():
@@ -185,3 +233,91 @@ async def test_clarify_submit_works_without_run_id(monkeypatch):
         ctx,
     )
     assert "_source" not in captured["send_params"]
+
+
+@pytest.mark.asyncio
+async def test_clarify_submit_validates_schema_before_forwarding(monkeypatch):
+    captured: dict = {}
+
+    async def _fake_send(send_params, ctx):
+        captured["send_params"] = send_params
+        return {"ok": True, "sessionKey": send_params["sessionKey"]}
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_chat._handle_chat_send",
+        _fake_send,
+    )
+
+    writer = _FakeMetaRunWriter(
+        _awaiting(filled_json='{"destination":"Tokyo"}'),
+    )
+    ctx = _ctx_with_writer(writer)
+    result = await _handle_chat_clarify_submit(
+        {
+            "sessionKey": "agent:main:webchat:abc",
+            "run_id": "r-await",
+            "fields": {"days": "5"},
+        },
+        ctx,
+    )
+
+    assert result["ok"] is True
+    assert writer.peeked_sessions == ["agent:main:webchat:abc"]
+    message = captured["send_params"]["message"]
+    assert "destination: Tokyo" in message
+    assert "days: 5" in message
+
+
+@pytest.mark.asyncio
+async def test_clarify_submit_validation_error_does_not_forward(monkeypatch):
+    async def _fake_send(send_params, ctx):  # pragma: no cover - must not run
+        raise AssertionError("chat.send should not be called for invalid fields")
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_chat._handle_chat_send",
+        _fake_send,
+    )
+
+    writer = _FakeMetaRunWriter(_awaiting())
+    ctx = _ctx_with_writer(writer)
+    with pytest.raises(RpcHandlerError) as excinfo:
+        await _handle_chat_clarify_submit(
+            {
+                "sessionKey": "agent:main:webchat:abc",
+                "run_id": "r-await",
+                "fields": {"destination": "Tokyo"},
+            },
+            ctx,
+        )
+
+    exc = excinfo.value
+    assert exc.code == "meta_clarify.validation_error"
+    assert exc.details["missing_fields"] == ["days"]
+    assert exc.details["filled_fields"] == {"destination": "Tokyo"}
+
+
+@pytest.mark.asyncio
+async def test_clarify_submit_rejects_run_id_mismatch(monkeypatch):
+    async def _fake_send(send_params, ctx):  # pragma: no cover - must not run
+        raise AssertionError("chat.send should not be called for mismatched run")
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_chat._handle_chat_send",
+        _fake_send,
+    )
+
+    writer = _FakeMetaRunWriter(_awaiting(run_id="r-real"))
+    ctx = _ctx_with_writer(writer)
+    with pytest.raises(RpcHandlerError) as excinfo:
+        await _handle_chat_clarify_submit(
+            {
+                "sessionKey": "agent:main:webchat:abc",
+                "runId": "r-submitted",
+                "fields": {"destination": "Tokyo", "days": 5},
+            },
+            ctx,
+        )
+
+    exc = excinfo.value
+    assert exc.code == "meta_clarify.run_mismatch"
+    assert exc.details["awaiting_run_id"] == "r-real"

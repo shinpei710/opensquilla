@@ -23,7 +23,17 @@ from opensquilla.persistence.meta_run_writer import (
     StepRecord,
     open_meta_run_writer,
 )
+from opensquilla.skills.meta.metacognition import (
+    decide_completion,
+    format_recovery_option_brief,
+    plan_recovery,
+    summarize_report,
+)
 from opensquilla.skills.meta.parser import parse_meta_plan
+from opensquilla.skills.meta.recovery_input import (
+    resume_input_protocol_payload,
+    validate_resume_input_json,
+)
 from opensquilla.skills.meta.types import MetaPlan
 
 meta_app = typer.Typer(
@@ -95,6 +105,25 @@ def _parse_since(value: str | None) -> int | None:
 def _serialize_record(rec: RunRecord) -> dict[str, Any]:
     d = asdict(rec)
     d["steps"] = [asdict(s) for s in rec.steps]
+    report_raw = d.pop("metacognition_json", None)
+    decision_raw = d.pop("metacognition_decision_json", None)
+    recovery_raw = d.pop("metacognition_recovery_json", None)
+    recovery_result_raw = d.pop("metacognition_recovery_result_json", None)
+    report = _parse_metacognition_json(report_raw)
+    decision = _decision_from_json_or_report(
+        decision_raw,
+        report,
+    )
+    d["metacognition"] = report
+    d["metacognition_decision"] = decision
+    d["metacognition_recovery"] = _recovery_from_json_or_decision(
+        recovery_raw,
+        report,
+        decision,
+    )
+    d["metacognition_recovery_result"] = _parse_metacognition_json(
+        recovery_result_raw,
+    )
     return d
 
 
@@ -113,6 +142,286 @@ def _print_runs_table(rows: list[RunRecord]) -> None:
             f"{r.run_id:28} {r.meta_skill_name:30.30} {r.status:10} "
             f"{r.triggered_by:17} {started}"
         )
+
+
+def _parse_metacognition_json(raw: str | None) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"status": "unknown", "summary": "Stored report is not valid JSON."}
+    return payload if isinstance(payload, dict) else None
+
+
+def _decision_from_json_or_report(
+    raw: str | None,
+    report: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    decision = _parse_metacognition_json(raw)
+    if decision is not None:
+        return decision
+    return decide_completion(report)
+
+
+def _recovery_from_json_or_decision(
+    raw: str | None,
+    report: dict[str, Any] | None,
+    decision: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    recovery = _parse_metacognition_json(raw)
+    if recovery is not None:
+        return recovery
+    return plan_recovery(report, decision)
+
+
+def _recovery_option_by_id(
+    recovery: dict[str, Any] | None,
+    action: str,
+) -> dict[str, Any] | None:
+    if not recovery:
+        return None
+    for option in recovery.get("options", []):
+        if isinstance(option, dict) and option.get("id") == action:
+            return option
+    return None
+
+
+def _confirmation_prompt_for_action(
+    action: str,
+    option: dict[str, Any] | None,
+) -> str:
+    execution = option.get("execution") if isinstance(option, dict) else None
+    if isinstance(execution, dict):
+        prompt = str(execution.get("confirmation_prompt") or "").strip()
+        if prompt:
+            return prompt
+    if action == "cancel_run":
+        return "Cancel this awaiting MetaSkill run?"
+    return f"Confirm recovery action {action!r}?"
+
+
+def _recover_payload(
+    *,
+    run_id: str,
+    action: str,
+    status: str,
+    reason: str,
+    confirmation_prompt: str = "",
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "action": action,
+        "status": status,
+        "reason": reason,
+    }
+    if confirmation_prompt:
+        payload["confirmation_prompt"] = confirmation_prompt
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _prepare_resume_after_user_input(
+    *,
+    writer: MetaRunWriter,
+    rec: RunRecord,
+    run_id: str,
+    action: str,
+    prompt: str,
+    fields_json: str | None,
+    confirm: bool,
+) -> tuple[dict[str, Any], int]:
+    if rec.status != "awaiting_user":
+        return (
+            _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="not_applicable",
+                reason=(
+                    "resume_after_user_input only applies to runs in "
+                    "awaiting_user status."
+                ),
+                confirmation_prompt=prompt,
+            ),
+            2,
+        )
+    if not rec.session_key:
+        return (
+            _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="not_applicable",
+                reason="Awaiting run has no session_key; cannot locate form state.",
+                confirmation_prompt=prompt,
+            ),
+            2,
+        )
+
+    awaiting = writer.peek_awaiting(session_id=rec.session_key)
+    if awaiting is None or awaiting.run_id != run_id:
+        return (
+            _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="not_applicable",
+                reason="No matching awaiting_user form state found for this run.",
+                confirmation_prompt=prompt,
+            ),
+            2,
+        )
+
+    validation = validate_resume_input_json(
+        awaiting_schema_json=awaiting.awaiting_schema_json,
+        awaiting_filled_json=awaiting.awaiting_filled_json,
+        fields_json=fields_json,
+    )
+    extra = resume_input_protocol_payload(awaiting=awaiting, validation=validation)
+    if not validation.ok:
+        return (
+            _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="validation_error",
+                reason="Submitted user input does not satisfy the awaiting schema.",
+                confirmation_prompt=prompt,
+                extra=extra,
+            ),
+            2,
+        )
+
+    if not confirm:
+        return (
+            _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="requires_confirmation",
+                reason=(
+                    "User input payload is valid. Re-run with --confirm to "
+                    "prepare a gateway resume request."
+                ),
+                confirmation_prompt=prompt,
+                extra=extra,
+            ),
+            2,
+        )
+
+    return (
+        _recover_payload(
+            run_id=run_id,
+            action=action,
+            status="prepared",
+            reason=(
+                "User input payload validated. CLI does not claim or resume "
+                "the run; execute through a live gateway/runtime surface."
+            ),
+            confirmation_prompt=prompt,
+            extra=extra,
+        ),
+        0,
+    )
+
+
+def _print_resume_recovery_payload(payload: dict[str, Any]) -> None:
+    typer.echo(f"status: {payload['status']}")
+    typer.echo(f"reason: {payload['reason']}")
+    prompt = str(payload.get("confirmation_prompt") or "").strip()
+    if prompt:
+        typer.echo(f"confirmation_prompt: {prompt}")
+    field_names = payload.get("field_names") or []
+    if field_names:
+        typer.echo(f"fields: {', '.join(str(v) for v in field_names)}")
+    required = payload.get("required_fields") or []
+    if required:
+        typer.echo(f"required: {', '.join(str(v) for v in required)}")
+    missing = payload.get("missing_fields") or []
+    if missing:
+        typer.echo(f"missing: {', '.join(str(v) for v in missing)}")
+    errors = payload.get("validation_errors") or []
+    for err in errors:
+        typer.echo(f"error: {err}", err=True)
+    filled = payload.get("filled_fields") or {}
+    if filled:
+        typer.echo(
+            "filled_fields: "
+            + json.dumps(filled, ensure_ascii=False, sort_keys=True),
+        )
+    gateway_response = payload.get("gateway_response")
+    if isinstance(gateway_response, dict):
+        typer.echo(
+            "gateway_response: "
+            + json.dumps(gateway_response, ensure_ascii=False, sort_keys=True),
+        )
+
+
+def _submit_resume_to_gateway(
+    *,
+    payload: dict[str, Any],
+    gateway_url: str | None,
+    config_path: Path | None,
+    json_out: bool,
+) -> dict[str, Any]:
+    from opensquilla.cli.gateway_rpc import run_gateway_sync
+
+    run_id = str(payload["run_id"])
+    session_key = str(payload.get("awaiting_session_id") or "")
+    fields = payload.get("filled_fields")
+    if not session_key or not isinstance(fields, dict) or not fields:
+        extra = {
+            k: v
+            for k, v in payload.items()
+            if k not in {"run_id", "action", "status", "reason"}
+        }
+        return _recover_payload(
+            run_id=run_id,
+            action=str(payload["action"]),
+            status="validation_error",
+            reason="Prepared resume payload is missing session or fields.",
+            extra=extra,
+        )
+
+    async def _run(client: Any) -> Any:
+        return await client.call(
+            "chat.clarify_submit",
+            {
+                "sessionKey": session_key,
+                "run_id": run_id,
+                "fields": fields,
+            },
+        )
+
+    gateway_response = run_gateway_sync(
+        _run,
+        gateway_url=gateway_url,
+        config_path=config_path,
+        json_output=json_out,
+    )
+    submitted = dict(payload)
+    submitted.update(
+        {
+            "status": "submitted",
+            "reason": (
+                "Submitted validated user input to the live gateway; "
+                "runtime will claim and resume the awaiting MetaSkill run."
+            ),
+            "gateway_required": False,
+            "gateway_response": gateway_response,
+        }
+    )
+    return submitted
+
+
+def _metacognition_counts_text(summary: dict[str, Any]) -> str:
+    counts = summary.get("signal_counts", {})
+    if not isinstance(counts, dict):
+        return ""
+    parts = [
+        f"{name}={counts.get(name, 0)}"
+        for name in ("blocked", "warning", "info")
+        if counts.get(name, 0)
+    ]
+    return ", ".join(parts) if parts else "none"
 
 
 @runs_app.command("list")
@@ -181,6 +490,56 @@ def runs_show(
         typer.echo(f"final_text:    {rec.final_text[:200]}...")
     if rec.error:
         typer.echo(f"error:         {rec.error}")
+    report = _parse_metacognition_json(rec.metacognition_json)
+    decision = _decision_from_json_or_report(
+        rec.metacognition_decision_json,
+        report,
+    )
+    recovery = _recovery_from_json_or_decision(
+        rec.metacognition_recovery_json,
+        report,
+        decision,
+    )
+    recovery_result = _parse_metacognition_json(
+        rec.metacognition_recovery_result_json,
+    )
+    report_summary = summarize_report(report)
+    if report_summary is not None:
+        typer.echo(
+            "metacognition: "
+            f"{report_summary['status']} "
+            f"({_metacognition_counts_text(report_summary)})"
+        )
+        if report_summary["summary"]:
+            typer.echo(f"meta_summary:  {report_summary['summary']}")
+    if decision is not None:
+        typer.echo(f"meta_decision: {decision.get('action', 'unknown')}")
+        reason = str(decision.get("reason") or "").strip()
+        if reason:
+            typer.echo(f"decision_reason: {reason}")
+        next_step = str(decision.get("suggested_next_step") or "").strip()
+        if next_step:
+            typer.echo(f"decision_next: {next_step}")
+    if recovery is not None:
+        typer.echo(
+            "recovery:      "
+            f"{recovery.get('primary_action', 'none')}"
+        )
+        options = [
+            format_recovery_option_brief(option)
+            for option in recovery.get("options", [])
+            if isinstance(option, dict) and option.get("id")
+        ]
+        if options:
+            typer.echo(f"recovery_opts: {', '.join(options)}")
+    if recovery_result is not None:
+        typer.echo(
+            "recovery_result: "
+            f"{recovery_result.get('status', 'unknown')}"
+        )
+        reason = str(recovery_result.get("reason") or "").strip()
+        if reason:
+            typer.echo(f"recovery_detail: {reason}")
     typer.echo(f"steps:         {len(rec.steps)}")
 
 
@@ -361,6 +720,198 @@ def runs_replay(
     )
     typer.echo("Use --dry-run to inspect the DAG.", err=True)
     raise typer.Exit(2)
+
+
+@runs_app.command("recover")
+def runs_recover(
+    run_id: str = typer.Argument(...),
+    action: str = typer.Option(..., "--action", help="Recovery option id to execute"),
+    fields_json: str | None = typer.Option(
+        None,
+        "--fields-json",
+        help="JSON object of user_input fields for resume_after_user_input",
+    ),
+    confirm: bool = typer.Option(
+        False,
+        "--confirm",
+        help="Actually execute confirmation-gated recovery actions",
+    ),
+    gateway: bool = typer.Option(
+        False,
+        "--gateway",
+        help="Submit a validated resume_after_user_input payload to a live gateway",
+    ),
+    gateway_url: str | None = typer.Option(
+        None,
+        "--gateway-url",
+        help="Gateway WebSocket URL for --gateway",
+    ),
+    config_path: Path | None = typer.Option(
+        None,
+        "--config",
+        help="Gateway config path used to resolve URL/auth for --gateway",
+    ),
+    reason: str = typer.Option(
+        "cli_recover_cancel_run",
+        "--reason",
+        help="Audit reason for supported recovery actions",
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """Execute a supported confirmed recovery action for one run.
+
+    ``cancel_run`` can be executed directly for awaiting MetaSkill runs.
+    ``resume_after_user_input`` validates and prepares a payload, but still
+    requires a live gateway/runtime surface to claim and continue the DAG.
+    Other recovery options remain surfaced as contracts until their runtime
+    execution paths are implemented.
+    """
+    writer = _open_writer()
+    try:
+        rec = writer.get_run(run_id)
+        if rec is None:
+            payload = _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="not_found",
+                reason="Run not found.",
+            )
+            if json_out:
+                typer.echo(json.dumps(payload, default=str))
+            else:
+                typer.echo(f"run not found: {run_id}", err=True)
+            raise typer.Exit(2)
+
+        report = _parse_metacognition_json(rec.metacognition_json)
+        decision = _decision_from_json_or_report(
+            rec.metacognition_decision_json,
+            report,
+        )
+        recovery = _recovery_from_json_or_decision(
+            rec.metacognition_recovery_json,
+            report,
+            decision,
+        )
+        option = _recovery_option_by_id(recovery, action)
+        if (
+            option is None
+            and rec.status == "awaiting_user"
+            and action in {"cancel_run", "resume_after_user_input"}
+        ):
+            option = {
+                "id": action,
+                "execution": {
+                    "mode": "confirm",
+                    "state": "requires_confirmation",
+                    "confirmation_required": True,
+                    "confirmation_prompt": (
+                        "Cancel this awaiting MetaSkill run?"
+                        if action == "cancel_run"
+                        else "Resume this MetaSkill run using the collected user input?"
+                    ),
+                },
+            }
+        prompt = _confirmation_prompt_for_action(action, option)
+
+        if action == "resume_after_user_input":
+            payload, exit_code = _prepare_resume_after_user_input(
+                writer=writer,
+                rec=rec,
+                run_id=run_id,
+                action=action,
+                prompt=prompt,
+                fields_json=fields_json,
+                confirm=confirm,
+            )
+            if exit_code == 0 and gateway:
+                payload = _submit_resume_to_gateway(
+                    payload=payload,
+                    gateway_url=gateway_url,
+                    config_path=config_path,
+                    json_out=json_out,
+                )
+            if json_out:
+                typer.echo(json.dumps(payload, default=str))
+            else:
+                _print_resume_recovery_payload(payload)
+            if exit_code:
+                raise typer.Exit(exit_code)
+            return
+
+        if action != "cancel_run":
+            payload = _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="unsupported",
+                reason=(
+                    "This recovery action is not executable by CLI yet; "
+                    "inspect the run or use a live gateway/runtime surface."
+                ),
+                confirmation_prompt=prompt,
+            )
+            if json_out:
+                typer.echo(json.dumps(payload, default=str))
+            else:
+                typer.echo(payload["reason"], err=True)
+            raise typer.Exit(2)
+
+        if rec.status != "awaiting_user":
+            payload = _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="not_applicable",
+                reason="cancel_run only applies to runs in awaiting_user status.",
+                confirmation_prompt=prompt,
+            )
+            if json_out:
+                typer.echo(json.dumps(payload, default=str))
+            else:
+                typer.echo(payload["reason"], err=True)
+            raise typer.Exit(2)
+
+        if not confirm:
+            payload = _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="requires_confirmation",
+                reason="Re-run with --confirm to cancel the awaiting MetaSkill run.",
+                confirmation_prompt=prompt,
+            )
+            if json_out:
+                typer.echo(json.dumps(payload, default=str))
+            else:
+                typer.echo(prompt)
+                typer.echo(
+                    "Re-run with --confirm to cancel the awaiting MetaSkill run.",
+                )
+            raise typer.Exit(2)
+
+        cancelled = writer.mark_cancelled(run_id=run_id, reason=reason)
+        if not cancelled:
+            payload = _recover_payload(
+                run_id=run_id,
+                action=action,
+                status="not_applicable",
+                reason="Run was no longer awaiting user input.",
+            )
+            if json_out:
+                typer.echo(json.dumps(payload, default=str))
+            else:
+                typer.echo(payload["reason"], err=True)
+            raise typer.Exit(2)
+    finally:
+        writer.close()
+
+    payload = _recover_payload(
+        run_id=run_id,
+        action=action,
+        status="cancelled",
+        reason=reason,
+    )
+    if json_out:
+        typer.echo(json.dumps(payload, default=str))
+        return
+    typer.echo(f"cancelled awaiting MetaSkill run: {run_id}")
 
 
 # ─── Proposals: list / accept ─────────────────────────────────────────────

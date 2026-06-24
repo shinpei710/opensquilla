@@ -216,3 +216,19 @@ class MetaResult:
     # New in PR3 (design §8.1, §8.3): pause signal vs failure distinction.
     paused: bool = False
     paused_payload: MetaPaused | None = None
+    # Optional metacognitive reliability report attached by the MetaSkill
+    # scheduler. Kept as a plain dict so persistence and surfaces can consume
+    # it without importing the controller module.
+    metacognition: dict[str, Any] | None = None
+    # Optional completion-gate decision derived from ``metacognition`` after
+    # final-text post-processing. Plain dict for the same persistence/surface
+    # boundary as the report.
+    metacognition_decision: dict[str, Any] | None = None
+    # Optional controlled recovery plan derived from the completion decision.
+    # This is intentionally advisory in V4: no recovery action is executed
+    # implicitly by storing it here.
+    metacognition_recovery: dict[str, Any] | None = None
+    # Optional execution result for a bounded metacognitive recovery action.
+    # This is separate from the advisory recovery plan so surfaces can
+    # distinguish "what was recommended" from "what actually ran".
+    metacognition_recovery_result: dict[str, Any] | None = None

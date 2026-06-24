@@ -2130,6 +2130,150 @@ async def test_orchestrator_final_text_step_falls_back_when_named_output_empty()
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_applies_regenerate_final_text_recovery() -> None:
+    from opensquilla.skills.meta.events import _StepDone
+
+    spec = _make_meta_spec(
+        composition={
+            "steps": [
+                {"id": "research", "skill": "summarize"},
+                {
+                    "id": "final",
+                    "skill": "summarize",
+                    "depends_on": ["research"],
+                },
+            ],
+        },
+        final_text_mode="raw",
+    )
+    plan = parse_meta_plan(spec)
+    assert plan is not None
+    loader = _FakeLoader([_make_skill_spec("summarize", "")])
+
+    async def dispatch(step, _effective_skill, _inputs, _outputs):
+        text = "usable research material" if step.id == "research" else ""
+        yield _StepDone(text=text)
+
+    chat_calls: list[tuple[str, str]] = []
+
+    async def fake_chat(system_prompt: str, user_message: str) -> str:
+        chat_calls.append((system_prompt, user_message))
+        return "Recovered answer"
+
+    orch = MetaOrchestrator(
+        agent_runner=lambda *_args, **_kwargs: None,
+        skill_loader=loader,
+        llm_chat=fake_chat,
+    )
+    orch._dispatch_step_stream = dispatch  # type: ignore[assignment]
+    result = await orch.run(MetaMatch(plan=plan, inputs={"user_message": "u"}))
+
+    assert result.ok, result.error
+    assert result.final_text == "Recovered answer"
+    assert result.metacognition_recovery_result is not None
+    assert result.metacognition_recovery_result["status"] == "applied"
+    assert result.metacognition_recovery_result["final_text_changed"] is True
+    assert result.metacognition_decision is not None
+    assert result.metacognition_decision["action"] == "warn"
+    assert result.metacognition_recovery is not None
+    assert result.metacognition_recovery["primary_action"] == "deliver_with_warning"
+    assert len(chat_calls) == 1
+    assert "recovering a MetaSkill run" in chat_calls[0][0]
+    assert "usable research material" in chat_calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_skips_final_text_recovery_without_llm_chat() -> None:
+    from opensquilla.skills.meta.events import _StepDone
+
+    spec = _make_meta_spec(
+        composition={
+            "steps": [
+                {"id": "research", "skill": "summarize"},
+                {
+                    "id": "final",
+                    "skill": "summarize",
+                    "depends_on": ["research"],
+                },
+            ],
+        },
+        final_text_mode="raw",
+    )
+    plan = parse_meta_plan(spec)
+    assert plan is not None
+    loader = _FakeLoader([_make_skill_spec("summarize", "")])
+
+    async def dispatch(step, _effective_skill, _inputs, _outputs):
+        text = "usable research material" if step.id == "research" else ""
+        yield _StepDone(text=text)
+
+    orch = MetaOrchestrator(
+        agent_runner=lambda *_args, **_kwargs: None,
+        skill_loader=loader,
+        llm_chat=None,
+    )
+    orch._dispatch_step_stream = dispatch  # type: ignore[assignment]
+    result = await orch.run(MetaMatch(plan=plan, inputs={"user_message": "u"}))
+
+    assert result.ok, result.error
+    assert result.final_text == ""
+    assert result.metacognition_decision is not None
+    assert result.metacognition_decision["action"] == "block"
+    assert result.metacognition_recovery is not None
+    assert result.metacognition_recovery["primary_action"] == "regenerate_final_text"
+    assert result.metacognition_recovery_result is not None
+    assert result.metacognition_recovery_result["status"] == "skipped"
+    assert "No llm_chat" in result.metacognition_recovery_result["reason"]
+    recovery_option = result.metacognition_recovery["options"][0]
+    assert recovery_option["id"] == "regenerate_final_text"
+    assert recovery_option["execution"]["state"] == "skipped"
+    assert recovery_option["execution"]["last_status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_skips_final_text_recovery_without_non_empty_outputs() -> None:
+    from opensquilla.skills.meta.events import _StepDone
+
+    spec = _make_meta_spec(
+        composition={
+            "steps": [
+                {"id": "draft", "skill": "summarize"},
+                {"id": "final", "skill": "summarize", "depends_on": ["draft"]},
+            ],
+        },
+        final_text_mode="raw",
+    )
+    plan = parse_meta_plan(spec)
+    assert plan is not None
+    loader = _FakeLoader([_make_skill_spec("summarize", "")])
+
+    async def dispatch(_step, _effective_skill, _inputs, _outputs):
+        yield _StepDone(text="")
+
+    async def fake_chat(_s: str, _u: str) -> str:
+        raise AssertionError("must not synthesize from empty step outputs")
+
+    orch = MetaOrchestrator(
+        agent_runner=lambda *_args, **_kwargs: None,
+        skill_loader=loader,
+        llm_chat=fake_chat,
+    )
+    orch._dispatch_step_stream = dispatch  # type: ignore[assignment]
+    result = await orch.run(MetaMatch(plan=plan, inputs={"user_message": "u"}))
+
+    assert result.ok, result.error
+    assert result.final_text == ""
+    assert result.metacognition_recovery_result is not None
+    assert result.metacognition_recovery_result["status"] == "skipped"
+    assert "No non-empty step outputs" in result.metacognition_recovery_result["reason"]
+    assert result.metacognition_decision is not None
+    assert result.metacognition_decision["action"] == "block"
+    recovery_option = result.metacognition_recovery["options"][0]
+    assert recovery_option["id"] == "regenerate_final_text"
+    assert recovery_option["execution"]["state"] == "skipped"
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_skips_memory_step_when_persist_disabled() -> None:
     """``memory_persist_enabled=False`` short-circuits any ``skill: memory``
     step so exploratory turns don't pollute the long-term store. Downstream
