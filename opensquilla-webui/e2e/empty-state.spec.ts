@@ -54,8 +54,9 @@ test.describe('Empty draft state', () => {
     await expect(page.locator('.msg-user, .msg-ai')).toHaveCount(0)
   })
 
-  test('prefilled draft keeps chips out of the way', async ({ page }) => {
-    // The Sessions Hub task input opens the draft with prefilled text.
+  test('Sessions hand-off sends in one step and leaves the landing', async ({ page }) => {
+    // The Sessions Hub "Start task" button hands the draft off with autosend,
+    // so the composer fires immediately instead of parking on the empty state.
     await page.goto(CONTROL_URL + 'sessions')
     await page.waitForSelector('.conn-pill', { timeout: 10000 })
 
@@ -63,9 +64,11 @@ test.describe('Empty draft state', () => {
     await page.locator('.hub-task__input').fill(taskText)
     await page.getByRole('button', { name: 'Start task' }).click()
 
-    await expect(page).toHaveURL(/\/chat\/new/)
-    await expect(page.locator('.chat-textarea')).toHaveValue(taskText)
-    await expect(page.locator('.empty-state__greeting')).toBeVisible()
-    await expect(page.locator('.empty-state__chips')).toHaveCount(0)
+    await expect(page).toHaveURL(/\/chat/)
+    // The send fired: the user bubble is present and the landing is gone.
+    await expect(
+      page.locator('.msg-user').filter({ hasText: taskText }),
+    ).toHaveCount(1, { timeout: 15000 })
+    await expect(page.locator('.empty-state__greeting')).toHaveCount(0)
   })
 })

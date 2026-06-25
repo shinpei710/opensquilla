@@ -74,17 +74,21 @@ test.describe('Sessions Hub', () => {
     await expect(page.locator('.hub-row')).toHaveCount(total)
   })
 
-  test('task input prefills the chat draft without sending', async ({ page }) => {
+  test('task input starts the task in one step', async ({ page }) => {
     await openHub(page)
 
     const taskText = 'Summarize the latest gateway logs'
     await page.locator('.hub-task__input').fill(taskText)
     await page.getByRole('button', { name: 'Start task' }).click()
 
-    await expect(page).toHaveURL(/\/chat\/new\?agent=main$/)
-    await expect(page.locator('.chat-textarea')).toHaveValue(taskText)
-    // Draft only: nothing was sent.
-    await expect(page.locator('.msg-user, .msg-ai')).toHaveCount(0)
+    // One step: the hand-off lands in chat and fires the send itself, so the
+    // operator never has to press Enter a second time.
+    await expect(page).toHaveURL(/\/chat/)
+    await expect(
+      page.locator('.msg-user').filter({ hasText: taskText }),
+    ).toHaveCount(1, { timeout: 15000 })
+    // The composer clears once the draft sends.
+    await expect(page.locator('.chat-textarea')).toHaveValue('')
   })
 
   test('row click opens the inspect drawer instead of navigating', async ({ page }) => {

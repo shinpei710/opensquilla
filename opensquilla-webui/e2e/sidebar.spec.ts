@@ -10,19 +10,15 @@ async function openControl(page: Page, path = '') {
   // Let the session list settle before inspecting the sidebar.
   await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
   await page.waitForTimeout(800)
-  await expect(page.locator('.sidebar-history-list, .sidebar-history-empty').first()).toBeVisible()
+  await expect(
+    page.locator('.sidebar-history-list, .sidebar-history-empty, .sidebar-onboarding').first(),
+  ).toBeVisible()
 }
 
 test.describe('Sidebar', () => {
-  test('Recents is a flat list with human titles and no grouped-mode chrome', async ({ page }) => {
+  test('Recents renders collapsible family groups (or onboarding when empty)', async ({ page }) => {
     await openControl(page)
 
-    // The Recent|Grouped toggle, family filter chips, and grouped rendering
-    // were removed with the fixed-core sidebar restructure.
-    await expect(page.getByRole('button', { name: 'Grouped', exact: true })).toHaveCount(0)
-    await expect(page.locator('.sidebar-filter-chip')).toHaveCount(0)
-    await expect(page.locator('.sidebar-group')).toHaveCount(0)
-    await expect(page.locator('.sidebar-family-label')).toHaveCount(0)
     await expect(page.locator('.sidebar-recents-eyebrow')).toHaveText('Recents')
 
     const sidebarText = await page.locator('.sidebar').innerText()
@@ -30,7 +26,32 @@ test.describe('Sidebar', () => {
     expect(sidebarText).not.toMatch(UUID_PATTERN)
 
     const titles = page.locator('.sidebar-history-title')
-    test.skip((await titles.count()) === 0, 'No conversations on this gateway; seed sessions to exercise the list')
+    if ((await titles.count()) === 0) {
+      // First-run empty state: the onboarding panel replaces the list.
+      await expect(page.locator('.sidebar-onboarding')).toBeVisible()
+      await expect(
+        page.locator('.sidebar-onboarding').getByRole('button', { name: 'Start a chat' }),
+      ).toBeVisible()
+      return
+    }
+
+    // Conversations exist: Recents renders collapsible family groups, each with
+    // an expandable header and a per-section count.
+    const groups = page.locator('.sidebar-group')
+    expect(await groups.count()).toBeGreaterThan(0)
+    await expect(groups.first().locator('.sidebar-group__count')).toBeVisible()
+
+    // The header actually toggles: aria-expanded flips and the body visibility
+    // follows. Assert the behavior, not just the attribute's presence.
+    const header = groups.first().locator('.sidebar-group__header')
+    const body = groups.first().locator('.sidebar-group__body')
+    const startedExpanded = (await header.getAttribute('aria-expanded')) === 'true'
+    await header.click()
+    await expect(header).toHaveAttribute('aria-expanded', String(!startedExpanded))
+    if (startedExpanded) await expect(body).toBeHidden()
+    else await expect(body).toBeVisible()
+    await header.click() // restore
+    await expect(header).toHaveAttribute('aria-expanded', String(startedExpanded))
 
     for (const title of await titles.allInnerTexts()) {
       expect(title.trim().length).toBeGreaterThan(0)
@@ -39,13 +60,17 @@ test.describe('Sidebar', () => {
     }
   })
 
-  test('cron runs stay mixed into Recents', async ({ page }) => {
+  test('cron runs are grouped under Automations in Recents', async ({ page }) => {
     // The Sessions Hub ledger is ground truth for which kinds exist.
     await openControl(page, 'sessions')
     const cronInHub = await page.locator('.hub-row[data-kind="cron"]').count()
-    test.skip(cronInHub === 0, 'No cron sessions on this gateway; seed a cron run to exercise the mix')
+    test.skip(cronInHub === 0, 'No cron sessions on this gateway; seed a cron run to exercise the group')
 
-    // Recents keeps automations interleaved with chats — no kind filtering.
+    // Recents keeps automations in their own collapsible family group, distinct
+    // from chats and channels.
+    // Cron exists in the hub, so it MUST surface in the Automations group.
+    // Collapsed groups keep their rows in the DOM (v-show), so a zero count is a
+    // real grouping regression, not a collapse artifact — assert, don't skip.
     const cronRows = page.locator('.sidebar-history-row[data-family="automations"]')
     expect(await cronRows.count()).toBeGreaterThan(0)
     for (const title of await cronRows.locator('.sidebar-history-title').allInnerTexts()) {
@@ -76,6 +101,31 @@ test.describe('Sidebar', () => {
 
     await page.locator('.sidebar-agent-chip').click()
     await expect(page.locator('.sidebar-agent-chip')).toHaveCount(0)
+  })
+
+  test('chat rows expose a rename/delete menu; non-chat rows do not', async ({ page }) => {
+    await openControl(page)
+
+    // Top-level chat rows (subagents are indented at depth > 0) carry the ⋯ menu.
+    const chatRow = page
+      .locator('.sidebar-history-row[data-family="chats"][data-depth="0"]')
+      .first()
+    test.skip((await chatRow.count()) === 0, 'No chat rows on this gateway; seed a chat to exercise the row menu')
+
+    const menuBtn = chatRow.locator('.sidebar-row-menu-btn')
+    await expect(menuBtn).toHaveAttribute('aria-haspopup', 'menu')
+    await menuBtn.click()
+
+    const menu = page.getByRole('menu')
+    await expect(menu).toBeVisible()
+    await expect(menu.getByRole('menuitem', { name: 'Rename' })).toBeVisible()
+    await expect(menu.getByRole('menuitem', { name: 'Delete' })).toBeVisible()
+
+    // Automations rows are not chats, so they never render the row menu.
+    const automationRow = page.locator('.sidebar-history-row[data-family="automations"]').first()
+    if ((await automationRow.count()) > 0) {
+      await expect(automationRow.locator('.sidebar-row-menu-btn')).toHaveCount(0)
+    }
   })
 
   test('Console auto-expands on console routes and collapses on leaving', async ({ page }) => {
@@ -131,15 +181,15 @@ test.describe('Sidebar', () => {
     }
   })
 
-  test('Ctrl+K opens the new-chat picker into the draft state', async ({ page }) => {
+  test('Ctrl+K starts a new chat instantly', async ({ page }) => {
     await openControl(page)
 
+    // Ctrl+K is the keyboard twin of the primary "New chat" button: it lands on
+    // the draft route immediately against the preferred agent, with no picker.
     await page.keyboard.press('Control+k')
-    const dialog = page.getByRole('dialog', { name: 'New chat' })
-    await expect(dialog).toBeVisible()
 
-    await page.getByRole('button', { name: 'Start chat' }).click()
     await expect(page).toHaveURL(/\/chat\/new\?agent=[a-z0-9_-]+$/i)
+    await expect(page.getByRole('dialog', { name: 'New chat' })).toHaveCount(0)
   })
 
   test('footer pins Settings; connection state shows in the topbar', async ({ page }) => {

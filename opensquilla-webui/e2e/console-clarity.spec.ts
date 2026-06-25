@@ -10,6 +10,24 @@ async function openControl(page: Page, path = '') {
 const settingsDialog = (page: Page) => page.getByRole('dialog', { name: 'Settings' })
 
 test.describe('Console clarity', () => {
+  // The DEV-only parts/fold parity check logs `[live-turn parity]` on any
+  // fold/key divergence between message.parts and the rendered timeline. Treat
+  // it as a hard failure so a regression is caught in CI, not eyeballed.
+  let parityErrors: string[]
+
+  test.beforeEach(({ page }) => {
+    parityErrors = []
+    page.on('console', msg => {
+      if (msg.type() === 'error' && msg.text().includes('[live-turn parity]')) {
+        parityErrors.push(msg.text())
+      }
+    })
+  })
+
+  test.afterEach(() => {
+    expect(parityErrors, 'live-turn parts/fold parity check reported a divergence').toEqual([])
+  })
+
   test('Console fold and Settings rows carry distinct icons', async ({ page }) => {
     await openControl(page)
 

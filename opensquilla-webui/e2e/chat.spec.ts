@@ -60,11 +60,10 @@ test.describe('Chat Page', () => {
     await core.getByText('Sessions', { exact: true }).click()
     await expect(page).toHaveURL(/\/sessions/)
 
-    // Chat now starts from New chat (the dedicated Chat nav row is gone);
-    // the picker lands on the draft state (see new-chat.spec.ts).
-    await page.getByRole('button', { name: 'New chat' }).click()
-    await expect(page.getByRole('dialog', { name: 'New chat' })).toBeVisible()
-    await page.getByRole('button', { name: 'Start chat' }).click()
+    // New chat is instant (no modal): the primary button drops straight to a
+    // draft. `exact` matches the New-chat button precisely.
+    await page.getByRole('button', { name: 'New chat', exact: true }).click()
+    await expect(page.getByRole('dialog', { name: 'New chat' })).toHaveCount(0)
     await expect(page).toHaveURL(/\/chat\/new\?agent=[a-z0-9_-]+$/i)
   })
 
@@ -75,7 +74,7 @@ test.describe('Chat Page', () => {
     // Let the session list settle before inspecting sidebar text.
     await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
     await page.waitForTimeout(800)
-    await expect(page.locator('.sidebar-history-list, .sidebar-history-empty').first()).toBeVisible()
+    await expect(page.locator('.sidebar-history-list, .sidebar-onboarding, .sidebar-history-empty').first()).toBeVisible()
 
     const sidebarText = await page.locator('.sidebar').innerText()
     expect(sidebarText).not.toMatch(/agent:[a-z0-9_-]+:[a-z0-9_-]+:/i)

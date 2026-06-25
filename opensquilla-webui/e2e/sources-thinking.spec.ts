@@ -247,4 +247,57 @@ test.describe('Sources row and thinking disclosure', () => {
     await expect(replayedRow).toBeVisible({ timeout: 30000 })
     await expect(replayedRow.locator('.sources-row__toggle')).toHaveAttribute('aria-expanded', 'false')
   })
+
+  test('measured reasoning time survives the post-turn history sync', async ({ page }) => {
+    test.skip(!LIVE, 'Live gateway test; set OPENSQUILLA_E2E_LIVE=1 to run.')
+    test.setTimeout(240000)
+
+    // Force the incremental merge ON regardless of the rollout default, before
+    // any page script reads the flag. The merge keeps a finished turn's measured
+    // reasoning.seconds when the next history snapshot lands; without it the
+    // snapshot maps seconds back to 0 and the disclosure loses its elapsed.
+    await page.addInitScript(() => {
+      try { window.localStorage.setItem('opensquilla.chat.historyMerge', '1') } catch { /* storage blocked */ }
+    })
+
+    await page.goto(CONTROL_URL + 'chat/new')
+    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+
+    // A multi-step reasoning prompt so the measured think time is comfortably
+    // over a second; a trivial one-word answer can resolve in under 1s, which
+    // renders as "Thought process" (seconds < 1) and cannot exercise the
+    // seconds-preservation contract this test guards.
+    const textarea = page.locator('.chat-textarea')
+    await textarea.fill(
+      'Reason thoroughly and at length, step by step, before answering. '
+      + 'Logic puzzle: Alice, Bob, and Carol each own a different pet '
+      + '(cat, dog, fish) and like a different color (red, green, blue). '
+      + 'Clue 1: Alice does not own the cat. Clue 2: the dog owner likes blue. '
+      + 'Clue 3: Carol likes red. Clue 4: Bob does not like green. Work through '
+      + 'every deduction explicitly, then give the full solution in one sentence.',
+    )
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+
+    // The turn runs and completes.
+    const ribbon = page.locator('.stream-activity')
+    await expect(ribbon).toBeVisible({ timeout: 30000 })
+    await expect(ribbon).toHaveCount(0, { timeout: 180000 })
+
+    // The finished assistant turn's reasoning disclosure shows the measured
+    // elapsed. ReasoningPart renders the summary as "Thought for Ns" when
+    // seconds >= 1 and degrades to "Thought process" when seconds is 0 — the
+    // latter is what a snapshot that drops the measured seconds would produce.
+    // Bind the real summary element, not the illustrative .__elapsed node.
+    const summary = page.locator('.msg-ai .thinking-fold .thinking-fold__summary').first()
+    await expect(summary).toBeVisible({ timeout: 30000 })
+    await expect(summary).toHaveText(/Thought for \d+/)
+    await expect(summary).not.toHaveText(/Thought process/)
+
+    // Wait past the ~50ms history-sync debounce plus a generous margin, then
+    // re-assert: a sync that clobbered the row would have reset the summary to
+    // "Thought process" here; the merge keeps the measured seconds.
+    await page.waitForTimeout(500)
+    await expect(summary).toHaveText(/Thought for \d+/)
+    await expect(summary).not.toHaveText(/Thought process/)
+  })
 })
