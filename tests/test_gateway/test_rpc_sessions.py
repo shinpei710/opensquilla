@@ -2379,8 +2379,9 @@ class TestSessionsSend:
     async def test_send_rejects_invalid_attachment_media_type(
         self, dispatcher, ctx_with_sessions, session
     ):
-        # text/plain is in the allow-list. Use a MIME that is genuinely
-        # outside the allow-list to keep this regression honest.
+        # An out-of-allow-list MIME with BINARY content stays fail-closed. (A
+        # textual payload would now degrade to text/plain via the UTF-8 fallback,
+        # so use NUL-bearing binary bytes to keep this rejection regression honest.)
         res = await dispatcher.dispatch(
             "r1",
             "sessions.send",
@@ -2388,7 +2389,7 @@ class TestSessionsSend:
                 "key": session.session_key,
                 "message": "hi",
                 "attachments": [
-                    {"type": "application/x-shellscript", "data": "QQ=="}
+                    {"type": "application/x-shellscript", "data": "AAECAw=="}
                 ],
             },
             ctx_with_sessions,
@@ -4011,3 +4012,422 @@ class TestSessionsResolve:
         res = await dispatcher.dispatch("r1", "sessions.create", {"agentId": "test"}, ctx)
         assert res.ok is False
         assert res.error.code == "UNAUTHORIZED"
+
+
+class _SearchStorage(FakeStorage):
+    """FakeStorage plus the FTS hook that sessions.search wraps."""
+
+    def __init__(self, sessions=None, transcript_rows=None):
+        super().__init__(sessions)
+        self._search_rows = transcript_rows or []
+        self.search_calls: list[tuple[str, str | None, int]] = []
+
+    async def search_transcript(self, query, session_id=None, limit=20):
+        self.search_calls.append((query, session_id, limit))
+        return list(self._search_rows)[:limit]
+
+
+class _SearchManager(FakeSessionManager):
+    def __init__(self, sessions=None, transcript_rows=None):
+        super().__init__(sessions)
+        self._storage = _SearchStorage(sessions, transcript_rows)
+
+
+class TestSessionsSearch:
+    @staticmethod
+    def _sessions():
+        return [
+            FakeSession(
+                session_key="agent:main:s1",
+                session_id="s1",
+                display_name="Deploy planning",
+                updated_at=2000,
+            ),
+            FakeSession(
+                session_key="agent:main:s2",
+                session_id="s2",
+                display_name="Grocery list",
+                updated_at=3000,
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_empty_query_returns_empty(self, dispatcher):
+        ctx = make_ctx(session_manager=_SearchManager(self._sessions()))
+        res = await dispatcher.dispatch("r1", "sessions.search", {"query": "   "}, ctx)
+        assert res.ok is True
+        assert res.payload["sessions"] == []
+        assert res.payload["messages"] == []
+
+    @pytest.mark.asyncio
+    async def test_no_manager_returns_empty(self, dispatcher, ctx_no_manager):
+        res = await dispatcher.dispatch(
+            "r1", "sessions.search", {"query": "deploy"}, ctx_no_manager
+        )
+        assert res.ok is True
+        assert res.payload["sessions"] == []
+        assert res.payload["messages"] == []
+
+    @pytest.mark.asyncio
+    async def test_title_hit_matches_one_session(self, dispatcher):
+        ctx = make_ctx(session_manager=_SearchManager(self._sessions()))
+        res = await dispatcher.dispatch("r1", "sessions.search", {"query": "deploy"}, ctx)
+        assert res.ok is True
+        keys = [row["key"] for row in res.payload["sessions"]]
+        assert keys == ["agent:main:s1"]
+        assert res.payload["sessions"][0]["title"] == "Deploy planning"
+        # No transcript rows configured → no content hits.
+        assert res.payload["messages"] == []
+
+    @pytest.mark.asyncio
+    async def test_content_hit_is_enriched_with_session_title(self, dispatcher):
+        rows = [
+            {
+                "id": 10,
+                "session_key": "agent:main:s2",
+                "role": "user",
+                "snippet": "buy >>>milk<<< today",
+                "created_at": 1234,
+            }
+        ]
+        manager = _SearchManager(self._sessions(), transcript_rows=rows)
+        ctx = make_ctx(session_manager=manager)
+        res = await dispatcher.dispatch("r1", "sessions.search", {"query": "milk", "limit": 5}, ctx)
+        assert res.ok is True
+        messages = res.payload["messages"]
+        assert len(messages) == 1
+        hit = messages[0]
+        assert hit["key"] == "agent:main:s2"
+        assert hit["title"] == "Grocery list"  # joined from the session metadata
+        assert hit["snippet"] == "buy >>>milk<<< today"
+        assert hit["role"] == "user"
+        # The FTS hook received the raw query and the clamped limit.
+        assert manager._storage.search_calls == [("milk", None, 5)]
+
+    @pytest.mark.asyncio
+    async def test_read_scope_is_sufficient(self, dispatcher):
+        ctx = make_ctx(
+            scopes=["operator.read"],
+            session_manager=_SearchManager(self._sessions()),
+        )
+        res = await dispatcher.dispatch("r1", "sessions.search", {"query": "deploy"}, ctx)
+        assert res.ok is True
+
+    @pytest.mark.asyncio
+    async def test_real_storage_fts_end_to_end(self, dispatcher):
+        """Drive the handler against a real SQLite FTS store (not the fake).
+
+        Exercises the real list_sessions + transcript FTS + title derivation that
+        the other tests stub, so a schema/SQL drift in search_transcript is caught
+        here rather than only in a live gateway.
+        """
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from opensquilla.session.models import SessionNode, TranscriptEntry
+        from opensquilla.session.storage import SessionStorage
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStorage(str(Path(tmpdir) / "s.db"))
+            await store.connect()
+            try:
+                async def seed(sid: str, name: str, text: str) -> None:
+                    await store.upsert_session(
+                        SessionNode(
+                            session_key=f"agent:main:{sid}",
+                            session_id=sid,
+                            agent_id="main",
+                            status="idle",
+                            created_at=1,
+                            updated_at=1,
+                            display_name=name,
+                        )
+                    )
+                    await store.append_transcript_entry(
+                        TranscriptEntry(
+                            session_id=sid,
+                            session_key=f"agent:main:{sid}",
+                            message_id=f"{sid}-m0",
+                            role="user",
+                            content=text,
+                            created_at=1,
+                        )
+                    )
+
+                await seed("d1", "Deploy planning", "we should deploy the gateway")
+                await seed("g1", "Grocery list", "remember to buy milk today")
+
+                ctx = make_ctx(session_manager=SimpleNamespace(_storage=store))
+
+                # Content hit via the real FTS index.
+                res = await dispatcher.dispatch("r1", "sessions.search", {"query": "milk"}, ctx)
+                assert res.ok is True
+                messages = res.payload["messages"]
+                assert [m["key"] for m in messages] == ["agent:main:g1"]
+                assert "milk" in messages[0]["snippet"].lower()
+                assert messages[0]["title"] == "Grocery list"
+
+                # Title hit (display_name) for a different term.
+                res2 = await dispatcher.dispatch("r1", "sessions.search", {"query": "deploy"}, ctx)
+                assert res2.ok is True
+                assert "agent:main:d1" in [s["key"] for s in res2.payload["sessions"]]
+            finally:
+                await store.close()
+
+    @pytest.mark.asyncio
+    async def test_cjk_content_search_real_storage(self, dispatcher):
+        """Chinese (non-ASCII) message content is searchable via the LIKE path,
+        which the FTS sanitizer would otherwise strip to nothing."""
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from opensquilla.session.models import SessionNode, TranscriptEntry
+        from opensquilla.session.storage import SessionStorage
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStorage(str(Path(tmpdir) / "s.db"))
+            await store.connect()
+            try:
+                await store.upsert_session(
+                    SessionNode(
+                        session_key="agent:main:c1",
+                        session_id="c1",
+                        agent_id="main",
+                        status="idle",
+                        created_at=1,
+                        updated_at=1,
+                        display_name="部署讨论",
+                    )
+                )
+                await store.append_transcript_entry(
+                    TranscriptEntry(
+                        session_id="c1",
+                        session_key="agent:main:c1",
+                        message_id="c1-m0",
+                        role="user",
+                        content="我们需要尽快完成部署计划并通知团队",
+                        created_at=1,
+                    )
+                )
+                # Baseline: the FTS index alone cannot find the Chinese term.
+                assert await store.search_transcript("部署") == []
+
+                ctx = make_ctx(session_manager=SimpleNamespace(_storage=store))
+                # A content-only Chinese phrase (absent from any title) must come
+                # back as a message hit with a highlighted snippet.
+                res = await dispatcher.dispatch("r1", "sessions.search", {"query": "通知团队"}, ctx)
+                assert res.ok is True
+                assert [m["key"] for m in res.payload["messages"]] == ["agent:main:c1"]
+                snippet = res.payload["messages"][0]["snippet"]
+                assert ">>>" in snippet and "通知团队" in snippet
+            finally:
+                await store.close()
+
+    @pytest.mark.asyncio
+    async def test_title_search_scans_beyond_200_sessions(self, dispatcher):
+        """Title search is global — an old conversation past any recent window
+        is still findable by name (no silent 200-session cap)."""
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from opensquilla.session.models import SessionNode
+        from opensquilla.session.storage import SessionStorage
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStorage(str(Path(tmpdir) / "s.db"))
+            await store.connect()
+            try:
+                # Target is the OLDEST row; 220 newer noise rows bury it well past
+                # any recent-200 page.
+                await store.upsert_session(
+                    SessionNode(
+                        session_key="agent:main:old",
+                        session_id="old",
+                        agent_id="main",
+                        status="idle",
+                        created_at=1,
+                        updated_at=1,
+                        display_name="Zephyr migration notes",
+                    )
+                )
+                for i in range(220):
+                    await store.upsert_session(
+                        SessionNode(
+                            session_key=f"agent:main:n{i}",
+                            session_id=f"n{i}",
+                            agent_id="main",
+                            status="idle",
+                            created_at=1000 + i,
+                            updated_at=1000 + i,
+                            display_name=f"noise {i}",
+                        )
+                    )
+                ctx = make_ctx(session_manager=SimpleNamespace(_storage=store))
+                res = await dispatcher.dispatch("r1", "sessions.search", {"query": "zephyr"}, ctx)
+                assert res.ok is True
+                assert [s["key"] for s in res.payload["sessions"]] == ["agent:main:old"]
+            finally:
+                await store.close()
+
+    @pytest.mark.asyncio
+    async def test_message_hits_deduped_and_exclude_title_hits(self, dispatcher):
+        """Many matches in one session collapse to a single message row, and a
+        session already shown as a title hit is not repeated under messages."""
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from opensquilla.session.models import SessionNode, TranscriptEntry
+        from opensquilla.session.storage import SessionStorage
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStorage(str(Path(tmpdir) / "s.db"))
+            await store.connect()
+            try:
+                # Session A: three messages all matching -> one message row.
+                await store.upsert_session(
+                    SessionNode(
+                        session_key="agent:main:a",
+                        session_id="a",
+                        agent_id="main",
+                        status="idle",
+                        created_at=1,
+                        updated_at=2,
+                        display_name="Daily standup",
+                    )
+                )
+                for i in range(3):
+                    await store.append_transcript_entry(
+                        TranscriptEntry(
+                            session_id="a",
+                            session_key="agent:main:a",
+                            message_id=f"a-m{i}",
+                            role="user",
+                            content=f"the report number {i}",
+                            created_at=10 + i,
+                        )
+                    )
+                # Session B: title AND content match -> appears as a title hit
+                # only, never duplicated under messages.
+                await store.upsert_session(
+                    SessionNode(
+                        session_key="agent:main:b",
+                        session_id="b",
+                        agent_id="main",
+                        status="idle",
+                        created_at=1,
+                        updated_at=3,
+                        display_name="Quarterly report",
+                    )
+                )
+                await store.append_transcript_entry(
+                    TranscriptEntry(
+                        session_id="b",
+                        session_key="agent:main:b",
+                        message_id="b-m0",
+                        role="user",
+                        content="the report is attached",
+                        created_at=20,
+                    )
+                )
+                ctx = make_ctx(session_manager=SimpleNamespace(_storage=store))
+                res = await dispatcher.dispatch("r1", "sessions.search", {"query": "report"}, ctx)
+                assert res.ok is True
+                msg_keys = [m["key"] for m in res.payload["messages"]]
+                sess_keys = [s["key"] for s in res.payload["sessions"]]
+                assert "agent:main:b" in sess_keys
+                assert msg_keys.count("agent:main:a") == 1
+                assert "agent:main:b" not in msg_keys
+            finally:
+                await store.close()
+
+    @pytest.mark.asyncio
+    async def test_mixed_ascii_cjk_query_ands_terms(self, dispatcher):
+        """A mixed query ("deploy 部署") must match a transcript containing both
+        terms even when they are not adjacent, and must NOT match when a term is
+        absent — i.e. terms are AND-ed, not matched as one contiguous substring."""
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from opensquilla.session.models import SessionNode, TranscriptEntry
+        from opensquilla.session.storage import SessionStorage
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStorage(str(Path(tmpdir) / "s.db"))
+            await store.connect()
+            try:
+                await store.upsert_session(
+                    SessionNode(
+                        session_key="agent:main:m1",
+                        session_id="m1",
+                        agent_id="main",
+                        status="idle",
+                        created_at=1,
+                        updated_at=1,
+                        display_name="Ops chat",
+                    )
+                )
+                await store.append_transcript_entry(
+                    TranscriptEntry(
+                        session_id="m1",
+                        session_key="agent:main:m1",
+                        message_id="m1-m0",
+                        role="user",
+                        # "deploy" and "部署" present but NOT adjacent.
+                        content="please deploy the service, the 部署 will finish soon",
+                        created_at=1,
+                    )
+                )
+                ctx = make_ctx(session_manager=SimpleNamespace(_storage=store))
+
+                hit = await dispatcher.dispatch(
+                    "r1", "sessions.search", {"query": "deploy 部署"}, ctx
+                )
+                assert hit.ok is True
+                assert [m["key"] for m in hit.payload["messages"]] == ["agent:main:m1"]
+
+                # A term that is absent ("缓存") must exclude the row.
+                miss = await dispatcher.dispatch(
+                    "r1", "sessions.search", {"query": "deploy 缓存"}, ctx
+                )
+                assert miss.ok is True
+                assert miss.payload["messages"] == []
+            finally:
+                await store.close()
+
+    @pytest.mark.asyncio
+    async def test_non_ascii_title_search_is_case_insensitive(self, dispatcher):
+        """Cased non-Latin scripts (e.g. Cyrillic) fold case in title search —
+        a lowercase query finds an upper-cased title."""
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from opensquilla.session.models import SessionNode
+        from opensquilla.session.storage import SessionStorage
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = SessionStorage(str(Path(tmpdir) / "s.db"))
+            await store.connect()
+            try:
+                await store.upsert_session(
+                    SessionNode(
+                        session_key="agent:main:ru",
+                        session_id="ru",
+                        agent_id="main",
+                        status="idle",
+                        created_at=1,
+                        updated_at=1,
+                        display_name="ПРИВЕТ Команда",
+                    )
+                )
+                ctx = make_ctx(session_manager=SimpleNamespace(_storage=store))
+                res = await dispatcher.dispatch("r1", "sessions.search", {"query": "привет"}, ctx)
+                assert res.ok is True
+                assert [s["key"] for s in res.payload["sessions"]] == ["agent:main:ru"]
+            finally:
+                await store.close()

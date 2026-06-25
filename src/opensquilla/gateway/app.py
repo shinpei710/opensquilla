@@ -267,6 +267,7 @@ def create_gateway_app(
                 "id": p["id"],
                 "namespace": p["namespace"],
                 "created_at": p.get("created_at"),
+                "deadline": p.get("deadline"),
             }
             params = p.get("params", {})
             argv = params.get("argv")

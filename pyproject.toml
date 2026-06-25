@@ -64,6 +64,10 @@ dev = [
     "ruff>=0.5",
 ]
 mcp = ["mcp>=1.2.0"]
+# Optional Outlook .msg attachment extraction. Heavy transitive deps
+# (oletools, msoffcrypto-tool, …), so it is opt-in; .msg uploads degrade
+# gracefully with a clear message when this extra is not installed.
+msg = ["extract-msg>=0.48"]
 memory = [
     "tiktoken>=0.5",
     "jieba>=0.42",
@@ -190,6 +194,7 @@ module = [
     "botpy.*",
     "cachetools.*",
     "dingtalk_stream.*",
+    "extract_msg.*",
     "jieba",
     "nio.*",
     "numpy.*",

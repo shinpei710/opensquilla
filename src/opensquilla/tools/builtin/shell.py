@@ -20,7 +20,11 @@ from typing import Any, cast
 
 import structlog
 
-from opensquilla.gateway.approval_queue import get_approval_queue
+from opensquilla.gateway.approval_queue import (
+    RESOLUTION_EXPIRED,
+    classify_command,
+    get_approval_queue,
+)
 from opensquilla.sandbox.backend.bubblewrap import BubblewrapBackend, build_bwrap_argv
 from opensquilla.sandbox.backend.noop import NoopBackend
 from opensquilla.sandbox.backend.seatbelt import (
@@ -1340,6 +1344,27 @@ def _wait_for_inline_browser_approval(background: bool) -> bool:
     return ctx is not None and ctx.caller_kind is CallerKind.WEB
 
 
+def _channel_approver_origin() -> str | None:
+    """Return the originating channel ``sender_id`` when one can be reached.
+
+    A channel-originated turn runs UNATTENDED, but if the originating user is
+    reachable on the channel (the run carries a channel caller, a delivery
+    target on the session, and the ``sender_id`` of whoever started the turn)
+    that user can be asked to approve out of band — exactly like the Web UI
+    poll path. Returns the ``sender_id`` to record as the approval owner, or
+    ``None`` when no approver channel is reachable (cron, subagent, or a
+    channel run that lost its sender).
+    """
+    ctx = current_tool_context.get()
+    if ctx is None or ctx.caller_kind is not CallerKind.CHANNEL:
+        return None
+    sender_id = (ctx.sender_id or "").strip()
+    channel_kind = (ctx.channel_kind or "").strip()
+    if not sender_id or not channel_kind:
+        return None
+    return sender_id
+
+
 def _apply_approval_elevated_mode(entry: object) -> None:
     params = getattr(entry, "params", None)
     if not isinstance(params, dict):
@@ -1350,6 +1375,40 @@ def _apply_approval_elevated_mode(entry: object) -> None:
     ctx = current_tool_context.get()
     if ctx is not None and ctx.is_owner:
         ctx.elevated = mode
+
+
+def _unapproved_envelope(
+    entry: object,
+    approval_id: str,
+    command: str,
+    warning: str,
+) -> dict[str, object]:
+    """Build the tool result for an approval that did not approve.
+
+    An expiry (deadline lapsed with no response) reads distinctly from a human
+    deny so the agent does not infer a deliberate refusal: it is told the action
+    simply was not run and may be re-requested. A real deny keeps its existing
+    message untouched.
+    """
+    if getattr(entry, "resolution", "") == RESOLUTION_EXPIRED:
+        return {
+            "status": "approval_denied",
+            "approval_id": approval_id,
+            "command": command,
+            "warning": warning,
+            "expired": True,
+            "message": (
+                "This action expired without a response and was not run; "
+                "ask again if it's still needed."
+            ),
+        }
+    return {
+        "status": "approval_denied",
+        "approval_id": approval_id,
+        "command": command,
+        "warning": warning,
+        "message": "Approval was denied.",
+    }
 
 
 async def _check_exec_approval(
@@ -1363,6 +1422,7 @@ async def _check_exec_approval(
     queue = get_approval_queue()
     settings = queue.get_settings()
     ctx = current_tool_context.get()
+    channel_owner_sender_id = _channel_approver_origin()
     params = {
         "toolName": tool_name,
         "command": command,
@@ -1371,6 +1431,12 @@ async def _check_exec_approval(
         "agent": ctx.agent_id if ctx is not None else "",
         "mode": "background" if background else "foreground",
     }
+    if channel_owner_sender_id is not None:
+        # Record who started the channel turn so only that user can resolve
+        # this approval from the channel (owner-only, default-deny on mismatch),
+        # and mark the origin channel so the notify bridge can route the prompt.
+        params["senderId"] = channel_owner_sender_id
+        params["channelKind"] = (ctx.channel_kind or "").strip() if ctx is not None else ""
 
     elevated_mode = _context_elevated_mode()
     elevated_full = elevated_mode == "full"
@@ -1422,6 +1488,27 @@ async def _check_exec_approval(
         )
         return deny_block
 
+    # Operator-configured allow/deny patterns. A deny match is a hard block on
+    # par with the guards above (deny precedence), so it runs before any
+    # elevated bypass. The allow side is evaluated later, where it can only
+    # short-circuit the prompt — never the hard guards.
+    pattern_class = classify_command(
+        command, settings.allow_patterns, settings.deny_patterns
+    )
+    if pattern_class == "deny":
+        log.warning(
+            "shell_approval_denied_pattern",
+            command=_audit_command(command),
+            tool=tool_name,
+        )
+        return {
+            "status": "approval_denied",
+            "approval_id": "",
+            "command": command,
+            "warning": warning,
+            "message": "This command was denied by the active approval policy.",
+        }
+
     # /elevated full — trusted operator has taken explicit responsibility.
     # Approvals are skipped entirely.
     if elevated_full:
@@ -1467,12 +1554,39 @@ async def _check_exec_approval(
         _elevate_current_call.set(True)
         return None
 
-    if ctx is not None and ctx.interaction_mode is InteractionMode.UNATTENDED:
+    if (
+        ctx is not None
+        and ctx.interaction_mode is InteractionMode.UNATTENDED
+        and channel_owner_sender_id is None
+    ):
+        # Unattended runs without a reachable approver (cron, subagent, or a
+        # channel run that lost its sender) cannot prompt anyone — fail fast
+        # before enqueuing so no orphaned approval is left pending. A channel
+        # run WITH a reachable owner falls through to enqueue + wait below; the
+        # interaction mode stays UNATTENDED so the UNATTENDED-gated tool-surface
+        # denials in policy_runtime are untouched.
         raise UnsupportedSurfaceError(
             f"Tool '{tool_name}' requires human approval, but this run is unattended. "
             "Use an interactive surface for approval-gated operations, or choose an "
             "operation that does not require approval."
         )
+
+    # Allow-pattern short-circuit: an operator-configured allow match skips the
+    # prompt, like auto-approve. It is gated on ``not sandbox_off_requires_approval``
+    # so it can never override the forced-approval-when-sandbox-off hard guard,
+    # and it only runs after the deny/sensitive/lockdown hard blocks above.
+    if (
+        approval_id is None
+        and not sandbox_off_requires_approval
+        and pattern_class == "allow"
+    ):
+        log.info(
+            "shell_approval_allowed_pattern",
+            command=_audit_command(command),
+            tool=tool_name,
+        )
+        _elevate_current_call.set(True)
+        return None
 
     # Intent-level short-circuit: if the user already approved the same
     # destructive intent recently (e.g. rm /x, and now os.remove("/x")),
@@ -1491,14 +1605,20 @@ async def _check_exec_approval(
 
     if approval_id is None:
         approval_id = queue.request(namespace="exec", params=params)
-        if _wait_for_inline_browser_approval(background):
+        # Both the Web UI poll path and a reachable channel approver let the
+        # tool call block on the queue and continue the instant the user
+        # resolves it. A channel approval only ever grants this one gated call
+        # (never session-wide elevation), so the per-call host grant is set but
+        # the session elevated-mode application is skipped for channel origins.
+        if _wait_for_inline_browser_approval(background) or channel_owner_sender_id is not None:
             try:
                 await queue.wait(approval_id, timeout=_APPROVAL_RETRY_WAIT_SECONDS)
             except TimeoutError:
                 pass
             entry = queue.get(approval_id)
             if entry.approved:
-                _apply_approval_elevated_mode(entry)
+                if channel_owner_sender_id is None:
+                    _apply_approval_elevated_mode(entry)
                 try:
                     queue.consume(approval_id)
                 except ValueError as exc:
@@ -1511,13 +1631,7 @@ async def _check_exec_approval(
                 )
                 _elevate_current_call.set(True)
                 return None
-            return {
-                "status": "approval_denied",
-                "approval_id": approval_id,
-                "command": command,
-                "warning": warning,
-                "message": "Approval was denied or timed out.",
-            }
+            return _unapproved_envelope(entry, approval_id, command, warning)
         status = "approval_required"
         message = (
             "Resolve this approval via exec.approval.resolve and retry with the returned "
@@ -1567,13 +1681,7 @@ async def _check_exec_approval(
                 ),
             }
     if not entry.approved:
-        return {
-            "status": "approval_denied",
-            "approval_id": approval_id,
-            "command": command,
-            "warning": warning,
-            "message": "Approval was denied.",
-        }
+        return _unapproved_envelope(entry, approval_id, command, warning)
     try:
         _apply_approval_elevated_mode(entry)
         queue.consume(approval_id)

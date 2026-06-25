@@ -235,7 +235,7 @@ class LlmProviderConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_LLM_")
 
     provider: str = "openrouter"
-    model: str = "deepseek/deepseek-v4-pro"
+    model: str = "anthropic/claude-sonnet-4.6"
     api_key: str = ""
     api_key_env: str = ""
     base_url: str = "https://openrouter.ai/api/v1"
@@ -563,9 +563,9 @@ def _default_tiers() -> dict:
     return {
         "c0": {
             "provider": "openrouter",
-            "model": "deepseek/deepseek-v4-flash",
+            "model": "openai/gpt-5.4-mini",
             "description": (
-                "fast DeepSeek V4 Flash route for trivial chat, short rewrites, "
+                "fast GPT-5.4 Mini route for trivial chat, short rewrites, "
                 "extraction, and low-risk simple Q&A"
             ),
             "supports_image": False,
@@ -573,7 +573,7 @@ def _default_tiers() -> dict:
         },
         "c1": {
             "provider": "openrouter",
-            "model": "deepseek/deepseek-v4-pro",
+            "model": "anthropic/claude-sonnet-4.6",
             "description": (
                 "default balanced text model for normal agent work, coding assistance, "
                 "debugging, and moderate analysis"
@@ -583,9 +583,9 @@ def _default_tiers() -> dict:
         },
         "c2": {
             "provider": "openrouter",
-            "model": "z-ai/glm-5.2",
+            "model": "openai/gpt-5.5",
             "description": (
-                "stronger text model for multi-step coding, structured reasoning, "
+                "stronger GPT-5.5 route for multi-step coding, structured reasoning, "
                 "larger context synthesis, and harder analysis"
             ),
             "supports_image": False,
@@ -930,6 +930,7 @@ class SquillaRouterConfig(BaseSettings):
     rollout_phase: str = "full"  # "observe" | "prompt_only" | "full"
     strategy: str = "v4_phase3"
     tier_profile: str | None = None
+    visual_mode: str = "real_candidates"
     tiers: dict = Field(default_factory=_default_tiers)
     default_tier: str = DEFAULT_TEXT_TIER
     confidence_threshold: float = 0.5
@@ -955,6 +956,17 @@ class SquillaRouterConfig(BaseSettings):
     vision_followup_gate_max_output_tokens: int = Field(default=512, ge=16)
     vision_followup_gate_fallback_recent_turns: int = Field(default=2, ge=0)
     vision_followup_gate_unknown_policy: str = "image_if_recent"
+
+    @field_validator("visual_mode", mode="before")
+    @classmethod
+    def _normalize_visual_mode(cls, value: Any) -> str:
+        raw = "real_candidates" if value is None else str(value).strip().lower()
+        normalized = raw.replace("-", "_")
+        if normalized in {"", "real_candidates", "candidates"}:
+            return "real_candidates"
+        if normalized in {"legacy_grid", "model_space", "modelspace"}:
+            return "legacy_grid"
+        raise ValueError("visual_mode must be one of: real_candidates, legacy_grid")
 
     @model_validator(mode="before")
     @classmethod
@@ -1013,6 +1025,28 @@ class CompactionLlmConfig(BaseSettings):
     enabled: bool = True
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
     protected_recent_messages: int = Field(default=0, ge=0)
+
+
+class SessionNamingConfig(BaseSettings):
+    """LLM-generated session titles (auto-naming).
+
+    After the first user message, a one-shot LLM call summarizes it into a short
+    title written to SessionNode.derived_title. Model selection mirrors compaction
+    but defaults to the router's default text tier rather than the session model:
+    ``model`` (explicit) > ``tier`` model > squilla_router.default_tier model.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_NAMING_")
+
+    enabled: bool = True
+    # Surfaces eligible for auto-naming. webchat/cli are chat; channel covers
+    # inbound channel conversations. cron/subagent intentionally excluded.
+    surfaces: list[str] = Field(default_factory=lambda: ["webchat", "cli", "channel"])
+    tier: str | None = None  # None = use squilla_router.default_tier
+    model: str | None = None  # None = use the resolved tier's model
+    timeout_seconds: float = 30.0
+    max_chars: int = Field(default=48, ge=8)
+    language: str = "auto"  # follow the conversation language
 
 
 class MCPServerEntry(BaseSettings):
@@ -1563,6 +1597,7 @@ class GatewayConfig(BaseSettings):
     squilla_router: SquillaRouterConfig = Field(default_factory=SquillaRouterConfig)
     agent_token_saving: AgentTokenSavingConfig = Field(default_factory=AgentTokenSavingConfig)
     compaction: CompactionLlmConfig = Field(default_factory=CompactionLlmConfig)
+    naming: SessionNamingConfig = Field(default_factory=SessionNamingConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
     image_generation: ImageGenerationConfig = Field(default_factory=ImageGenerationConfig)

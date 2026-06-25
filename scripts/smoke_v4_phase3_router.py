@@ -34,19 +34,19 @@ from opensquilla.gateway.config import GatewayConfig  # noqa: E402
 TIERS = {
     "c0": {
         "provider": "openrouter",
-        "model": "deepseek/deepseek-v4-flash",
+        "model": "openai/gpt-5.4-mini",
         "description": "short text and trivial follow-ups",
         "thinking_level": "high",
     },
     "c1": {
         "provider": "openrouter",
-        "model": "deepseek/deepseek-v4-pro",
+        "model": "anthropic/claude-sonnet-4.6",
         "description": "normal coding and agent tasks",
         "thinking_level": "high",
     },
     "c2": {
         "provider": "openrouter",
-        "model": "z-ai/glm-5.2",
+        "model": "openai/gpt-5.5",
         "description": "structured multi-step work",
         "thinking_level": "high",
     },
@@ -948,17 +948,17 @@ def _live_tier_model_map(live_model: str) -> dict[str, str]:
         "c0": _tier_model_env(
             "OPENSQUILLA_LIVE_LLM_C0_MODEL",
             "OPENSQUILLA_LIVE_LLM_T0_MODEL",
-            "deepseek/deepseek-v4-flash",
+            "openai/gpt-5.4-mini",
         ),
         "c1": _tier_model_env(
             "OPENSQUILLA_LIVE_LLM_C1_MODEL",
             "OPENSQUILLA_LIVE_LLM_T1_MODEL",
-            "deepseek/deepseek-v4-pro",
+            "anthropic/claude-sonnet-4.6",
         ),
         "c2": _tier_model_env(
             "OPENSQUILLA_LIVE_LLM_C2_MODEL",
             "OPENSQUILLA_LIVE_LLM_T2_MODEL",
-            "z-ai/glm-5.2",
+            "openai/gpt-5.5",
         ),
         "c3": _tier_model_env(
             "OPENSQUILLA_LIVE_LLM_C3_MODEL",

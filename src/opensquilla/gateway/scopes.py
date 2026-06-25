@@ -88,6 +88,7 @@ METHOD_SCOPES: dict[str, str] = {
     "config.schema.lookup": READ_SCOPE,
     "sessions.get": READ_SCOPE,
     "sessions.list": READ_SCOPE,
+    "sessions.search": READ_SCOPE,
     "sessions.preview": READ_SCOPE,
     "sessions.resolve": READ_SCOPE,
     "sessions.subscribe": READ_SCOPE,
@@ -170,9 +171,11 @@ METHOD_SCOPES: dict[str, str] = {
     "exec.approval.snapshot": APPROVALS_SCOPE,
     "exec.approval.forget": APPROVALS_SCOPE,
     "exec.approval.resolve": APPROVALS_SCOPE,
+    "exec.approval.extend": APPROVALS_SCOPE,
     "plugin.approval.request": APPROVALS_SCOPE,
     "plugin.approval.waitDecision": APPROVALS_SCOPE,
     "plugin.approval.resolve": APPROVALS_SCOPE,
+    "plugin.approval.extend": APPROVALS_SCOPE,
     # ----- proposals (auto-propose UI: list/show) -----
     # ``exec.proposals.*`` prefix sits OUTSIDE the ``exec.approvals.``
     # admin prefix so that proposal browsing can remain operator-visible.

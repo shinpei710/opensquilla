@@ -55,6 +55,11 @@ from opensquilla.session.compaction_lifecycle import (
 )
 from opensquilla.session.keys import canonicalize_session_key, normalize_agent_id, parse_agent_id
 from opensquilla.session.models import SessionStatus
+from opensquilla.session.naming import (
+    generate_session_title,
+    is_naming_eligible,
+    title_slot_is_empty,
+)
 from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 
 _d = get_dispatcher()
@@ -877,6 +882,160 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
     return {"sessions": result, "count": len(result), "ts": now_ms}
 
 
+async def _titles_for_keys(storage: Any, keys: list[str], now_ms: int) -> dict[str, str]:
+    """Resolve canonical session_key -> sidebar title for a small set of keys.
+
+    Labels transcript (content) hits without rebuilding the whole session list.
+    Bounded by the search limit, so this is a handful of point lookups.
+    """
+    unique = list(dict.fromkeys(canonicalize_session_key(k) for k in keys if k))
+    sessions: list[Any] = []
+    for key in unique:
+        try:
+            node = await storage.get_session(key)
+        except Exception:
+            node = None
+        if node is not None:
+            sessions.append(node)
+    if not sessions:
+        return {}
+    transcript_titles = await _list_transcript_titles(storage, sessions)
+    out: dict[str, str] = {}
+    for node in sessions:
+        view = build_session_view_item(
+            node,
+            entry_count=0,
+            task_rows=[],
+            now_ms=now_ms,
+            transcript_title=transcript_titles.get(getattr(node, "session_id", ""), ""),
+        )
+        out[canonicalize_session_key(node.session_key)] = str(view.get("title") or "")
+    return out
+
+
+@_d.method("sessions.search", scope="operator.read")
+async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
+    """Search sessions by title and by transcript content.
+
+    ``sessions`` holds title matches across ALL sessions (not just a recent
+    page); ``messages`` holds content matches. Content search uses the ranked
+    FTS index for ASCII queries and a substring (LIKE) scan for queries the FTS
+    tokenizer can't segment (CJK and other non-ASCII scripts), so Chinese
+    conversations are searchable too. Covers every surface (webchat, channels,
+    cron) because the transcript store is shared. Titles are derived the same
+    way ``sessions.list`` derives them so results read like the sidebar.
+    """
+    now_ms = int(time.time() * 1000)
+    query = ""
+    limit = 20
+    if isinstance(params, dict):
+        query = str(params.get("query") or "").strip()
+        try:
+            limit = int(params.get("limit", 20))
+        except (TypeError, ValueError):
+            limit = 20
+    limit = max(1, min(limit, 50))
+
+    empty = {"sessions": [], "messages": [], "query": query, "ts": now_ms}
+    if not query or ctx.session_manager is None:
+        return empty
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        return empty
+
+    # ── Title hits ───────────────────────────────────────────────────────────
+    # Prefer the dedicated global query (matches every session, builds view rows
+    # only for the matches). Fall back to a bounded recent scan for storage
+    # doubles that don't implement it.
+    title_search = getattr(storage, "search_sessions_by_title", None)
+    if callable(title_search):
+        title_sessions = await title_search(query, limit)
+    else:
+        needle = query.lower()
+        recent = await storage.list_sessions(limit=200)
+        title_sessions = [
+            s
+            for s in recent
+            if needle
+            in " ".join(
+                p
+                for p in (
+                    str(getattr(s, "display_name", "") or ""),
+                    str(getattr(s, "derived_title", "") or ""),
+                    str(getattr(s, "subject", "") or ""),
+                )
+                if p
+            ).lower()
+        ][:limit]
+
+    transcript_titles = await _list_transcript_titles(storage, title_sessions)
+    session_hits: list[dict[str, Any]] = []
+    title_keys: set[str] = set()
+    for s in title_sessions:
+        view = build_session_view_item(
+            s,
+            entry_count=0,
+            task_rows=[],
+            now_ms=now_ms,
+            transcript_title=transcript_titles.get(getattr(s, "session_id", ""), ""),
+        )
+        title_keys.add(canonicalize_session_key(s.session_key))
+        session_hits.append(
+            {
+                "key": s.session_key,
+                "title": str(view.get("title") or ""),
+                "effectiveAgentId": view.get("effectiveAgentId"),
+                "surface": view.get("surface"),
+                "updatedAt": view.get("updatedAt"),
+            }
+        )
+
+    # ── Content hits ─────────────────────────────────────────────────────────
+    # ASCII queries use the ranked, indexed FTS path. Non-ASCII queries (CJK and
+    # other scripts the FTS tokenizer can't segment) use a substring LIKE scan —
+    # the only option for them. ASCII deliberately has NO LIKE fallback so a
+    # common keystroke can never trigger an unbounded full-table content scan.
+    has_like = hasattr(storage, "search_transcript_like")
+    non_ascii = any(ord(ch) > 127 for ch in query)
+    rows: list[dict[str, Any]] = []
+    try:
+        if non_ascii:
+            if has_like:
+                rows = await storage.search_transcript_like(query, limit=limit)
+        else:
+            rows = await storage.search_transcript(query, limit=limit)
+    except Exception:
+        log.warning("sessions.search.transcript_failed", exc_info=True)
+        rows = []
+
+    # One row per session, never repeating a session already shown as a title
+    # hit, enriched with the session title via a small bounded lookup.
+    pending: list[tuple[str, str, dict[str, Any]]] = []
+    content_keys: set[str] = set()
+    for row in rows:
+        raw_key = str(row.get("session_key") or "")
+        canon = canonicalize_session_key(raw_key)
+        if not canon or canon in title_keys or canon in content_keys:
+            continue
+        content_keys.add(canon)
+        pending.append((raw_key, canon, row))
+
+    title_map = await _titles_for_keys(storage, [canon for _, canon, _ in pending], now_ms)
+    message_hits: list[dict[str, Any]] = []
+    for raw_key, canon, row in pending:
+        message_hits.append(
+            {
+                "key": raw_key,
+                "title": title_map.get(canon, ""),
+                "role": row.get("role"),
+                "snippet": row.get("snippet") or "",
+                "createdAt": row.get("created_at"),
+            }
+        )
+
+    return {"sessions": session_hits, "messages": message_hits, "query": query, "ts": now_ms}
+
+
 @_d.method("sessions.create", scope="operator.write")
 async def _handle_sessions_create(params: dict | None, ctx: RpcContext) -> dict:
     if not isinstance(params, dict):
@@ -969,6 +1128,40 @@ async def _handle_sessions_fork(params: dict | None, ctx: RpcContext) -> dict:
     return {"key": child.session_key, "parentKey": key}
 
 
+async def _should_auto_title(
+    ctx: RpcContext,
+    storage: Any,
+    session: Any,
+    key: str,
+    session_id: str,
+) -> bool:
+    """Whether to spawn LLM auto-naming for this send (first user message only).
+
+    Cheap checks first; the transcript-count query only runs for sessions that
+    are eligible and still lack a title, so titled/established sessions cost
+    nothing. Best-effort: any failure disables naming for this turn.
+    """
+    try:
+        naming_cfg = getattr(getattr(ctx, "config", None), "naming", None)
+        if naming_cfg is None or not getattr(naming_cfg, "enabled", False):
+            return False
+        if not title_slot_is_empty(session):
+            return False
+        from opensquilla.gateway.session_view import _session_kind, _surface
+
+        origin = getattr(session, "origin", None)
+        origin_map = origin if isinstance(origin, dict) else {}
+        surface = _surface(session, key, origin_map)
+        session_kind = _session_kind(session, key, surface, origin_map)
+        if not is_naming_eligible(naming_cfg, surface, session_kind):
+            return False
+        # First user message: the session had no transcript entries before this
+        # send (the current message is persisted by the TurnRunner afterwards).
+        return bool(await storage.count_transcript_entries(session_id) == 0)
+    except Exception:  # noqa: BLE001 - naming is best-effort
+        return False
+
+
 @_d.method("sessions.send", scope="operator.write")
 async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
     key = _require_key(params)
@@ -1025,6 +1218,9 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
         if isinstance(canonical_session_id, str) and canonical_session_id
         else key.split(":")[-1] or key
     )
+    # Capture the auto-naming decision before the turn task runs, so the
+    # first-message check reflects pre-turn transcript state.
+    _generate_title = await _should_auto_title(ctx, storage, session, key, session_id)
     disk_budget = getattr(attachments_cfg, "transcript_disk_budget_bytes", None)
     ingested_attachments = await _attachment_ingest.ingest_attachments(
         message_text,
@@ -1471,6 +1667,13 @@ async def _handle_sessions_send(params: dict | None, ctx: RpcContext) -> dict:
                 await _store.evict(_u)
             except Exception:  # noqa: BLE001 — eviction is best-effort
                 log.warning("uploads.evict_failed_post_turn uuid=%s", _u[:8])
+    if _generate_title:
+        # Fire-and-forget: auto-name the session from its first user message.
+        # Independent of the turn; writes derived_title + broadcasts on success.
+        asyncio.create_task(
+            generate_session_title(ctx, key, semantic_message_text or message_text),
+            name=f"session-title:{key}",
+        )
     return {"status": "accepted", "key": key}
 
 
