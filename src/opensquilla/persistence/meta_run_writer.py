@@ -493,12 +493,16 @@ class MetaRunWriter:
         meta_skill_name: str,
         meta_plan: MetaPlan,
         triggered_by: Literal[
-            "hard_takeover", "soft_meta_invoke", "auto_cron", "auto_dream",
+            "hard_takeover",
+            "soft_meta_invoke",
+            "auto_cron",
+            "auto_dream",
+            "manual_command",
         ],
         inputs: Mapping[str, Any],
         session_key: str | None,
         turn_id: str | None,
-    ) -> str:
+    ) -> str | None:
         run_id = self._id_gen()
         snapshot_json, digest = _serialize_plan(meta_plan)
         inputs_json = _redact_inputs_json(inputs, max_bytes=self._max_field_bytes)
@@ -521,6 +525,7 @@ class MetaRunWriter:
                 self._conn.commit()
         except Exception as exc:  # noqa: BLE001
             log.warning("meta_run_writer.begin_run_failed: %s", exc)
+            return None
         return run_id
 
     def begin_step_sync(

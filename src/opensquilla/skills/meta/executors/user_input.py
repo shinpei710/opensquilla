@@ -140,6 +140,67 @@ class _DAOProto(Protocol):
     ) -> bool: ...
 
 
+def _claim_failure_message(
+    dao: _DAOProto,
+    *,
+    run_id: str,
+    step_id: str,
+    session_id: str,
+) -> str:
+    get_run = getattr(dao, "get_run", None)
+    if callable(get_run):
+        try:
+            run = get_run(run_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "meta_user_input.claim_failure_get_run_failed",
+                run_id=run_id,
+                step=step_id,
+                error=str(exc),
+            )
+            run = ...
+        if run is None:
+            return (
+                f"meta run {run_id!r} was not found while step {step_id!r} "
+                "was entering awaiting_user; meta-skill persistence did not "
+                "create or retain the running row"
+            )
+        status = getattr(run, "status", None)
+        if isinstance(status, str) and status != "running":
+            return (
+                f"meta run {run_id!r} is {status!r} while step {step_id!r} "
+                "was entering awaiting_user; expected status 'running'"
+            )
+
+    peek_awaiting = getattr(dao, "peek_awaiting", None)
+    if callable(peek_awaiting):
+        try:
+            awaiting = peek_awaiting(session_id=session_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "meta_user_input.claim_failure_peek_awaiting_failed",
+                run_id=run_id,
+                step=step_id,
+                session_id=session_id,
+                error=str(exc),
+            )
+            awaiting = None
+        if awaiting is not None:
+            awaiting_run_id = getattr(awaiting, "run_id", "")
+            awaiting_step_id = getattr(awaiting, "step_id", "")
+            if isinstance(awaiting_run_id, str) and isinstance(awaiting_step_id, str):
+                return (
+                    f"session {session_id!r} already has awaiting_user run "
+                    f"{awaiting_run_id!r} at step {awaiting_step_id!r}; "
+                    f"step {step_id!r} in run {run_id!r} cannot claim awaiting_user"
+                )
+
+    return (
+        f"awaiting claim rejected for run_id={run_id!r} step={step_id!r} "
+        f"(run is no longer 'running' or partial unique index conflict)"
+    )
+
+
 async def run_user_input_step(
     step: MetaStep,
     *,
@@ -322,8 +383,12 @@ async def run_user_input_step(
 
     if not claimed:
         raise RuntimeError(
-            f"awaiting claim rejected for run_id={run_id!r} step={step.id!r} "
-            f"(run is no longer 'running' or partial unique index conflict)",
+            _claim_failure_message(
+                dao,
+                run_id=run_id,
+                step_id=step.id,
+                session_id=session_id,
+            ),
         )
 
     raise MetaPaused(

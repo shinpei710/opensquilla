@@ -83,6 +83,28 @@ async def test_no_skip_raises_meta_paused_after_successful_cas():
     assert kwargs["awaiting_since"] == 1700000000.0
 
 
+@pytest.mark.asyncio
+async def test_claim_failure_reports_missing_run_instead_of_generic_rejection():
+    dao = MagicMock()
+    dao.try_claim_awaiting.return_value = False
+    dao.get_run.return_value = None
+
+    with pytest.raises(RuntimeError) as exc:
+        await run_user_input_step(
+            _step(_cfg()),
+            inputs={"user_message": "hi", "collected": {}},
+            outputs={"upstream": "some output"},
+            run_id="missing-run",
+            session_id="S1",
+            dao=dao,
+            now=lambda: 1700000000.0,
+        )
+
+    message = str(exc.value)
+    assert "meta run 'missing-run' was not found" in message
+    assert "awaiting claim rejected" not in message
+
+
 def test_clarify_copy_renders_against_inputs_and_outputs():
     cfg = ClarifyStepConfig(
         mode="form",

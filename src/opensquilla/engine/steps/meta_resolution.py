@@ -35,7 +35,10 @@ from typing import Any
 import structlog
 
 from opensquilla.engine.pipeline import TurnContext
-from opensquilla.skills.meta.clarify_autofill import autofill_required_clarify_fields
+from opensquilla.skills.meta.clarify_autofill import (
+    autofill_required_clarify_fields,
+    is_empty_clarify_submission,
+)
 from opensquilla.skills.meta.clarify_nl_extract import extract as _nl_extract
 from opensquilla.skills.meta.clarify_text import parse_clarify_reply
 from opensquilla.skills.meta.inputs import (
@@ -1125,7 +1128,11 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
                 if not partial_errors and partial:
                     parsed = {**previously_filled, **partial}
             candidate_fields = {**previously_filled, **parsed}
-            if _clarify_errors_allow_autofill(errors):
+            infer_optional_fields = (
+                is_structured_clarify_form
+                and is_empty_clarify_submission(candidate_fields)
+            )
+            if infer_optional_fields or _clarify_errors_allow_autofill(errors):
                 try:
                     inputs_for_autofill = _json_object(awaiting.inputs_json)
                     outputs_for_autofill = _json_object(awaiting.step_outputs_json)
@@ -1136,6 +1143,7 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
                         clarify_reply=ctx.message,
                         prior_step_outputs=outputs_for_autofill,
                         llm_chat=ctx.metadata.get("meta_llm_chat"),
+                        infer_optional_fields=infer_optional_fields,
                     )
                 except Exception as exc:  # noqa: BLE001
                     log.warning(
@@ -1157,6 +1165,9 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
                 ctx.metadata["meta_clarify_autofilled_fields"] = sorted(
                     completed_auto.keys()
                 )
+            elif infer_optional_fields and not missing_after_autofill:
+                parsed = filled_auto
+                errors = []
             if errors:
                 failure_count = writer.increment_parse_failures(
                     run_id=awaiting.run_id,

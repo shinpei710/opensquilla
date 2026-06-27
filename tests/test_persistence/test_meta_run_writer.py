@@ -90,6 +90,24 @@ def test_begin_finish_run_roundtrip(writer: MetaRunWriter) -> None:
     assert len(record.meta_skill_digest) == 64  # sha256 hex
 
 
+def test_begin_run_accepts_manual_command_trigger(writer: MetaRunWriter) -> None:
+    plan = _make_plan()
+    run_id = writer.begin_run_sync(
+        meta_skill_name=plan.name,
+        meta_plan=plan,
+        triggered_by="manual_command",
+        inputs={"user_message": "/meta demo"},
+        session_key="sess-manual",
+        turn_id="turn-manual",
+    )
+    assert run_id is not None
+
+    record = writer.get_run(run_id)
+    assert record is not None
+    assert record.triggered_by == "manual_command"
+    assert record.status == "running"
+
+
 def test_step_lifecycle(writer: MetaRunWriter) -> None:
     plan = _make_plan()
     run_id = writer.begin_run_sync(
@@ -511,6 +529,14 @@ def test_writer_failures_dont_raise(tmp_path: Path) -> None:
     w = open_meta_run_writer(db)
     w.close()  # connection now closed
     # Subsequent calls must not raise
+    assert w.begin_run_sync(
+        meta_skill_name="demo",
+        meta_plan=_make_plan(),
+        triggered_by="soft_meta_invoke",
+        inputs={},
+        session_key=None,
+        turn_id=None,
+    ) is None
     w.begin_step_sync(
         run_id="bogus", step=MetaStep(id="s", skill="x", kind="agent"),
         effective_skill="x", rendered_inputs={},
