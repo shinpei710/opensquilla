@@ -173,6 +173,10 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     assert "code-task', 'smoke-imports'" in verifier
     assert "code-task', 'smoke-router'" in verifier
     assert "timeout: 120000" in verifier
+    assert "OPENSQUILLA_GATEWAY_SMOKE_TIMEOUT_MS" in _read(
+        "desktop/electron/scripts/smoke-gateway.mjs"
+    )
+    assert "'90000'" in _read("desktop/electron/scripts/smoke-gateway.mjs")
 
 
 def test_windows_release_workflow_fails_fast_after_gateway_build_failure() -> None:

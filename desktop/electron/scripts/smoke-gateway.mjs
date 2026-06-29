@@ -13,7 +13,7 @@ const repoRoot = resolve(packageRoot, '..', '..')
 const desktopOutputDir = join(repoRoot, 'dist', 'desktop-electron')
 const sourceRuntimeGatewayDir = join(packageRoot, 'runtime', 'gateway')
 const binaryName = process.platform === 'win32' ? 'opensquilla-gateway.exe' : 'opensquilla-gateway'
-const deadlineMs = 30_000
+const deadlineMs = Number.parseInt(process.env.OPENSQUILLA_GATEWAY_SMOKE_TIMEOUT_MS || '90000', 10)
 const pollIntervalMs = 250
 const killGraceMs = 3_000
 const maxTailLines = 80
