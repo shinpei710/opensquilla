@@ -20,6 +20,7 @@ from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.pricing import lookup_price
 from opensquilla.provider.context_capabilities import provider_state_continuity_diagnostic
 from opensquilla.router_control import RouterControlHoldStore
+from opensquilla.router_runtime_diagnostics import router_runtime_operator_message
 from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
     HIGHEST_TEXT_TIER,
@@ -58,17 +59,6 @@ _router_runtime_warning_lock = threading.Lock()
 _router_runtime_warning_emitted = False
 _MAX_ROUTING_HISTORY = 5
 _ROUTING_HISTORY_WINDOW = 1800
-_ROUTER_RUNTIME_FALLBACK_MESSAGE = (
-    "OpenSquilla router fallback active: bundled ONNX router failed to load. "
-    "OpenSquilla can still start with safe router fallback, but bundled ONNX "
-    "model routing is disabled until the router runtime is available. On Windows, "
-    "Microsoft Visual C++ Redistributable 2015-2022 x64 is required for the "
-    "bundled ONNX router. If automatic installation fails, install it manually: "
-    "https://aka.ms/vs/17/release/vc_redist.x64.exe. After installing, reopen "
-    "PowerShell and restart OpenSquilla."
-)
-
-
 def _router_text_fallback_chain(
     selected_tier: object,
     tiers: dict,
@@ -371,7 +361,7 @@ def _warn_router_runtime_fallback_once(error: Exception | str) -> None:
         if _router_runtime_warning_emitted:
             return
         _router_runtime_warning_emitted = True
-    _log_std.warning("%s Error: %s", _ROUTER_RUNTIME_FALLBACK_MESSAGE, error)
+    _log_std.warning("%s Error: %s", router_runtime_operator_message(error), error)
 
 
 def _get_strategy(config: object) -> RouterStrategy:

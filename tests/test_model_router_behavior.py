@@ -67,6 +67,15 @@ class ExplodingV4Strategy:
         )
 
 
+class MacLibompExplodingV4Strategy:
+    def __init__(self, *args, **kwargs) -> None:
+        raise RuntimeError(
+            "failed to initialize V4 Phase 3 router: dlopen("
+            ".../lightgbm/lib/lib_lightgbm.dylib, 0x0006): Library not loaded: "
+            "@rpath/libomp.dylib Referenced from: .../lib_lightgbm.dylib"
+        )
+
+
 @pytest.fixture(autouse=True)
 def reset_squilla_router_state(monkeypatch: pytest.MonkeyPatch) -> None:
     squilla_router_step._history_store.clear()
@@ -1144,6 +1153,31 @@ async def test_router_runtime_failure_emits_one_operator_warning(
     assert "safe router fallback" in messages[0]
     assert "https://aka.ms/vs/17/release/vc_redist.x64.exe" in messages[0]
     assert "After installing, reopen PowerShell and restart OpenSquilla" in messages[0]
+
+
+@pytest.mark.asyncio
+async def test_router_runtime_failure_emits_macos_libomp_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import opensquilla.squilla_router.v4_phase3 as v4_phase3
+
+    monkeypatch.setattr(v4_phase3, "V4Phase3Strategy", MacLibompExplodingV4Strategy)
+    caplog.set_level(logging.WARNING)
+
+    ctx = make_context("Explain the setup steps.")
+    ctx.config.squilla_router.require_router_runtime = True
+    routed = await apply_squilla_router(ctx)
+
+    assert routed.metadata["routing_source"] == "v4_unavailable"
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if "brew install libomp" in record.getMessage()
+    ]
+    assert len(messages) == 1
+    assert "default-tier routing" in messages[0]
+    assert "opensquilla gateway restart" in messages[0]
 
 
 @pytest.mark.asyncio

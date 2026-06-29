@@ -122,6 +122,18 @@ opensquilla gateway restart
 On Windows, ONNX Runtime may need the Visual C++ Redistributable for Visual
 Studio 2015-2022 x64. Install it, then restart the shell and gateway.
 
+On macOS terminal installs, LightGBM may need the system OpenMP runtime. If
+startup logs `Library not loaded: @rpath/libomp.dylib` from
+`lightgbm/lib/lib_lightgbm.dylib`, install it and restart the gateway:
+
+```sh
+brew install libomp
+opensquilla gateway restart
+```
+
+The signed desktop app bundles the native runtime it needs; this recovery step
+is for terminal or source installs.
+
 ## Search Does Not Work
 
 Inspect search providers:

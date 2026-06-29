@@ -1575,6 +1575,25 @@ def validate_squilla_router_runtime(config: GatewayConfig) -> None:
     log.info("build_services.squilla_router_bundle_ready", bundle_dir=str(bundle_dir))
 
 
+def validate_squilla_router_runtime_deep(config: GatewayConfig) -> None:
+    """Validate router assets and load the ML runtime once."""
+    validate_squilla_router_runtime(config)
+    router_cfg = getattr(config, "squilla_router", None)
+    if router_cfg is None or not getattr(router_cfg, "enabled", False):
+        return
+
+    strategy = _preload_squilla_router_strategy(router_cfg)
+    if getattr(strategy, "_available", False):
+        return
+
+    error = getattr(strategy, "error", None)
+    if isinstance(error, BaseException):
+        raise RuntimeError(f"V4 Phase 3 router did not become available: {error}") from error
+    if error is not None:
+        raise RuntimeError(f"V4 Phase 3 router did not become available: {error}")
+    raise RuntimeError("V4 Phase 3 router did not become available")
+
+
 def _preload_squilla_router_strategy(router_cfg: Any) -> object:
     from opensquilla.engine.steps.squilla_router import preload_strategy
 
@@ -1597,10 +1616,13 @@ async def preload_squilla_router_runtime(config: GatewayConfig) -> None:
             raise RuntimeError("V4 Phase 3 router did not become available")
         log.warning("gateway.squilla_router_preload_unavailable", bundle_dir=str(bundle_dir))
     except Exception as exc:  # noqa: BLE001
+        from opensquilla.router_runtime_diagnostics import classify_router_runtime_error
+
         log.warning(
             "gateway.squilla_router_preload_failed",
             bundle_dir=str(bundle_dir),
             error=str(exc),
+            runtime_error_kind=classify_router_runtime_error(exc),
         )
 
 

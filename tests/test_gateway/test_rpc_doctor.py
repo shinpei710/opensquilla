@@ -72,11 +72,25 @@ def _optional_image_generation(ctx: RpcContext) -> dict[str, Any]:
     }
 
 
+def _ready_router(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "rolloutPhase": "full",
+        "strategy": "v4_phase3",
+        "tierProfile": "openrouter",
+        "defaultTier": "c1",
+        "runtimeValid": True,
+        "requireRouterRuntime": True,
+        "runtimeErrorKind": None,
+    }
+
+
 def _patch_ready_support_surfaces(monkeypatch: pytest.MonkeyPatch, rpc_doctor: Any) -> None:
     monkeypatch.setattr(rpc_doctor, "_handle_doctor_memory_status", _ready_memory)
     monkeypatch.setattr(rpc_doctor, "_handle_channels_status", _ready_channels)
     monkeypatch.setattr(rpc_doctor, "_handle_search_status", _ready_search)
     monkeypatch.setattr(rpc_doctor, "_build_logs_status", _ready_logs)
+    monkeypatch.setattr(rpc_doctor, "_router_payload", _ready_router)
     monkeypatch.setattr(
         rpc_doctor,
         "_image_generation_payload",
@@ -226,6 +240,7 @@ async def test_doctor_status_includes_search_and_image_generation_findings(
     monkeypatch.setattr(rpc_doctor, "_handle_channels_status", _ready_channels)
     monkeypatch.setattr(rpc_doctor, "_handle_search_status", search_status)
     monkeypatch.setattr(rpc_doctor, "_build_logs_status", _ready_logs)
+    monkeypatch.setattr(rpc_doctor, "_router_payload", _ready_router)
     monkeypatch.setattr(rpc_doctor, "_image_generation_payload", image_generation_payload)
 
     response = await get_dispatcher().dispatch(
@@ -388,7 +403,7 @@ async def test_doctor_status_includes_router_and_memory_embedding_findings(
             ],
         }
 
-    def router_payload(ctx: RpcContext) -> dict[str, Any]:
+    def router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
         return {
             "enabled": True,
             "rolloutPhase": "full",
@@ -396,6 +411,7 @@ async def test_doctor_status_includes_router_and_memory_embedding_findings(
             "tierProfile": "openrouter",
             "runtimeValid": False,
             "requireRouterRuntime": False,
+            "runtimeErrorKind": "router_assets_missing",
             "error": "missing V4 bundle files",
         }
 
@@ -426,6 +442,40 @@ async def test_doctor_status_includes_router_and_memory_embedding_findings(
     ids = [finding["id"] for finding in response.payload["findings"]]
     assert "router.runtime.missing" in ids
     assert "memory_embedding.config.error" in ids
+
+
+def test_router_payload_deep_mode_loads_runtime_and_classifies_native_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.gateway.boot as boot
+    import opensquilla.gateway.rpc_doctor as rpc_doctor
+
+    calls: list[str] = []
+
+    def light_validation(config: GatewayConfig) -> None:
+        calls.append("light")
+
+    def deep_validation(config: GatewayConfig) -> None:
+        calls.append("deep")
+        raise RuntimeError(
+            "dlopen(.../lightgbm/lib/lib_lightgbm.dylib, 0x0006): "
+            "Library not loaded: @rpath/libomp.dylib"
+        )
+
+    monkeypatch.setattr(boot, "validate_squilla_router_runtime", light_validation)
+    monkeypatch.setattr(boot, "validate_squilla_router_runtime_deep", deep_validation)
+
+    ctx = RpcContext(conn_id="test", config=GatewayConfig())
+
+    quick = rpc_doctor._router_payload(ctx, deep=False)
+    deep = rpc_doctor._router_payload(ctx, deep=True)
+
+    assert calls == ["light", "deep"]
+    assert quick["runtimeValid"] is True
+    assert quick["runtimeErrorKind"] is None
+    assert deep["runtimeValid"] is False
+    assert deep["runtimeErrorKind"] == "macos_libomp_missing"
+    assert "libomp.dylib" in deep["error"]
 
 
 @pytest.mark.asyncio

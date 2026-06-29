@@ -13,6 +13,10 @@ from typing import Any
 import structlog
 import yaml
 
+from opensquilla.router_runtime_diagnostics import (
+    classify_router_runtime_error,
+    router_runtime_hint,
+)
 from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
     ROUTE_CLASS_TO_TIER,
@@ -80,17 +84,13 @@ class V4Phase3Strategy:
         try:
             self._init_runtime(use_aux_head=use_aux_head)
         except Exception as exc:
-            missing_dep = isinstance(exc, ImportError) or isinstance(exc.__cause__, ImportError)
+            error_kind = classify_router_runtime_error(exc)
             log.error(
                 "v4_phase3.init_failed",
                 bundle_dir=str(self.bundle_dir),
                 error=str(exc),
-                hint=(
-                    "router ML runtime missing; install opensquilla[recommended] "
-                    "to enable v4_phase3 routing"
-                    if missing_dep
-                    else None
-                ),
+                runtime_error_kind=error_kind,
+                hint=router_runtime_hint(error_kind),
             )
             if require_router_runtime:
                 raise RuntimeError(f"failed to initialize V4 Phase 3 router: {exc}") from exc

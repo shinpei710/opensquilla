@@ -151,6 +151,11 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     assert "codesign" in build_gateway
     assert "'--force', '--sign', '-'" in build_gateway
     assert "@loader_path/libomp.dylib" in build_gateway
+    assert "verifyMacLightgbmRuntime" in verifier
+    assert "lightgbm/lib/lib_lightgbm.dylib" in verifier
+    assert "bundled libomp.dylib" in verifier
+    assert "otool" in verifier
+    assert "@loader_path/libomp.dylib" in verifier
     assert "code-task', 'stage-task-file'" in verifier
     assert "code-task', 'smoke-imports'" in verifier
     assert "code-task', 'smoke-router'" in verifier

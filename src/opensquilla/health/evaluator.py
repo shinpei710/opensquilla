@@ -4,6 +4,14 @@ import shlex
 from typing import Any
 
 from opensquilla.health.model import FixStep, HealthFinding, HealthSeverity
+from opensquilla.router_runtime_diagnostics import (
+    MACOS_LIBOMP_MISSING,
+    ROUTER_ASSETS_MISSING,
+    ROUTER_NATIVE_DEPENDENCY_MISSING,
+    ROUTER_PYTHON_DEPENDENCY_MISSING,
+    WINDOWS_VC_RUNTIME_MISSING,
+    classify_router_runtime_error,
+)
 
 _LEGACY_PROVIDER_REPLACEMENTS = {
     "zai": "zhipu",
@@ -788,6 +796,98 @@ def evaluate_image_generation(payload: dict[str, Any]) -> list[HealthFinding]:
     ]
 
 
+def _router_runtime_missing_guidance(
+    payload: dict[str, Any],
+) -> tuple[str, str, list[FixStep]]:
+    error = str(payload.get("error") or "The configured router runtime is unavailable.")
+    kind = str(payload.get("runtimeErrorKind") or classify_router_runtime_error(error))
+    if kind == MACOS_LIBOMP_MISSING:
+        return (
+            "Router native dependency is missing",
+            (
+                "LightGBM could not load macOS OpenMP runtime libomp.dylib. "
+                f"{error}"
+            ),
+            [
+                FixStep(label="Install macOS OpenMP runtime", command="brew install libomp"),
+                FixStep(label="Restart gateway", command="opensquilla gateway restart"),
+                FixStep(
+                    label="Disable local router",
+                    command="opensquilla configure router --router disabled",
+                ),
+            ],
+        )
+    if kind == WINDOWS_VC_RUNTIME_MISSING:
+        return (
+            "Router native dependency is missing",
+            (
+                "ONNX Runtime could not load on Windows. Install the Visual C++ "
+                f"Redistributable for Visual Studio 2015-2022 (x64). {error}"
+            ),
+            [
+                FixStep(
+                    label="Download Visual C++ Redistributable",
+                    command="https://aka.ms/vs/17/release/vc_redist.x64.exe",
+                ),
+                FixStep(label="Restart gateway", command="opensquilla gateway restart"),
+                FixStep(
+                    label="Disable local router",
+                    command="opensquilla configure router --router disabled",
+                ),
+            ],
+        )
+    if kind == ROUTER_ASSETS_MISSING:
+        return (
+            "Router runtime assets are missing",
+            error,
+            [
+                FixStep(
+                    label="Disable local router",
+                    command="opensquilla configure router --router disabled",
+                ),
+                FixStep(
+                    label="Reconfigure recommended router",
+                    command="opensquilla configure router --router recommended",
+                ),
+                FixStep(label="Restart gateway", command="opensquilla gateway restart"),
+            ],
+        )
+    if kind in {ROUTER_NATIVE_DEPENDENCY_MISSING, ROUTER_PYTHON_DEPENDENCY_MISSING}:
+        return (
+            "Router runtime dependency is missing",
+            error,
+            [
+                FixStep(
+                    label="Reinstall recommended dependencies",
+                    detail=(
+                        "Reinstall using the same release URL or source install command, "
+                        "including the recommended extra."
+                    ),
+                ),
+                FixStep(label="Restart gateway", command="opensquilla gateway restart"),
+                FixStep(
+                    label="Disable local router",
+                    command="opensquilla configure router --router disabled",
+                ),
+            ],
+        )
+    return (
+        "Router runtime is unavailable",
+        error,
+        [
+            FixStep(
+                label="Disable local router",
+                command="opensquilla configure router --router disabled",
+            ),
+            FixStep(
+                label="Reconfigure recommended router",
+                command="opensquilla configure router --router recommended",
+            ),
+            FixStep(label="Restart gateway", command="opensquilla gateway restart"),
+        ],
+    )
+
+
 def evaluate_router(payload: dict[str, Any]) -> list[HealthFinding]:
     if "enabled" not in payload:
         return _diagnostic_incomplete(
@@ -814,6 +914,11 @@ def evaluate_router(payload: dict[str, Any]) -> list[HealthFinding]:
     tier_profile = str(payload.get("tierProfile") or "custom")
     runtime_valid = bool(payload.get("runtimeValid"))
     require_runtime = bool(payload.get("requireRouterRuntime"))
+    runtime_error_kind = payload.get("runtimeErrorKind")
+    if not runtime_valid and not runtime_error_kind:
+        runtime_error_kind = classify_router_runtime_error(
+            str(payload.get("error") or "The configured router runtime is unavailable.")
+        )
     evidence = {
         "enabled": enabled,
         "rolloutPhase": rollout_phase,
@@ -822,6 +927,7 @@ def evaluate_router(payload: dict[str, Any]) -> list[HealthFinding]:
         "defaultTier": payload.get("defaultTier"),
         "runtimeValid": runtime_valid,
         "requireRouterRuntime": require_runtime,
+        "runtimeErrorKind": runtime_error_kind,
     }
 
     if not enabled:
@@ -845,25 +951,16 @@ def evaluate_router(payload: dict[str, Any]) -> list[HealthFinding]:
         ]
     if not runtime_valid:
         severity: HealthSeverity = "error" if require_runtime else "warn"
+        title, detail, fix_steps = _router_runtime_missing_guidance(payload)
         return [
             HealthFinding(
                 id="router.runtime.missing",
                 severity=severity,
                 surface="router",
-                title="Router runtime assets are missing",
-                detail=str(payload.get("error") or "The configured router runtime is unavailable."),
+                title=title,
+                detail=detail,
                 evidence=evidence,
-                fix_steps=[
-                    FixStep(
-                        label="Disable local router",
-                        command="opensquilla configure router --router disabled",
-                    ),
-                    FixStep(
-                        label="Reconfigure recommended router",
-                        command="opensquilla configure router --router recommended",
-                    ),
-                    FixStep(label="Restart gateway", command="opensquilla gateway restart"),
-                ],
+                fix_steps=fix_steps,
                 restart_required=True,
             )
         ]

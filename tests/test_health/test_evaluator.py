@@ -971,6 +971,33 @@ def test_router_evaluator_flags_required_missing_runtime_as_action_required() ->
     assert "opensquilla configure router --router disabled" in findings[0].fix_steps[0].command
 
 
+def test_router_evaluator_gives_macos_libomp_recovery() -> None:
+    findings = evaluate_router(
+        {
+            "enabled": True,
+            "rolloutPhase": "full",
+            "strategy": "v4_phase3",
+            "tierProfile": "openrouter",
+            "runtimeValid": False,
+            "requireRouterRuntime": True,
+            "runtimeErrorKind": "macos_libomp_missing",
+            "error": "Library not loaded: @rpath/libomp.dylib",
+        }
+    )
+
+    finding = findings[0]
+    assert finding.id == "router.runtime.missing"
+    assert finding.severity == "error"
+    assert finding.title == "Router native dependency is missing"
+    assert "libomp.dylib" in finding.detail
+    assert finding.evidence["runtimeErrorKind"] == "macos_libomp_missing"
+    assert [step.command for step in finding.fix_steps] == [
+        "brew install libomp",
+        "opensquilla gateway restart",
+        "opensquilla configure router --router disabled",
+    ]
+
+
 def test_memory_embedding_evaluator_flags_explicit_remote_without_key() -> None:
     findings = evaluate_memory_embedding(
         {

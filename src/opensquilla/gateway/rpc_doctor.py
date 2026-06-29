@@ -213,7 +213,7 @@ def _image_generation_api_key_env(config: Any, provider: str) -> str:
     return configured_env or str(spec.env_key or "")
 
 
-def _router_payload(ctx: RpcContext) -> dict[str, Any]:
+def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
     config = cast(GatewayConfig | None, getattr(ctx, "config", None))
     if config is None:
         return {
@@ -224,6 +224,7 @@ def _router_payload(ctx: RpcContext) -> dict[str, Any]:
             "defaultTier": None,
             "runtimeValid": True,
             "requireRouterRuntime": False,
+            "runtimeErrorKind": None,
         }
 
     router = config.squilla_router
@@ -236,17 +237,28 @@ def _router_payload(ctx: RpcContext) -> dict[str, Any]:
             "defaultTier": None,
             "runtimeValid": True,
             "requireRouterRuntime": False,
+            "runtimeErrorKind": None,
         }
 
     runtime_valid = True
     error: str | None = None
+    runtime_error_kind: str | None = None
     try:
-        from opensquilla.gateway.boot import validate_squilla_router_runtime
+        from opensquilla.gateway.boot import (
+            validate_squilla_router_runtime,
+            validate_squilla_router_runtime_deep,
+        )
 
-        validate_squilla_router_runtime(config)
+        if deep:
+            validate_squilla_router_runtime_deep(config)
+        else:
+            validate_squilla_router_runtime(config)
     except Exception as exc:  # noqa: BLE001 - doctor turns runtime validation into guidance.
+        from opensquilla.router_runtime_diagnostics import classify_router_runtime_error
+
         runtime_valid = False
         error = str(exc)
+        runtime_error_kind = classify_router_runtime_error(exc)
 
     return {
         "enabled": bool(getattr(router, "enabled", False)),
@@ -256,6 +268,7 @@ def _router_payload(ctx: RpcContext) -> dict[str, Any]:
         "defaultTier": getattr(router, "default_tier", None),
         "runtimeValid": runtime_valid,
         "requireRouterRuntime": bool(getattr(router, "require_router_runtime", False)),
+        "runtimeErrorKind": runtime_error_kind,
         "error": error,
     }
 
@@ -347,7 +360,7 @@ async def _handle_doctor_status(params: dict | None, ctx: RpcContext) -> dict[st
         ),
         ("channels", lambda: _handle_channels_status({}, ctx), evaluate_channels),
         ("sandbox", lambda: _sandbox_payload(ctx), evaluate_sandbox),
-        ("router", lambda: _router_payload(ctx), evaluate_router),
+        ("router", lambda: _router_payload(ctx, deep=deep), evaluate_router),
         (
             "memory_embedding",
             lambda: _memory_embedding_payload(ctx),

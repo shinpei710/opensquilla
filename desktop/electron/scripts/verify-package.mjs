@@ -101,6 +101,34 @@ function verifyGatewayCommand(binary, label, args, options = {}) {
   }
 }
 
+function verifyMacLightgbmRuntime(files, label) {
+  const lightgbmLibs = files.filter((path) => path.endsWith(join('lightgbm', 'lib', 'lib_lightgbm.dylib')))
+  if (lightgbmLibs.length === 0) {
+    fail(`${label} runtime is missing lightgbm/lib/lib_lightgbm.dylib`)
+    return
+  }
+
+  for (const lightgbmLib of lightgbmLibs) {
+    const bundledLibomp = join(dirname(lightgbmLib), 'libomp.dylib')
+    if (!files.includes(bundledLibomp)) {
+      fail(`${label} runtime is missing bundled libomp.dylib next to ${lightgbmLib}`)
+    }
+
+    if (process.platform !== 'darwin') continue
+    const result = spawnSync('otool', ['-L', lightgbmLib], {
+      encoding: 'utf8',
+      windowsHide: true,
+    })
+    if (result.error) {
+      fail(`${label} could not inspect ${lightgbmLib} with otool: ${result.error.message}`)
+    } else if (result.status !== 0) {
+      fail(`${label} otool -L failed for ${lightgbmLib}${outputTail(result)}`)
+    } else if (!result.stdout.includes('@loader_path/libomp.dylib')) {
+      fail(`${label} ${lightgbmLib} does not load libomp.dylib via @loader_path`)
+    }
+  }
+}
+
 async function listFiles(root) {
   const files = []
 
@@ -163,6 +191,10 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
     verifyGatewayCommand(binary, label, ['code-task', 'stage-task-file'], { input: 'desktop package smoke\n' })
     verifyGatewayCommand(binary, label, ['code-task', 'smoke-imports'], { timeout: 120000 })
     verifyGatewayCommand(binary, label, ['code-task', 'smoke-router'], { timeout: 120000 })
+  }
+
+  if (platform === 'darwin') {
+    verifyMacLightgbmRuntime(files, label)
   }
 }
 

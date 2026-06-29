@@ -91,6 +91,14 @@ startup logs a `DLL load failed` error, install it manually (see
 [Troubleshooting](#troubleshooting)). OpenSquilla keeps running with
 direct single-model routing until it is installed.
 
+On macOS terminal installs, SquillaRouter's LightGBM runtime may also
+need the system OpenMP library. The signed desktop app bundles the
+runtime it needs, but **Quick terminal install** does not install
+Homebrew/system libraries. If startup logs `Library not loaded:
+@rpath/libomp.dylib`, run `brew install libomp`, then restart the
+gateway. OpenSquilla keeps running with direct single-model routing
+until it is installed.
+
 Install links: [Git](https://git-scm.com/downloads) ·
 [Git LFS](https://git-lfs.com/) ·
 [uv](https://docs.astral.sh/uv/getting-started/installation/).
@@ -184,7 +192,10 @@ This installs the OpenSquilla wheel from the release URL, then lets
 `uv` download the dependencies declared by the selected extras. The
 default `recommended` extra includes SquillaRouter runtime dependencies
 such as ONNX Runtime, LightGBM, NumPy, and tokenizers, so a first install
-needs network access unless those wheels are already cached.
+needs network access unless those wheels are already cached. `uv` does
+not install system native runtimes such as macOS `libomp` or the Windows
+Visual C++ Redistributable; see [Troubleshooting](#troubleshooting) if
+the router runtime reports a native-library load error.
 
 **3. Configure and run.**
 
@@ -681,6 +692,25 @@ totals for the full run.
 ---
 
 ## Troubleshooting
+
+<details>
+<summary>macOS: <code>Library not loaded: @rpath/libomp.dylib</code></summary>
+
+If startup logs `Library not loaded: @rpath/libomp.dylib` from
+`lightgbm/lib/lib_lightgbm.dylib`, OpenSquilla keeps running with
+direct single-model routing, but the bundled `SquillaRouter` runtime
+stays inactive until the macOS OpenMP runtime is installed.
+
+The signed desktop app bundles the native runtime it needs. If you used
+Quick terminal install or source install from a shell, install `libomp`
+with Homebrew and restart the gateway:
+
+```sh
+brew install libomp
+opensquilla gateway restart
+```
+
+</details>
 
 <details>
 <summary>Windows: <code>DLL load failed</code> / Visual C++ runtime</summary>

@@ -153,7 +153,13 @@ If routing does not appear to work:
 
 3. If SquillaRouter optional dependencies are missing, OpenSquilla can still run
    with direct single-model routing. On Windows, ONNX Runtime may require the
-   Visual C++ Redistributable.
+   Visual C++ Redistributable. On macOS terminal installs, LightGBM may require
+   `libomp` from Homebrew:
+
+   ```sh
+   brew install libomp
+   opensquilla gateway restart
+   ```
 
 4. If you need deterministic model behavior for a run, disable routing:
 
