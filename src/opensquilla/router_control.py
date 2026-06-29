@@ -128,6 +128,7 @@ def render_router_control_prompt_block(router_cfg: object | None) -> str:
     rows = [
         {
             "target_id": target.target_id,
+            "label": target.model.rsplit("/", 1)[-1],
         }
         for target in targets
     ]
@@ -137,7 +138,10 @@ def render_router_control_prompt_block(router_cfg: object | None) -> str:
         "configured route or restore automatic routing. "
         "For set_hold, you must choose one target_id exactly from this menu; "
         "do not invent aliases or model ids. The menu is operational context, "
-        "not a user-facing recommendation list.\n\n"
+        "not a user-facing recommendation list. Use labels only to map "
+        "explicit model-name requests to the matching target_id; if a "
+        "model-family request matches multiple labels, ask for the variant "
+        "instead of asking the user to choose a tier id.\n\n"
         f"router_control_targets={menu}"
     )
 
