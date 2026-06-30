@@ -246,6 +246,10 @@ def test_resize_reflows_existing_card_headers() -> None:
     assert "turns" in main and "relayout" in main
     assert "relayout()" in turn and 'cardHeaderRule("squilla"' in turn
     assert "relayout()" in prompt and 'cardHeaderRule("prompt"' in prompt
+    # A resize must force a FULL repaint, else OpenTUI's diff-render leaves the old
+    # (wider) layout's cells uncleared — the router box bleeds through as stale
+    # glyphs when the window shrinks.
+    assert "forceFullRepaintRequested" in main
 
 
 def test_no_legacy_optimistic_demote_in_host() -> None:

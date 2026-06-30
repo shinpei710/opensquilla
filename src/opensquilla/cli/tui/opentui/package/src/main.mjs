@@ -254,6 +254,13 @@ async function main() {
     // Reflow every existing turn's full-width header rule to the new width, so a
     // resize re-rules the cards instead of leaving baked rules to wrap or strand.
     for (const t of turns) t.relayout?.();
+    // Force a FULL repaint after a resize. OpenTUI's standard (alternate-screen)
+    // resize path renders a DIFF, so cells the old — wider/taller — layout
+    // occupied are left uncleared: e.g. the router box's previous position and
+    // the composer's old right border bleed through as stale glyphs when the
+    // window shrinks. Forcing a full repaint clears the vacated cells.
+    renderer.forceFullRepaintRequested = true;
+    renderer.requestRender?.();
     const w = renderer.terminalWidth ?? 0;
     if (w && h) ipc.send({ type: "resize", width: w, height: h });
   });
