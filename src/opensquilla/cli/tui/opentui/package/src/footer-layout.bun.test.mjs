@@ -129,31 +129,37 @@ test("a footer without backgroundColor is transparent (contrast case)", async ()
   expect(bg.a).toBe(0);
 });
 
-test("composer and router boxes never overlap across widths", async () => {
+test("composer is one full-width box with the router strip on its own row above", async () => {
+  // The router is a single-line status strip on the TOP footer row; the composer
+  // is one full-width box below it. Nothing shares the composer's (caret's) rows
+  // — that adjacency is what corrupted the router under a macOS IME overlay, and
+  // removing it is the fix (mirrors opencode on the same @opentui/core engine).
   for (const width of [60, 80, 120, 160]) {
-    const top = rowText(await renderFooter({ width }), HEIGHT - FOOTER_HEIGHT);
-    const composerOpen = top.indexOf("╭");
-    const composerClose = top.indexOf("╮");
-    const routerOpen = top.lastIndexOf("╭");
-    const routerClose = top.lastIndexOf("╮");
-    expect(composerOpen).toBeGreaterThanOrEqual(0); // composer box present
-    expect(routerOpen).toBeGreaterThan(composerOpen); // a distinct second box
-    expect(composerClose).toBeGreaterThan(composerOpen);
-    // composer fully closes before the router box opens — i.e. no overlap.
-    expect(composerClose).toBeLessThan(routerOpen);
-    expect(routerClose).toBeGreaterThan(routerOpen);
+    const frame = await renderFooter({ width });
+    const stripRow = rowText(frame, HEIGHT - FOOTER_HEIGHT);
+    const boxTopRow = rowText(frame, HEIGHT - FOOTER_HEIGHT + 1);
+    // The strip carries the router fields and is NOT a box (no corner glyphs).
+    expect(stripRow).toContain("router");
+    expect(stripRow).toContain("model");
+    expect(stripRow.includes("╭")).toBe(false);
+    // Exactly ONE box on the composer's rows: a single ╭…╮ pair, no second box.
+    const open = boxTopRow.indexOf("╭");
+    const close = boxTopRow.indexOf("╮");
+    expect(open).toBeGreaterThanOrEqual(0);
+    expect(boxTopRow.lastIndexOf("╭")).toBe(open); // only one opening corner
+    expect(close).toBeGreaterThan(open);
+    expect(boxTopRow.lastIndexOf("╮")).toBe(close); // only one closing corner
   }
 });
 
-test("router model value stays out of the composer box after a resize", async () => {
+test("the router model renders on the strip, never on the composer/caret rows", async () => {
   const frame = await renderFooter({ width: 100, resizeTo: 60 });
-  const top = rowText(frame, HEIGHT - FOOTER_HEIGHT);
-  const composerClose = top.indexOf("╮");
-  const routerOpen = top.lastIndexOf("╭");
-  expect(composerClose).toBeLessThan(routerOpen);
-  // The model text must render inside the router box, never bleeding left into
-  // the composer placeholder region.
-  const modelRow = rowText(frame, HEIGHT - 5);
-  const modelIndex = modelRow.indexOf("deepseek-v4-pro");
-  expect(modelIndex).toBeGreaterThan(composerClose);
+  // The model value lives on the router strip (top footer row)...
+  const stripRow = rowText(frame, HEIGHT - FOOTER_HEIGHT);
+  expect(stripRow).toContain("deepseek-v4-pro");
+  // ...and never on the composer box's border or input/caret rows, where a macOS
+  // IME would composite its marked text and candidate popover.
+  for (const r of [HEIGHT - FOOTER_HEIGHT + 1, HEIGHT - FOOTER_HEIGHT + 2, HEIGHT - 1]) {
+    expect(rowText(frame, r).includes("deepseek-v4-pro")).toBe(false);
+  }
 });

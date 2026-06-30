@@ -6,9 +6,11 @@ const COMPLETION_MENU_RIGHT = 34;
 const COMPLETION_MENU_CHROME_CELLS = 4; // left/right border plus left/right padding
 const MIN_COMPLETION_ROW_CELLS = 16;
 const COMPOSER_LEFT = 1;
-const COMPOSER_RIGHT = 34;
 const COMPOSER_CONTENT_LEFT = COMPOSER_LEFT + 2; // border plus left padding
-const COMPOSER_CONTENT_TOP_OFFSET = 1; // top border
+// The composer box sits one row below the top of the footer (the router status
+// strip occupies that first row), so its first content row is 2 below footerTop:
+// the strip row (0) + the composer box's own top border (1).
+const COMPOSER_CONTENT_TOP_OFFSET = 2;
 
 // Pure key handling for the theme picker overlay (modeled on menuKeyAction):
 // up/down preview the highlighted theme live, enter keeps it, escape reverts.
@@ -347,13 +349,6 @@ export function createComposer(deps) {
   };
   let fileDebounce = null;
 
-  function colorForStyle(style) {
-    if (style === "warning") return THEME.warning;
-    if (style === "error") return THEME.error;
-    if (style === "dim") return THEME.muted;
-    return THEME.success;
-  }
-
   function statusIcon() {
     if (!turnStatus.active) return "✓";
     const frames = STATUS_PULSE_FRAMES[turnStatus.phase] ?? STATUS_PULSE_FRAMES.thinking;
@@ -659,9 +654,9 @@ export function createComposer(deps) {
       id: "composer-box",
       position: "absolute",
       left: COMPOSER_LEFT,
-      right: COMPOSER_RIGHT,
+      right: COMPOSER_LEFT, // full width: nothing shares the caret's rows
       bottom: 0,
-      height: footerHeight,
+      height: Math.max(1, footerHeight - 1), // the router strip takes the top row
       borderStyle: "rounded",
       borderColor: composer.disabled ? THEME.composerDisabledBorder : THEME.composerBorder,
       bottomTitle: `${statusIcon()} ${turnStatus.label}`,
@@ -680,26 +675,32 @@ export function createComposer(deps) {
     });
     inputBox.add(composerNode);
 
-    const routerNode = new BoxRenderable(renderer, {
-      id: "router-plugin",
+    // Router status as a compact single-line strip ABOVE the (now full-width)
+    // composer. Keeping it OFF the caret's rows is the fix for the macOS IME
+    // corruption: with no box sharing the rows where the terminal composites the
+    // marked-text / candidate overlay, there is no adjacent cell band for the
+    // terminal's wide-char accounting to desync. (opencode, on the same
+    // @opentui/core engine + alt-screen, is immune for exactly this reason — its
+    // status sits below the input and its sidebar is a disjoint column.)
+    const stripValue = (v) => clipToCells(String(v ?? "").replace(/\s+/gu, " ").trim() || "-", 18);
+    const routerStrip = new BoxRenderable(renderer, {
+      id: "router-strip",
       position: "absolute",
-      right: 1,
-      bottom: 0,
-      width: 31,
-      height: footerHeight,
-      borderStyle: "rounded",
-      borderColor: colorForStyle(routerState.style),
-      title: " router ",
-      titleAlignment: "left",
-      paddingLeft: 1,
-      paddingRight: 1,
-      flexDirection: "column",
+      top: 0,
+      left: COMPOSER_LEFT,
+      right: COMPOSER_LEFT,
+      height: 1,
+      flexDirection: "row",
+      backgroundColor: THEME.footerBg,
     });
-    routerNode.add(new TextRenderable(renderer, { id: "router-model", content: fixedRouterRow("model", routerModelValue()), fg: THEME.text }));
-    routerNode.add(new TextRenderable(renderer, { id: "router-route", content: fixedRouterRow("route", routerRouteValue()), fg: THEME.routeText }));
-    routerNode.add(new TextRenderable(renderer, { id: "router-saving", content: fixedRouterRow("save", routerState.saving), fg: THEME.metricPositive }));
-    routerNode.add(new TextRenderable(renderer, { id: "router-context", content: fixedRouterRow("ctx", routerState.context), fg: THEME.warning }));
-    inputBox.add(routerNode);
+    const addChip = (suffix, content, fg) =>
+      routerStrip.add(new TextRenderable(renderer, { id: `router-${suffix}`, content, fg }));
+    addChip("label", "router  ", THEME.brandAccentSoft);
+    addChip("model", `model ${stripValue(routerModelValue())}  `, THEME.text);
+    addChip("route", `route ${stripValue(routerRouteValue())}  `, THEME.routeText);
+    addChip("saving", `save ${stripValue(routerState.saving)}  `, THEME.metricPositive);
+    addChip("context", `ctx ${stripValue(routerState.context)}`, THEME.warning);
+    inputBox.add(routerStrip);
     renderCompletionMenu();
     // The theme picker shares the overlay layer, so a footer re-render (pulse
     // tick while a turn streams, router update, keystroke) clears it via
@@ -771,7 +772,7 @@ export function createComposer(deps) {
     const terminalHeight = Number(renderer?.terminalHeight ?? renderer?.height) || 24;
     const footerTop = Math.max(0, terminalHeight - footerHeight);
     const { line, col } = caretVisualLineCol();
-    const maxX = Math.max(COMPOSER_CONTENT_LEFT, terminalWidth - COMPOSER_RIGHT - 2);
+    const maxX = Math.max(COMPOSER_CONTENT_LEFT, terminalWidth - COMPOSER_CONTENT_LEFT - 1);
     const maxY = Math.max(footerTop, footerTop + footerHeight - 2);
     const x = clamp(COMPOSER_CONTENT_LEFT + col, COMPOSER_CONTENT_LEFT, maxX);
     const y = clamp(
