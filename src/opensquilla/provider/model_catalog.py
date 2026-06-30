@@ -81,6 +81,19 @@ def _static_fallback_entry(model_id: str) -> tuple[int, int] | None:
     return None
 
 
+def _price_per_1k(value: object) -> float:
+    """Convert an OpenRouter per-token price string to a per-1k-token float.
+
+    OpenRouter reports prices as per-token USD strings; downstream cost
+    accounting expects per-1k-token floats. Missing or non-numeric values
+    fall back to 0.0 (free / unknown).
+    """
+    try:
+        return float(value) * 1000.0  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class ModelCatalog:
     """In-memory cache of model metadata fetched from provider API.
 
@@ -111,6 +124,7 @@ class ModelCatalog:
             input_modalities = {
                 str(item).lower() for item in architecture.get("input_modalities", [])
             }
+            pricing = m.get("pricing") or {}
             self._models[model_id] = ModelInfo(
                 provider="openrouter",
                 model_id=model_id,
@@ -120,6 +134,8 @@ class ModelCatalog:
                 supports_reasoning="reasoning" in supported or "reasoning_effort" in supported,
                 supports_tools="tools" in supported or "tool_choice" in supported,
                 supports_vision="image" in input_modalities,
+                input_cost_per_1k=_price_per_1k(pricing.get("prompt")),
+                output_cost_per_1k=_price_per_1k(pricing.get("completion")),
             )
 
     def get_capabilities(

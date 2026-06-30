@@ -64,6 +64,32 @@ def test_static_fallback_qualified_and_unqualified_resolve_identically() -> None
         assert catalog.resolve_max_tokens(qualified) == catalog.resolve_max_tokens(bare)
 
 
+def test_populate_from_data_parses_openrouter_pricing() -> None:
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [
+            {
+                "id": "vendor/priced-model",
+                "context_length": 100_000,
+                "pricing": {"prompt": "0.0000025", "completion": "0.00001"},
+            },
+            {"id": "vendor/free-model", "context_length": 8_192},
+            {"id": "vendor/bad-pricing", "pricing": {"prompt": "n/a", "completion": None}},
+        ]
+    )
+
+    priced = catalog.get("vendor/priced-model")
+    assert priced is not None
+    assert priced.input_cost_per_1k == pytest.approx(0.0025)
+    assert priced.output_cost_per_1k == pytest.approx(0.01)
+    # Missing pricing block → 0.0
+    assert catalog.get("vendor/free-model").input_cost_per_1k == 0.0
+    # Non-numeric / None → 0.0 (no crash)
+    bad = catalog.get("vendor/bad-pricing")
+    assert bad.input_cost_per_1k == 0.0
+    assert bad.output_cost_per_1k == 0.0
+
+
 def test_openrouter_near_context_completion_window_uses_safe_default() -> None:
     catalog = ModelCatalog()
     catalog._populate_from_data(
