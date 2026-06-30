@@ -74,6 +74,22 @@ export const PALETTES = Object.freeze({
 export const DEFAULT_THEME = "opensquilla-dark";
 export const THEME_NAMES = Object.freeze(Object.keys(PALETTES));
 
+// One coherent run-state color vocabulary, shared by the in-card tool rows AND
+// the composer footer status pill so a step's live state reads the same top and
+// bottom. Derived from the SAME semantic palette as THEME (no new palette values)
+// and repopulated in place on every /theme switch, exactly like THEME.
+function toStatus(p) {
+  return {
+    running: p.accentSecondary, // a tool/turn in flight (soft brand orange)
+    ok: p.ok,
+    error: p.danger,
+    warn: p.warn,
+    queued: p.queued, // reserved for a future per-tool queued/permission signal
+    detail: p.textDim, // tool result preview + secondary lines
+    detailError: p.danger, // a result line under a failed tool
+  };
+}
+
 // Derive the host's render tokens from an OpenSquilla semantic palette. This is
 // the single source of how a theme maps onto the UI, so all themes are coherent.
 function toTokens(p) {
@@ -114,6 +130,8 @@ export function resolveThemeName(name) {
 // at render time, so applyTheme() repopulates this object IN PLACE and a re-render
 // recolors the UI without recreating any imports.
 export const THEME = {};
+// Live run-state colors (see toStatus); repopulated in place alongside THEME.
+export const STATUS = {};
 let activeTheme = DEFAULT_THEME;
 
 // Listeners fired AFTER THEME is repopulated, so host-owned derived state that is
@@ -129,6 +147,7 @@ export function onThemeApplied(listener) {
 export function applyTheme(name) {
   const resolved = resolveThemeName(name);
   Object.assign(THEME, toTokens(PALETTES[resolved]));
+  Object.assign(STATUS, toStatus(PALETTES[resolved]));
   activeTheme = resolved;
   for (const listener of _themeListeners) {
     try {
@@ -151,4 +170,6 @@ export const STATUS_PULSE_FRAMES = Object.freeze({
   thinking: ["∙", "•", "●", "•"],
   tool: ["◌", "◔", "◑", "◕"],
   output: ["◇", "◆", "◇", "◆"],
+  // A distinct half-filled "waiting" pulse, reserved for a future queued state.
+  queued: ["◍", "◌", "◍", "◌"],
 });

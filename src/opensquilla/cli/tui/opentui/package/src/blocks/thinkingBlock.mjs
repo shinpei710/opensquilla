@@ -7,20 +7,16 @@ import { TOOL_INDENT, clipToCells, stripTerminalControls, timelineAvailCells } f
 export function createThinkingBlock(ctx) {
   const { renderer, TextRenderable, box, idPrefix } = ctx;
   let text = "";
-  let railAdded = false;
   let lineCount = 0;
 
   function render() {
     const trimmed = stripTerminalControls(text).replace(/^\n+/, "");
     if (!trimmed) return;
-    if (!railAdded) {
-      const gt = new TextRenderable(renderer, { id: `${idPrefix}-gt`, content: `${TOOL_INDENT}│`, fg: THEME.detailText });
-      box.add(gt);
-      railAdded = true;
-    }
     const lines = trimmed.split("\n");
     lines.forEach((line, i) => {
-      const prefix = i === 0 ? `${TOOL_INDENT}✻ ` : `${TOOL_INDENT}│ `;
+      // The turn card's left border supplies the gutter; continuation lines just
+      // indent to align under the ✻ marker rather than redrawing their own "│".
+      const prefix = i === 0 ? `${TOOL_INDENT}✻ ` : `${TOOL_INDENT}  `;
       const avail = timelineAvailCells(prefix, renderer.terminalWidth);
       const content = `${prefix}${clipToCells(line, avail)}`;
       const id = `${idPrefix}-l${i}`;

@@ -158,7 +158,7 @@ async function main() {
 
   const dispatch = createDispatcher({
     turnBegin: (m) => { ensureTurn(m.id); },
-    turnEnd: () => { if (activeTurn) activeTurn.ended = true; },
+    turnEnd: () => { if (activeTurn) { activeTurn.finish?.(); activeTurn.ended = true; } },
     turnStatus: (m) => {
       statusActive = Boolean(m.active ?? statusActive);
       composer.setTurnStatus(m);

@@ -1,6 +1,10 @@
 export const TOOL_INDENT = " ";
 export const CARD_RULE_SHORT = "─".repeat(8);
 export const TIMELINE_WRAP_GUARD_CELLS = 6;
+// A single codex-style result-preview corner under a tool row, and the dim
+// separator before a completed tool's duration (e.g. "✓ grep foo · 0.2s").
+export const RESULT_CORNER = "└ ";
+export const DURATION_SEP = " · ";
 
 // Clamp the footer height to the terminal: never taller than the screen (a short
 // pane would otherwise overflow the fixed-height footer and corrupt the layout),

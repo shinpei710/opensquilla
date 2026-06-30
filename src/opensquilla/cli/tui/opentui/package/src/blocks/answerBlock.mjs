@@ -1,26 +1,23 @@
 import { THEME } from "../theme.mjs";
-import { CARD_RULE_SHORT, TOOL_INDENT, cardHeaderRule, stripTerminalControls } from "../primitives.mjs";
+import { stripTerminalControls } from "../primitives.mjs";
 
+// The answer is just the streamed markdown body now: its card chrome (header
+// rule, left border, footer) is owned by the turn, which wraps the whole
+// assistant turn in ONE card so narration and tool calls share a continuous
+// gutter. begin() mounts the markdown into the turn's shared card body.
 export function createAnswerBlock(ctx) {
-  const { renderer, BoxRenderable, TextRenderable, MarkdownRenderable, syntaxStyle, box, idPrefix } = ctx;
-  let gap = null, top = null, body = null, md = null, bot = null;
+  const { renderer, MarkdownRenderable, syntaxStyle, box, idPrefix } = ctx;
+  let md = null;
   let text = "";
   return {
     get text() { return text; },
     begin() {
-      gap = new TextRenderable(renderer, { id: `${idPrefix}-gap`, content: `${TOOL_INDENT}│`, fg: THEME.detailText }); box.add(gap);
-      top = new TextRenderable(renderer, { id: `${idPrefix}-top`, content: cardHeaderRule("answer ─ squilla", renderer.terminalWidth), fg: THEME.answerFrame }); box.add(top);
-      body = new BoxRenderable(renderer, { id: `${idPrefix}-body`, width: "100%", flexDirection: "column", border: ["left"], borderColor: THEME.answerFrame, paddingLeft: 1, flexShrink: 0 });
       md = new MarkdownRenderable(renderer, { id: `${idPrefix}-md`, content: "", streaming: true, conceal: true, syntaxStyle, fg: THEME.text, tableOptions: { style: "columns" }, internalBlockMode: "top-level", width: "100%" });
-      body.add(md); box.add(body);
+      box.add(md);
       renderer.requestRender?.();
     },
     append(delta) { text += String(delta); if (md) md.content = stripTerminalControls(text); renderer.requestRender?.(); },
     update() {},
-    end() {
-      if (md) md.streaming = false;
-      bot = new TextRenderable(renderer, { id: `${idPrefix}-bot`, content: `╰${CARD_RULE_SHORT}`, fg: THEME.answerFrame }); box.add(bot);
-      renderer.requestRender?.();
-    },
+    end() { if (md) md.streaming = false; renderer.requestRender?.(); },
   };
 }

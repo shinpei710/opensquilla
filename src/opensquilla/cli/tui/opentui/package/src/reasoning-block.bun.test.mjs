@@ -15,7 +15,7 @@ import { BoxRenderable, TextRenderable, MarkdownRenderable } from "@opentui/core
 
 import { createThinkingBlock } from "./blocks/thinkingBlock.mjs";
 import { createReasoningBlock } from "./blocks/reasoningBlock.mjs";
-import { createAnswerBlock } from "./blocks/answerBlock.mjs";
+import { createTurnView } from "./turnView.mjs";
 
 const WIDTH = 60;
 const HEIGHT = 12;
@@ -71,12 +71,37 @@ test("a streaming thinking block shows purple ✻ text with no answer card", asy
   expect(text).not.toContain("╰");
 });
 
-test("a streaming answer block does render its card border", async () => {
-  const text = flatText(await renderBlock(createAnswerBlock));
-  // contrast case proving the assertion above discriminates: the answer block
-  // paints its card top rail immediately.
-  expect(text).toContain("answer");
+test("an assistant turn wraps its answer in a single squilla card", async () => {
+  // Contrast case proving the assertion above discriminates. The card chrome now
+  // belongs to the TURN (one card per turn), not the answer block, so drive a
+  // turn view: an answer renders inside a labelled squilla card with top and
+  // bottom rules.
+  const { renderer, renderOnce, captureSpans } = await createTestRenderer({ width: WIDTH, height: HEIGHT });
+  const conversationBox = new BoxRenderable(renderer, {
+    id: "conversation",
+    position: "absolute",
+    left: 0,
+    top: 0,
+    right: 0,
+    bottom: 0,
+    flexDirection: "column",
+  });
+  renderer.root.add(conversationBox);
+  const turn = createTurnView(
+    { renderer, BoxRenderable, TextRenderable, MarkdownRenderable, syntaxStyle: undefined, conversationBox },
+    "ans",
+  );
+  turn.begin("a1", "answer", {});
+  turn.append("a1", "the final answer text");
+  turn.end("a1");
+  turn.finish();
+  await renderOnce();
+  const text = flatText(captureSpans());
+  renderer.destroy?.();
+
+  expect(text).toContain("squilla");
   expect(text).toContain("╭");
+  expect(text).toContain("╰");
 });
 
 test("a reasoning block shows only a collapsed Thinking… marker, never the process text", async () => {
