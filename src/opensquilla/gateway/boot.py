@@ -989,6 +989,8 @@ def build_cron_result_payload(
 
 def _task_run_status_for_session_change(event: TaskLifecycleEvent) -> str:
     status = getattr(event.task_status, "value", str(event.task_status))
+    if event.phase == "queued":
+        return "queued"
     if event.phase == "running":
         return "running"
     if status == "succeeded":
@@ -1034,10 +1036,16 @@ def _make_task_session_lifecycle_listener(
         )
         if not changed:
             return
-        reason = "task_running" if event.phase == "running" else "task_terminal"
+        reason = (
+            "task_queued"
+            if event.phase == "queued"
+            else "task_running"
+            if event.phase == "running"
+            else "task_terminal"
+        )
         session_status = session_status_for_task_status(event.task_status)
         task_state = _task_state_for_session_change(event)
-        state_field = "active_task" if event.phase == "running" else "last_task"
+        state_field = "active_task" if event.phase in {"queued", "running"} else "last_task"
         await event_emitter(
             event.session_key,
             "sessions.changed",

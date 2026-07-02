@@ -1133,6 +1133,38 @@ class TestSessionsList:
         assert row["run_status"] == "running"
 
     @pytest.mark.asyncio
+    async def test_list_uses_active_task_activity_for_recents_sort_key(self, dispatcher):
+        session = FakeSession(
+            session_key="agent:main:webchat:active-sort",
+            updated_at=100,
+        )
+        manager = FakeSessionManager([session])
+        manager._storage._agent_tasks[session.session_key] = [
+            SimpleNamespace(
+                task_id="task-running",
+                status="running",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=300,
+                updated_at=450,
+                started_at=400,
+                finished_at=None,
+                terminal_reason=None,
+            )
+        ]
+        ctx = make_ctx(session_manager=manager, task_runtime=None)
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        row = res.payload["sessions"][0]
+        assert row["runStatus"] == "running"
+        assert row["lastActivityAt"] == 450
+        assert row["updatedAt"] == 450
+        assert row["updated_at"] == 100
+
+    @pytest.mark.asyncio
     async def test_list_prefers_running_active_task_over_newer_queued_task(
         self, dispatcher
     ):

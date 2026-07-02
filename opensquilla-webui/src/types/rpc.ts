@@ -54,6 +54,8 @@ export interface RawSessionItem {
   groupLabel?: string
   updatedAt?: number | string
   updated_at?: number | string
+  lastActivityAt?: number | string
+  last_activity_at?: number | string
   messageCount?: number
   message_count?: number
   entry_count?: number
