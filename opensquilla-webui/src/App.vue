@@ -350,6 +350,8 @@
 
   <ConfirmModal />
 
+  <UpdateBanner />
+
   <!-- Single app-wide announcer for the pending-approval count. The nav badge
        and topbar pill stay silent (no double-announce); this region carries the
        only spoken update when the count changes. -->
@@ -376,6 +378,7 @@ import Icon from './components/Icon.vue'
 import ErrorBoundary from './components/ErrorBoundary.vue'
 import ToastHost from './components/ToastHost.vue'
 import ConfirmModal from './components/ConfirmModal.vue'
+import UpdateBanner from './components/UpdateBanner.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarSetupBanner from './components/SidebarSetupBanner.vue'
 import CommandPalette from './components/CommandPalette.vue'

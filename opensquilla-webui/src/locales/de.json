@@ -1,4 +1,9 @@
 {
+  "updates": {
+    "available": "OpenSquilla {version} ist verfügbar",
+    "viewRelease": "Version anzeigen",
+    "dismiss": "Schließen"
+  },
   "common": {
     "close": "Schließen",
     "save": "Speichern",

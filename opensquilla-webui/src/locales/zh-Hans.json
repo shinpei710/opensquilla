@@ -1,4 +1,9 @@
 {
+  "updates": {
+    "available": "OpenSquilla {version} 已发布",
+    "viewRelease": "查看发布说明",
+    "dismiss": "忽略"
+  },
   "common": {
     "close": "关闭",
     "save": "保存",
