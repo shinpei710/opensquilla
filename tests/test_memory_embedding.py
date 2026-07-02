@@ -91,8 +91,7 @@ async def test_openai_embedding_provider_adds_openrouter_app_attribution_for_que
     assert captured["headers"] == {
         "Authorization": "Bearer or-test",
         "HTTP-Referer": "https://opensquilla.ai",
-        "X-OpenRouter-Title": "OpenSquilla",
-        "X-OpenRouter-Categories": "cli-agent,personal-agent",
+        "X-Title": "OpenSquilla",
     }
 
 

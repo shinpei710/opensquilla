@@ -24,6 +24,10 @@ class ProviderConfig:
     org_id: str = ""
     proxy: str = ""  # explicit HTTP proxy URL
     provider_routing: dict[str, str] = field(default_factory=dict)
+    # False for cross-provider tier execution: provider-bound continuity
+    # state minted elsewhere (thinking blocks / thought signatures) must not
+    # be replayed to a provider that did not produce it.
+    replay_provider_state: bool = True
 
 
 @dataclass
@@ -49,9 +53,12 @@ def _missing_base_url_message(provider: str) -> str:
     return f"Provider '{provider}' requires an explicit base_url"
 
 
-def _provider_config_identity(
-    cfg: ProviderConfig,
-) -> tuple[str, str, str, str, str, str, tuple[tuple[str, str], ...]]:
+_ProviderConfigIdentity = tuple[
+    str, str, str, str, str, str, bool, tuple[tuple[str, str], ...]
+]
+
+
+def _provider_config_identity(cfg: ProviderConfig) -> _ProviderConfigIdentity:
     provider_routing = tuple(sorted((str(k), str(v)) for k, v in cfg.provider_routing.items()))
     return (
         cfg.provider,
@@ -60,6 +67,7 @@ def _provider_config_identity(
         cfg.base_url,
         cfg.org_id,
         cfg.proxy,
+        cfg.replay_provider_state,
         provider_routing,
     )
 
@@ -76,12 +84,16 @@ def _build_provider(cfg: ProviderConfig) -> LLMProvider:
 
     base_url = cfg.base_url or spec.default_base_url
 
-    if not base_url and spec.provider_id in {"azure", "vllm"}:
+    if not base_url and spec.requires_base_url():
         raise ProviderBuildError(_missing_base_url_message(cfg.provider))
 
     match spec.backend:
         case "anthropic":
-            kwargs: dict = {"api_key": cfg.api_key, "model": cfg.model}
+            kwargs: dict = {
+                "api_key": cfg.api_key,
+                "model": cfg.model,
+                "replay_provider_state": cfg.replay_provider_state,
+            }
             if base_url:
                 kwargs["base_url"] = base_url
             if cfg.proxy:
@@ -93,6 +105,8 @@ def _build_provider(cfg: ProviderConfig) -> LLMProvider:
                 "api_key": cfg.api_key,
                 "model": cfg.model,
                 "provider_kind": spec.provider_kind,
+                "compat": spec.compat,
+                "replay_provider_state": cfg.replay_provider_state,
             }
             if base_url:
                 kwargs["base_url"] = base_url
@@ -202,6 +216,27 @@ class ModelSelector:
         self._index = 1
         return _build_provider(self._chain[self._index])
 
+    def override_provider_config(self, cfg: ProviderConfig) -> None:
+        """Replace the active chain head with a full per-turn provider config.
+
+        Cross-provider tier execution: unlike ``override_model`` (which keeps
+        the primary's provider and credentials), this installs a complete
+        ``ProviderConfig`` — provider id, credentials, base URL — as the
+        turn's primary. The previous primary is kept as the first fallback so
+        pre-content failover still has somewhere to go.
+        """
+        original_primary = self._chain[0]
+        deduped_fallbacks: list[ProviderConfig] = []
+        seen: set[_ProviderConfigIdentity] = {_provider_config_identity(cfg)}
+        for candidate in [original_primary, *self._chain[1:]]:
+            identity = _provider_config_identity(candidate)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            deduped_fallbacks.append(candidate)
+        self._chain = [cfg, *deduped_fallbacks]
+        self._index = 0
+
     def override_model(self, model: str) -> None:
         """Update the model on the primary provider config (for runtime switching)."""
         if model and model != self._chain[0].model:
@@ -217,7 +252,7 @@ class ModelSelector:
             )
             fallback_chain = [original_primary, *self._chain[1:]]
             deduped_fallbacks: list[ProviderConfig] = []
-            seen: set[tuple[str, str, str, str, str, str, tuple[tuple[str, str], ...]]] = {
+            seen: set[_ProviderConfigIdentity] = {
                 _provider_config_identity(overridden_primary)
             }
             for cfg in fallback_chain:
@@ -281,7 +316,7 @@ class ModelSelector:
             )
 
         deduped_tail: list[ProviderConfig] = []
-        seen: set[tuple[str, str, str, str, str, str, tuple[tuple[str, str], ...]]] = {
+        seen: set[_ProviderConfigIdentity] = {
             _provider_config_identity(current)
         }
         for cfg in [*router_fallbacks, *existing_tail]:
@@ -347,6 +382,7 @@ def build_provider(
     api_key: str = "",
     base_url: str = "",
     org_id: str = "",
+    proxy: str = "",
 ) -> LLMProvider:
     """Convenience factory: build a single provider directly."""
     return _build_provider(
@@ -356,5 +392,6 @@ def build_provider(
             api_key=api_key,
             base_url=base_url,
             org_id=org_id,
+            proxy=proxy,
         )
     )

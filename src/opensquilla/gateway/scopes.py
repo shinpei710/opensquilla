@@ -251,6 +251,8 @@ METHOD_SCOPES: dict[str, str] = {
     "memory.repair.show": ADMIN_SCOPE,
     # OpenSquilla-only — onboarding mutations require admin scope.
     "onboarding.provider.configure": ADMIN_SCOPE,
+    # The probe persists nothing but carries candidate credentials.
+    "onboarding.provider.probe": ADMIN_SCOPE,
     "onboarding.router.configure": ADMIN_SCOPE,
     "onboarding.memory_embedding.configure": ADMIN_SCOPE,
     "onboarding.search.configure": ADMIN_SCOPE,

@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import ClassVar, Literal
 
+from .compat_policy import OpenAICompatPolicy, compat_policy_for_kind
+
 ProviderBackend = Literal[
     "openai_compat",
     "openai_responses",
@@ -30,6 +32,10 @@ class ProviderSpec:
     metadata_supported: bool = True
     runtime_supported: bool = True
     capabilities: frozenset[str] = field(default_factory=lambda: frozenset({"chat"}))
+    # Dialect quirks for OpenAI-compatible providers (display name, token
+    # field, schema keyword strips, reasoning toggles, ...). Defaults to the
+    # kind-keyed policy; only meaningful for backend == "openai_compat".
+    compat: OpenAICompatPolicy = field(default_factory=OpenAICompatPolicy)
 
     _LOCAL_PROVIDERS: ClassVar[frozenset[str]] = frozenset(
         {"ollama", "lm_studio", "ovms"}
@@ -83,6 +89,7 @@ def _spec(
         failure_family=failure_family,
         runtime_supported=runtime_supported,
         capabilities=capabilities or frozenset({"chat"}),
+        compat=compat_policy_for_kind(provider_kind),
     )
 
 
@@ -244,6 +251,13 @@ for _provider_spec in [
     _spec("vllm", "openai_compat", "openai"),
     _spec("lm_studio", "openai_compat", "lm_studio", default_base_url="http://localhost:1234/v1"),
     _spec("ovms", "openai_compat", "ovms", default_base_url="http://localhost:8000/v3"),
+    _spec(
+        "litellm_proxy",
+        "openai_compat",
+        "litellm_proxy",
+        "LITELLM_API_KEY",
+        "http://localhost:4000/v1",
+    ),
     _spec(
         "volcengine_coding_plan",
         "openai_compat",
