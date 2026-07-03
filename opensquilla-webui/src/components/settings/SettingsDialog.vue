@@ -160,6 +160,12 @@
               @update-auto-session-titles="setAutoSessionTitles"
               @save="saveBehavior"
             />
+            <SettingsPrivacyPanel
+              v-else-if="section === 'privacy'"
+              :panel="privacyPanel"
+              @update-disable-network-observability="setDisableNetworkObservability"
+              @save="savePrivacy"
+            />
             <SetupRouterPanel
               v-else-if="section === 'router'"
               :panel="routerPanel"
@@ -241,6 +247,7 @@ import SetupProviderPanel from '@/components/setup/SetupProviderPanel.vue'
 import SetupRouterPanel from '@/components/setup/SetupRouterPanel.vue'
 import SetupChannelsPanel from '@/components/setup/SetupChannelsPanel.vue'
 import SetupCapabilitiesPanel from '@/components/setup/SetupCapabilitiesPanel.vue'
+import SettingsPrivacyPanel from '@/components/settings/SettingsPrivacyPanel.vue'
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
@@ -267,6 +274,7 @@ const {
   loaded,
   providerPanel,
   behaviorPanel,
+  privacyPanel,
   routerPanel,
   channelsPanel,
   capabilitiesPanel,
@@ -286,6 +294,7 @@ const {
   discardChanges,
   selectProvider,
   setAutoSessionTitles,
+  setDisableNetworkObservability,
   setRouterMode,
   setRouterDefaultTier,
   setRouterVisualMode,
@@ -313,6 +322,7 @@ const {
   saveAudio,
   copyCommand,
   copyConfigPath,
+  savePrivacy,
 } = useSetupCatalog()
 
 const modalRef = ref<HTMLElement | null>(null)
