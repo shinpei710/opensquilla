@@ -8,8 +8,11 @@ from pathlib import Path
 
 import typer
 
+from opensquilla.cli.stdio import configure_stdio_for_unicode
 from opensquilla.env import load_env, warn_if_proxy_ignored
 from opensquilla.paths import default_opensquilla_home, is_valid_profile_name
+
+configure_stdio_for_unicode()
 
 _LOADED_ENV_CONTEXTS: set[tuple[Path, Path]] = set()
 _LOADED_LOCAL_ENV_CWDS: set[Path] = set()
