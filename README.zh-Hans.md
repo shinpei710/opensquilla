@@ -630,6 +630,18 @@ OpenSquilla 的灵感来自
 
 ---
 
+## 贡献者
+
+感谢所有为 OpenSquilla 做出贡献的人。
+
+<p align="center">
+  <a href="https://github.com/opensquilla/opensquilla/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=opensquilla/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
+  </a>
+</p>
+
+---
+
 ## 参与贡献
 
 我们欢迎各种形式的贡献——bug 报告、功能想法、文档、新的提供商或渠道适配器、技能，以及

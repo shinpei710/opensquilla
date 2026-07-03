@@ -769,6 +769,18 @@ wiedergespielte Arbeit.
 
 ---
 
+## Mitwirkende
+
+Dank an alle, die zu OpenSquilla beitragen.
+
+<p align="center">
+  <a href="https://github.com/opensquilla/opensquilla/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=opensquilla/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
+  </a>
+</p>
+
+---
+
 ## Mitwirken
 
 Beiträge jeder Art sind willkommen — Fehlerberichte, Funktionsideen,

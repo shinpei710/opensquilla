@@ -550,6 +550,18 @@ OpenSquilla は [OpenClaw](https://github.com/openclaw/openclaw) に着想を得
 
 ---
 
+## コントリビューター
+
+OpenSquilla に貢献してくださったすべての方に感謝します。
+
+<p align="center">
+  <a href="https://github.com/opensquilla/opensquilla/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=opensquilla/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
+  </a>
+</p>
+
+---
+
 ## 貢献する
 
 あらゆる種類の貢献を歓迎します——バグ報告、機能のアイデア、ドキュメント、新しいプロバイダやチャネルのアダプター、スキル、そしてコアランタイムの開発です。[`CONTRIBUTING.md`](CONTRIBUTING.md) を読んだうえで、[GitHub](https://github.com/opensquilla/opensquilla) で issue やプルリクエストを開いてください。

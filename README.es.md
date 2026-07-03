@@ -539,6 +539,18 @@ Los colaboradores de la comunidad se reconocen en [`CONTRIBUTORS.md`](CONTRIBUTO
 
 ---
 
+## Colaboradores
+
+Gracias a todas las personas que contribuyen a OpenSquilla.
+
+<p align="center">
+  <a href="https://github.com/opensquilla/opensquilla/graphs/contributors">
+    <img src="https://contrib.rocks/image?repo=opensquilla/opensquilla&max=100&columns=10" alt="OpenSquilla contributors" />
+  </a>
+</p>
+
+---
+
 ## Cómo contribuir
 
 Las contribuciones de todo tipo son bienvenidas: informes de errores, ideas de funcionalidades, documentación, nuevos adaptadores de proveedores o canales, skills y trabajo en el runtime central. Consulta [`CONTRIBUTING.md`](CONTRIBUTING.md) y luego abre una issue o una pull request en [GitHub](https://github.com/opensquilla/opensquilla).
