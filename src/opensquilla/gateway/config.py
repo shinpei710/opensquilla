@@ -767,6 +767,47 @@ def _router_tier_profile_defaults(profile: str | None) -> dict:
     return preset.tier_defaults()
 
 
+class RouterBudgetConfig(BaseModel):
+    """Additive, opt-in per-session spend gate for the router.
+
+    Default state is a complete no-op: with no ``limit_usd`` set (or
+    ``action = "off"``) the routing policy's budget stage never runs, so the
+    chosen tier is byte-identical to a build without this block (the routing
+    parity golden pins that). The gate READS the session's already-accumulated
+    billed/estimated spend — it never recomputes cost math — and, when that
+    spend crosses ``limit_usd``, takes ``action``:
+
+    - ``"warn"`` (the default action) — annotate routing metadata + emit a
+      ``router_budget.warn`` log, but leave the routed tier UNCHANGED.
+    - ``"cap"`` — lower the routed tier to ``cap_tier`` (or the router
+      ``default_tier`` when unset), never raising it.
+    - ``"off"`` — disable the gate regardless of ``limit_usd``.
+
+    When the accumulated spend (or a required forward price) cannot be
+    determined, the gate SUSPENDS (a no-op) rather than acting on missing data.
+
+    ``extra="ignore"`` keeps the block downgrade-tolerant: an older loader
+    reading a config that carries it simply drops it and falls back to today's
+    un-gated routing. Nothing that activates the gate is persisted while it is
+    unset — ``limit_usd``/``cap_tier`` default to ``None`` and drop out of the
+    ``exclude_none`` TOML dump.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    action: Literal["off", "warn", "cap"] = "warn"
+    # Per-session ceiling in USD. ``None`` (or a non-positive value) disables
+    # the gate — this is the default, byte-identical no-op state.
+    limit_usd: float | None = None
+    # Cap target for ``action = "cap"``. ``None`` falls back to the router's
+    # ``default_tier`` at gather time. Normalized through router_tiers.
+    cap_tier: str | None = None
+    # Opt-in forward projection: add an estimate of the next turn's marginal
+    # input cost to the accumulated spend before comparing to ``limit_usd``.
+    # When the estimate cannot be determined the gate SUSPENDS.
+    include_next_turn_estimate: bool = False
+
+
 class SquillaRouterConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_SQUILLA_ROUTER_",
@@ -815,6 +856,20 @@ class SquillaRouterConfig(BaseSettings):
     # deletes them. Additive key: the class-level extra="ignore" keeps old
     # builds rollback-tolerant when this key is present in config files.
     decision_retention_days: int = Field(default=30, ge=1)
+    # Opt-in on-device router calibration. When true, the routing policy applies
+    # the hard-clamped adjustment in <state>/router_calibration.json as a bias
+    # on the confidence gate, and the gateway runs a 24h in-process calibration
+    # job over local decision records. Default-off: the confidence gate stays
+    # byte-identical to today and no calibration job is scheduled. Additive key
+    # (class extra="ignore" keeps old builds rollback-tolerant). Never touches
+    # the router savings/cost math.
+    calibration_enabled: bool = False
+    # Opt-in per-session spend gate. Default (no limit) is a complete no-op:
+    # the routing policy's budget stage never runs, so the chosen tier stays
+    # byte-identical to today. Reads accumulated session spend; never
+    # recomputes cost. Additive key (class extra="ignore" keeps old builds
+    # rollback-tolerant).
+    budget: RouterBudgetConfig = Field(default_factory=RouterBudgetConfig)
     estimated_output_savings_pct: float = 0.03
     upgrade_to_c3_compaction_enabled: bool = True
     vision_history_lookback_turns: int = Field(default=8, ge=0)
@@ -1300,6 +1355,50 @@ class AgentSubagentDefaults(BaseModel):
     """When ``True``, killing a parent session also cancels its descendants."""
 
 
+class AgentRoutingConfig(BaseModel):
+    """Per-agent router tier overrides for a durable agent profile.
+
+    Both fields are optional and default to ``None`` ("unset"). Tier strings are
+    canonicalized to ``c0``–``c3`` exactly the way :class:`SquillaRouterConfig`
+    normalizes its ``default_tier``: legacy ``t0``–``t3`` aliases and a leading
+    ``tier:`` prefix are accepted, and an unrecognized value is kept verbatim
+    (normalize-or-keep). This matches every other tier-accepting surface in the
+    codebase (``SquillaRouterConfig``, ``engine/routing/policy.py``) rather than
+    inventing a stricter rejection path the rest of the codebase lacks.
+
+    Ordering between ``default_tier`` and ``max_tier`` is intentionally NOT
+    enforced: ``SquillaRouterConfig`` enforces no analogous ceiling constraint,
+    so this block mirrors that rigor. The block is additive schema only — no
+    consumer reads it yet, so it does not change routing behavior for any
+    existing config. Wiring ``max_tier`` as a routing ceiling / ``default_tier``
+    as a per-agent starting tier is a documented follow-up.
+    """
+
+    default_tier: str | None = None
+    """Preferred starting tier for turns run under this agent. ``None`` → unset;
+    routing falls back to ``squilla_router.default_tier`` (current behavior)."""
+
+    max_tier: str | None = None
+    """Ceiling tier this agent's turns may be routed to. ``None`` → unset; no
+    per-agent ceiling is applied (current behavior)."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_tiers(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        values = dict(values)
+        for key in ("default_tier", "max_tier"):
+            raw = values.get(key)
+            if raw is None:
+                continue
+            text = str(raw).strip()
+            if text[:5].lower() == "tier:":
+                text = text[5:]
+            values[key] = normalize_text_tier(text) or raw
+        return values
+
+
 class AgentEntryConfig(BaseModel):
     """Gateway config entry for a durable, user-managed agent."""
 
@@ -1313,6 +1412,9 @@ class AgentEntryConfig(BaseModel):
     enabled: bool = True
     system_prompt: str | None = None
     subagents: AgentSubagentDefaults | None = None
+    routing: AgentRoutingConfig | None = None
+    """Additive per-agent tier overrides. ``None`` → unset (nothing persisted;
+    current routing behavior preserved)."""
 
     @field_validator("id")
     @classmethod
@@ -1466,14 +1568,22 @@ class LlmProviderProfile(BaseSettings):
     Written as ``[llm_profiles.<provider_id>]`` in the config TOML and
     referenced by router tiers through their existing ``provider`` field.
     Resolution order per field matches the primary provider: explicit value,
-    then ``api_key_env`` (or the registry env key), then the registry
-    default base URL.
+    then ``api_key_env_pool`` (when non-empty), then ``api_key_env`` (or the
+    registry env key), then the registry default base URL.
     """
 
     model_config = SettingsConfigDict(extra="ignore")
 
     api_key: str = ""
     api_key_env: str = ""
+    # Rotation pool of env-var NAMES (never key values) for this profile,
+    # e.g. ["OPENAI_KEY_A", "OPENAI_KEY_B"]. Resolved from the environment at
+    # runtime; secrets are never persisted or logged. Profiles-only this
+    # cycle: the top-level [llm] model must NOT gain this field — [llm] is
+    # extra="forbid", so a stamped default would brick downgrade to 0.5.0rc1,
+    # while this profile model is extra="ignore" and rc1 tolerates the field
+    # on load (rc1's first persist silently strips it; release-noted).
+    api_key_env_pool: list[str] = Field(default_factory=list)
     base_url: str = ""
     proxy: str = ""
 
