@@ -81,6 +81,8 @@
     "controlNav": "控制台导航",
     "primaryNav": "主导航",
     "primaryMobile": "移动端主导航",
+    "moreThemes": "更多主题…",
+    "moreThemesHint": "更多主题可在外观设置中选择",
     "themeMode": {
       "light": "浅色",
       "dark": "深色",

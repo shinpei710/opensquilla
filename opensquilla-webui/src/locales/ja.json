@@ -81,6 +81,8 @@
     "controlNav": "ナビゲーションの操作",
     "primaryNav": "メイン",
     "primaryMobile": "メイン（モバイル）",
+    "moreThemes": "その他のテーマ…",
+    "moreThemesHint": "追加のテーマは外観設定で利用できます",
     "themeMode": {
       "light": "ライト",
       "dark": "ダーク",

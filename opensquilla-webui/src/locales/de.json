@@ -81,6 +81,8 @@
     "controlNav": "Navigation steuern",
     "primaryNav": "Primär",
     "primaryMobile": "Primär mobil",
+    "moreThemes": "Weitere Designs…",
+    "moreThemesHint": "Weitere Designs sind in den Darstellungseinstellungen verfügbar",
     "themeMode": {
       "light": "Hell",
       "dark": "Dunkel",
