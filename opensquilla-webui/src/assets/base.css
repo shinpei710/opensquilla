@@ -429,14 +429,11 @@ pre {
   background-attachment: local, local, scroll, scroll;
 }
 
-/* Option B desktop lean: the Manage / Monitor bands live in the palette and via
-   deep links on desktop, so the inline band wrapper is hidden in the docked +
-   hover rail. It is re-shown in the <=768px drawer (see the mobile media query)
-   so every destination stays a tap away on mobile. `display: contents` there
-   keeps the bands flowing as direct children of .sidebar-core (the scroll/fade
-   container) exactly as before. */
+/* Candidate A (full index): every destination is a visible labelled row on
+   desktop too. The Manage/Monitor bands flow inline as direct children of
+   .sidebar-core (the scroll/fade container); the "More" popover is retired. */
 .sidebar-core__managed {
-  display: none;
+  display: contents;
 }
 
 /* New-chat keyboard hint */
@@ -656,6 +653,22 @@ pre {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Total count beside the single-family eyebrow (the per-family header row is
+   skipped when there is only one family, so the count moves up here). */
+.sidebar-recents-count {
+  flex-shrink: 0;
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--sidebar-item-hover);
+  color: var(--sidebar-text-soft);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+  line-height: 17px;
 }
 
 .sidebar-history.is-selecting .sidebar-recents-eyebrow {
@@ -1009,6 +1022,55 @@ pre {
   margin-top: 2px;
   border-top: none;
   padding-top: 0;
+}
+
+/* Collapsible console band header: the eyebrow label becomes a full-width
+   disclosure toggle so the Build/Monitor indexes can yield their vertical
+   space to the Recents/Chats list (the rail serves both a console index and a
+   chat history). The label keeps its quiet eyebrow styling; a chevron rotates,
+   and a collapsed band that owns the active route shows an accent dot so
+   "where am I" survives the fold. */
+.sidebar-nav-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin: var(--sp-3) 0 2px;
+  padding: var(--sp-2) var(--sp-2) 4px;
+  border: none;
+  border-top: 1px solid var(--sidebar-border);
+  background: none;
+  color: var(--sidebar-text-soft);
+  cursor: pointer;
+  text-align: left;
+}
+.sidebar-nav-group-toggle .sidebar-nav-group-label {
+  margin: 0;
+  padding: 0;
+  border-top: none;
+  flex: 1;
+}
+.sidebar-nav-group-toggle:hover .sidebar-nav-group-label {
+  color: var(--sidebar-text);
+}
+.sidebar-nav-group-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: var(--radius-sm);
+}
+.sidebar-band-chevron {
+  color: var(--sidebar-text-soft);
+  transition: transform var(--dur-fast, 120ms) var(--ease-out, ease);
+}
+.sidebar-band-chevron.is-collapsed {
+  transform: rotate(-90deg);
+}
+.sidebar-band-active-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  flex-shrink: 0;
 }
 
 /* Setup-health banner: dismissible readiness warning above Recents */
@@ -1459,7 +1521,7 @@ pre {
      so the More drawer and dialogs dim it. */
   .mobile-tabbar {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     position: fixed;
     left: 0;
     right: 0;

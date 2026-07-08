@@ -58,7 +58,9 @@
     "overview": "Vue d'ensemble",
     "usage": "Utilisation",
     "logs": "Journaux",
-    "settings": "Paramètres"
+    "settings": "Paramètres",
+    "groupBuild": "Construire",
+    "groupMonitor": "Surveiller"
   },
   "chrome": {
     "settings": "Paramètres",
@@ -134,7 +136,12 @@
         "delivery": "Diffusion",
         "preferences": "Préférences",
         "capabilities": "Capacités"
-      }
+      },
+      "safety": "Sécurité"
+    },
+    "safety": {
+      "title": "Stratégie d’approbation",
+      "desc": "Choisissez comment OpenSquilla gère les exécutions d’outils à risque sur tous les agents et canaux."
     }
   },
   "errorBoundary": {
@@ -895,7 +902,10 @@
         "runLocalDoctorDetail": "Vérifie la configuration locale et l'intégration avant de redémarrer la passerelle.",
         "startLocal": "Démarrer la passerelle locale",
         "inspectLocal": "Inspecter la passerelle locale"
-      }
+      },
+      "checkedAgo": "Vérifié {time}",
+      "rerunChecks": "Relancer les vérifications",
+      "environment": "Environnement"
     }
   },
   "console": {
@@ -909,7 +919,7 @@
       "title": "Agents",
       "subtitle": "Personnalités et jeux de compétences personnalisés avec lesquels vous pouvez discuter.",
       "settingsHint": "Les valeurs par défaut de fournisseur et de modèle se trouvent dans les Paramètres",
-      "openSettings": "ouvrir les paramètres",
+      "openSettings": "Ouvrir les paramètres",
       "totalAgents": "Total des agents",
       "builtinCount": "{n} intégré(s)",
       "customCount": "{n} personnalisé(s)",
@@ -975,7 +985,7 @@
       "title": "Canaux",
       "subtitle": "État d'exécution des canaux configurés. Ajoutez ou modifiez la configuration des canaux dans les Paramètres ou la CLI.",
       "settingsHint": "La configuration des canaux se trouve dans les Paramètres",
-      "openSettings": "ouvrir les paramètres",
+      "openSettings": "Ouvrir les paramètres",
       "totalChannels": "Total des canaux",
       "typeCount": "{n} types",
       "connected": "Connectés",
@@ -1619,7 +1629,8 @@
       "autoFollow": "Suivi automatique",
       "loading": "Chargement des journaux…",
       "noMatch": "Aucune ligne ne correspond au filtre actuel.",
-      "lineDetail": "Détail de la ligne de journal"
+      "lineDetail": "Détail de la ligne de journal",
+      "ofLoadedFoot": "{visible} affichées · {total} en mémoire"
     }
   },
   "chat": {

@@ -58,7 +58,9 @@
     "overview": "Übersicht",
     "usage": "Nutzung",
     "logs": "Protokolle",
-    "settings": "Einstellungen"
+    "settings": "Einstellungen",
+    "groupBuild": "Erstellen",
+    "groupMonitor": "Überwachen"
   },
   "chrome": {
     "settings": "Einstellungen",
@@ -134,7 +136,12 @@
         "delivery": "Zustellung",
         "preferences": "Einstellungen",
         "capabilities": "Fähigkeiten"
-      }
+      },
+      "safety": "Sicherheit"
+    },
+    "safety": {
+      "title": "Freigabestrategie",
+      "desc": "Legen Sie fest, wie OpenSquilla riskante Tool-Ausführungen über alle Agenten und Kanäle hinweg behandelt."
     }
   },
   "errorBoundary": {
@@ -895,7 +902,10 @@
         "runLocalDoctorDetail": "Prüft lokale Konfiguration und Onboarding vor dem Neustart des Gateways.",
         "startLocal": "Lokales Gateway starten",
         "inspectLocal": "Lokales Gateway prüfen"
-      }
+      },
+      "checkedAgo": "Geprüft {time}",
+      "rerunChecks": "Prüfungen erneut ausführen",
+      "environment": "Umgebung"
     }
   },
   "console": {
@@ -1619,7 +1629,8 @@
       "autoFollow": "Automatisch folgen",
       "loading": "Protokolle werden geladen…",
       "noMatch": "Keine Zeilen entsprechen dem aktuellen Filter.",
-      "lineDetail": "Protokollzeilendetail"
+      "lineDetail": "Protokollzeilendetail",
+      "ofLoadedFoot": "{visible} sichtbar · {total} gepuffert"
     }
   },
   "chat": {

@@ -52,29 +52,9 @@
       </div>
     </header>
 
-    <section class="stat-row">
-      <div class="stat stat--hero">
-        <div class="stat-label">{{ t('usageLogs.logs.inView') }}</div>
-        <div class="stat-value">{{ visibleCount.toLocaleString() }}</div>
-        <div class="stat-hint">{{ t('usageLogs.logs.ofLoaded', { total: totalCount.toLocaleString() }) }}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">{{ t('usageLogs.logs.errors') }}</div>
-        <div class="stat-value">{{ errorCount }}</div>
-        <div class="stat-hint">{{ errorCount > 0 ? t('usageLogs.logs.reviewNeeded') : t('usageLogs.logs.allClear') }}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">{{ t('usageLogs.logs.warnings') }}</div>
-        <div class="stat-value">{{ warnCount }}</div>
-        <div class="stat-hint">{{ warnCount > 0 ? t('usageLogs.logs.recentAdvisories') : t('usageLogs.logs.none') }}</div>
-      </div>
-      <div class="stat">
-        <div class="stat-label">{{ t('usageLogs.logs.infoDebug') }}</div>
-        <div class="stat-value mono">{{ infoCount }}<span>/</span>{{ debugCount }}</div>
-        <div class="stat-hint">{{ t('usageLogs.logs.routineOutput') }}</div>
-      </div>
-    </section>
-
+    <!-- One toolbar row carries both filter and count: each level chip shows
+         its live count, so the former four near-empty count tiles are gone.
+         The in-view/loaded figure moves to the stream footer readout. -->
     <section class="lg-toolbar">
       <div class="lg-levels">
         <span class="lg-toolbar__label">{{ t('usageLogs.logs.levels') }}</span>
@@ -88,6 +68,7 @@
           >
             <span class="lg-level-btn__dot"></span>
             <span class="lg-level-btn__label">{{ level }}</span>
+            <span class="lg-level-btn__count">{{ levelChipCount(level) }}</span>
           </button>
         </div>
       </div>
@@ -146,6 +127,9 @@
           </div>
         </div>
       </div>
+      <footer class="lg-stream__foot" aria-live="polite">
+        {{ t('usageLogs.logs.ofLoadedFoot', { visible: visibleCount.toLocaleString(), total: totalCount.toLocaleString() }) }}
+      </footer>
     </section>
 
     <Transition name="lg-detail">
@@ -311,21 +295,19 @@ let pollErrorShown = false
 // ---------------------------------------------------------------------------
 
 const totalCount = computed(() => allLines.value.length)
-// One pass over the buffer instead of four separate full scans per change.
+// One pass over the buffer instead of one full scan per level per change.
 const levelCounts = computed(() => {
-  let error = 0, warn = 0, info = 0, debug = 0
+  const counts: Record<string, number> = { TRACE: 0, DEBUG: 0, INFO: 0, WARN: 0, ERROR: 0 }
   for (const l of allLines.value) {
-    if (l.level === 'ERROR') error++
-    else if (l.level === 'WARN') warn++
-    else if (l.level === 'INFO') info++
-    else if (l.level === 'DEBUG' || l.level === 'TRACE') debug++
+    if (l.level in counts) counts[l.level]++
   }
-  return { error, warn, info, debug }
+  return counts
 })
-const errorCount = computed(() => levelCounts.value.error)
-const warnCount = computed(() => levelCounts.value.warn)
-const infoCount = computed(() => levelCounts.value.info)
-const debugCount = computed(() => levelCounts.value.debug)
+
+// Live count rendered inside each level-filter chip (the former count tiles).
+function levelChipCount(level: string): string {
+  return (levelCounts.value[level] ?? 0).toLocaleString()
+}
 
 const filteredLines = computed(() => {
   const term = debouncedSearch.value.toLowerCase()
@@ -727,62 +709,6 @@ function escRegex(s: string): string {
   width: 6px;
 }
 
-.stat-row {
-  display: grid;
-  gap: var(--sp-3);
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-}
-
-.stat {
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  color: var(--text);
-  overflow: hidden;
-  padding: var(--sp-4);
-  position: relative;
-}
-
-.stat--hero {
-  min-height: 116px;
-}
-
-.stat-label {
-  color: var(--text-dim);
-  display: block;
-  font-size: 12px;
-  font-weight: 750;
-  letter-spacing: 0.08em;
-  line-height: 1.25;
-  text-transform: uppercase;
-}
-
-.stat-value {
-  align-items: center;
-  display: flex;
-  font-size: 2rem;
-  font-variant-numeric: tabular-nums;
-  gap: 8px;
-  letter-spacing: 0;
-  line-height: 1.12;
-  margin-top: var(--sp-4);
-}
-
-.stat-value.mono {
-  font-family: var(--font-mono);
-}
-
-.stat-value span {
-  color: var(--text-dim);
-  font-size: 1.4rem;
-}
-
-.stat-hint {
-  color: var(--text-muted);
-  font-size: var(--fs-sm);
-  margin-top: var(--sp-2);
-}
-
 .lg-toolbar {
   align-items: center;
   background: var(--bg-surface);
@@ -852,6 +778,26 @@ function escRegex(s: string): string {
 .lg-level-btn--info  .lg-level-btn__dot { background: var(--ok); }
 .lg-level-btn--warn  .lg-level-btn__dot { background: var(--warn-fill); }
 .lg-level-btn--error .lg-level-btn__dot { background: var(--danger); }
+
+/* Live count inside each level chip (replaces the former count-tile band). */
+.lg-level-btn__count {
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  font-weight: 500;
+}
+.lg-level-btn.is-active .lg-level-btn__count {
+  color: var(--text-muted);
+}
+
+/* Stream footer readout: in-view / buffered counts, quiet mono. */
+.lg-stream__foot {
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: var(--sp-2) var(--sp-4);
+  text-align: right;
+}
 
 .lg-search-wrap {
   align-items: center;
@@ -987,10 +933,11 @@ function escRegex(s: string): string {
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.06em;
+  min-width: 52px;
   padding: 1px 6px;
   text-align: center;
   text-transform: uppercase;
-  width: 44px;
+  white-space: nowrap;
 }
 
 .lg-line__lvl--trace { background: color-mix(in srgb, var(--text-dim) 15%, transparent); color: var(--text-dim); }

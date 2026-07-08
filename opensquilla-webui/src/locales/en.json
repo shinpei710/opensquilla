@@ -58,7 +58,9 @@
     "overview": "Overview",
     "usage": "Usage",
     "logs": "Logs",
-    "settings": "Settings"
+    "settings": "Settings",
+    "groupBuild": "Build",
+    "groupMonitor": "Monitor"
   },
   "chrome": {
     "settings": "Settings",
@@ -134,7 +136,12 @@
         "delivery": "Delivery",
         "preferences": "Preferences",
         "capabilities": "Capabilities"
-      }
+      },
+      "safety": "Safety"
+    },
+    "safety": {
+      "title": "Approval strategy",
+      "desc": "Choose how OpenSquilla handles risky tool executions across every agent and channel."
     }
   },
   "errorBoundary": {
@@ -895,7 +902,10 @@
         "runLocalDoctorDetail": "Checks local config and onboarding before restarting the gateway.",
         "startLocal": "Start local gateway",
         "inspectLocal": "Inspect local gateway"
-      }
+      },
+      "checkedAgo": "Checked {time}",
+      "rerunChecks": "Re-run checks",
+      "environment": "Environment"
     }
   },
   "console": {
@@ -909,7 +919,7 @@
       "title": "Agents",
       "subtitle": "Custom personalities and skill sets you can chat with.",
       "settingsHint": "Provider and model defaults live in Settings",
-      "openSettings": "open settings",
+      "openSettings": "Open settings",
       "totalAgents": "Total agents",
       "builtinCount": "{n} built-in",
       "customCount": "{n} custom",
@@ -975,7 +985,7 @@
       "title": "Channels",
       "subtitle": "Runtime status for configured channels. Add or change channel configuration in Settings or the CLI.",
       "settingsHint": "Channel configuration lives in Settings",
-      "openSettings": "open settings",
+      "openSettings": "Open settings",
       "totalChannels": "Total channels",
       "typeCount": "{n} types",
       "connected": "Connected",
@@ -1619,7 +1629,8 @@
       "autoFollow": "Auto-follow",
       "loading": "Loading logs…",
       "noMatch": "No lines match the current filter.",
-      "lineDetail": "Log line detail"
+      "lineDetail": "Log line detail",
+      "ofLoadedFoot": "{visible} in view · {total} buffered"
     }
   },
   "chat": {

@@ -362,9 +362,9 @@ function openBlockedSession() {
   const key = pendingApprovals.value.find(Boolean)
   if (key) {
     router.push({ path: '/chat', query: { session: key } })
-  } else {
-    router.push('/approvals')
   }
+  // No session-attached pending approval: nothing to open. Approvals resolve
+  // inline in chat, so there is no standalone queue page to fall back to.
 }
 
 function clearFilters() {

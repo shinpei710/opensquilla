@@ -11,12 +11,12 @@ async function openMobileChat(page: Page) {
 }
 
 test.describe('Mobile bottom tab bar', () => {
-  test('tabs are visible and navigate between Chat, Sessions, and Approvals', async ({ page }) => {
+  test('tabs are visible and navigate between Chat, Sessions, Overview, and Agents', async ({ page }) => {
     await openMobileChat(page)
 
     const tabbar = page.locator('.mobile-tabbar')
     await expect(tabbar).toBeVisible()
-    await expect(tabbar.locator('.mobile-tab')).toHaveCount(4)
+    await expect(tabbar.locator('.mobile-tab')).toHaveCount(5)
 
     // Chat is the active tab on the chat route.
     const chatTab = tabbar.getByRole('link', { name: 'Chat' })
@@ -27,9 +27,14 @@ test.describe('Mobile bottom tab bar', () => {
     await expect(tabbar.getByRole('link', { name: 'Sessions' })).toHaveClass(/is-active/)
     await expect(chatTab).not.toHaveClass(/is-active/)
 
-    await tabbar.getByRole('link', { name: 'Approvals' }).click()
-    await expect(page).toHaveURL(/\/approvals$/)
-    await expect(tabbar.getByRole('link', { name: 'Approvals' })).toHaveClass(/is-active/)
+    // Overview fronts the Monitor hub; its tab stays lit on any hub sub-route.
+    await tabbar.getByRole('link', { name: 'Overview' }).click()
+    await expect(page).toHaveURL(/\/overview$/)
+    await expect(tabbar.getByRole('link', { name: 'Overview' })).toHaveClass(/is-active/)
+
+    await tabbar.getByRole('link', { name: 'Agents' }).click()
+    await expect(page).toHaveURL(/\/agents$/)
+    await expect(tabbar.getByRole('link', { name: 'Agents' })).toHaveClass(/is-active/)
 
     await chatTab.click()
     await expect(page).toHaveURL(/\/chat/)

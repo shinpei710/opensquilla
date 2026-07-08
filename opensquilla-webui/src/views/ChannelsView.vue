@@ -19,35 +19,15 @@
       </div>
     </header>
 
-    <section class="stat-row control-stat-grid control-stat-grid--fixed" style="--control-stat-columns: 4">
-      <div class="stat stat--hero control-stat control-stat--hero">
-        <div class="stat-label control-stat__label">{{ t('console.channels.totalChannels') }}</div>
-        <div class="stat-value control-stat__value">{{ total }}</div>
-        <div class="stat-hint control-stat__hint">{{ t('console.channels.typeCount', { n: typeCount }) }}</div>
-      </div>
-      <div class="stat control-stat">
-        <div class="stat-label control-stat__label">{{ t('console.channels.connected') }}</div>
-        <div class="stat-value control-stat__value">
-          {{ connected }}
-          <span v-if="connected > 0" class="dot ok"></span>
-        </div>
-        <div class="stat-hint control-stat__hint">
-          {{ connected > 0 ? t('console.channels.live') : (attention > 0 ? t('console.channels.unhealthy', { n: attention }) : t('console.channels.allIdle')) }}
-        </div>
-      </div>
-      <div class="stat control-stat">
-        <div class="stat-label control-stat__label">{{ t('console.channels.inactive') }}</div>
-        <div class="stat-value control-stat__value">{{ inactive }}</div>
-        <div class="stat-hint control-stat__hint">
-          <span v-if="attention > 0" class="ch-neg">{{ t('console.channels.needAttention', { n: attention }) }}</span>
-          <span v-else>{{ inactiveHint }}</span>
-        </div>
-      </div>
-      <div class="stat control-stat">
-        <div class="stat-label control-stat__label">{{ t('console.channels.restartAttempts') }}</div>
-        <div class="stat-value mono control-stat__value control-stat__value--mono">{{ restarts }}</div>
-        <div class="stat-hint control-stat__hint">{{ t('console.channels.sinceGatewayStart') }}</div>
-      </div>
+    <!-- Status line (quiet-canvas): inline counts on the canvas instead of a
+         stat-tile band — a page whose population is 0-3 channels doesn't earn
+         four count cards. Hidden entirely at zero (the empty state speaks). -->
+    <section v-if="total > 0" class="ch-statusline" :aria-label="t('console.channels.title')">
+      <span class="ch-count"><b>{{ total }}</b> {{ t('console.channels.totalChannels') }}</span>
+      <span class="ch-count is-ok"><b>{{ connected }}</b> {{ t('console.channels.connected') }}</span>
+      <span v-if="attention > 0" class="ch-count is-attention">{{ t('console.channels.needAttention', { n: attention }) }}</span>
+      <span v-if="inactive > 0" class="ch-count"><b>{{ inactive }}</b> {{ t('console.channels.inactive') }}</span>
+      <span v-if="restarts > 0" class="ch-count"><b>{{ restarts }}</b> {{ t('console.channels.restartAttempts') }}</span>
     </section>
 
     <section class="ch-list">
@@ -234,25 +214,9 @@ const attention = computed(() =>
 
 const inactive = computed(() => total.value - connected.value - attention.value)
 
-const disabled = computed(() =>
-  channels.value.filter(c => c.status === 'disabled').length
-)
-
 const restarts = computed(() =>
   channels.value.reduce((acc, c) => acc + (Number(c.restart_attempts) || 0), 0)
 )
-
-const typeCount = computed(() => {
-  const types = new Set<string>()
-  channels.value.forEach(c => { if (c.type) types.add(c.type) })
-  return types.size
-})
-
-const inactiveHint = computed(() => {
-  if (inactive.value === 0) return t('console.channels.noInactive')
-  if (disabled.value > 0) return t('console.channels.disabledCount', { n: disabled.value })
-  return t('console.channels.configuredButIdle')
-})
 
 // ---------------------------------------------------------------------------
 // Lifecycle
@@ -287,9 +251,10 @@ onActivated(() => {
 onDeactivated(teardownLive)
 onUnmounted(teardownLive)
 
-// Both platforms own a `/settings` route (web overlay / desktop settings view).
+// Deep-link straight to the Channels section — the button promises channel
+// configuration, so it must not land on the default (Chat Model) section.
 function openSettingsSurface(): void {
-  void router.push('/settings')
+  void router.push('/settings/channels')
 }
 
 // ---------------------------------------------------------------------------
@@ -362,9 +327,25 @@ function statusHint(ch: Channel): string {
 </script>
 
 <style scoped>
-.stat--hero {
-  min-height: 116px;
+/* Inline status counts on the canvas (replaces the former stat-tile band). */
+.ch-statusline {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-4);
 }
+.ch-count {
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+}
+.ch-count b {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  margin-right: 4px;
+}
+.ch-count.is-ok b { color: var(--ok); }
+.ch-count.is-attention { color: var(--danger); font-weight: 600; }
 
 .dot {
   border-radius: var(--radius-full);
@@ -559,12 +540,6 @@ function statusHint(ch: Channel): string {
   color: var(--danger);
 }
 
-@media (max-width: 980px) {
-  .stat-row {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
-
 @media (max-width: 760px) {
   .ch-stage__header {
     align-items: stretch;
@@ -577,12 +552,6 @@ function statusHint(ch: Channel): string {
   }
 
   .ch-cards {
-    grid-template-columns: 1fr;
-  }
-}
-
-@media (max-width: 480px) {
-  .stat-row {
     grid-template-columns: 1fr;
   }
 }

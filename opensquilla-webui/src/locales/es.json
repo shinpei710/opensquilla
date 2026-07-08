@@ -58,7 +58,9 @@
     "overview": "Resumen",
     "usage": "Uso",
     "logs": "Registros",
-    "settings": "Ajustes"
+    "settings": "Ajustes",
+    "groupBuild": "Construir",
+    "groupMonitor": "Monitorizar"
   },
   "chrome": {
     "settings": "Ajustes",
@@ -134,7 +136,12 @@
         "delivery": "Entrega",
         "preferences": "Preferencias",
         "capabilities": "Capacidades"
-      }
+      },
+      "safety": "Seguridad"
+    },
+    "safety": {
+      "title": "Estrategia de aprobación",
+      "desc": "Elige cómo OpenSquilla gestiona las ejecuciones de herramientas arriesgadas en todos los agentes y canales."
     }
   },
   "errorBoundary": {
@@ -895,7 +902,10 @@
         "runLocalDoctorDetail": "Comprueba la configuración local y la incorporación antes de reiniciar la puerta de enlace.",
         "startLocal": "Iniciar puerta de enlace local",
         "inspectLocal": "Inspeccionar puerta de enlace local"
-      }
+      },
+      "checkedAgo": "Comprobado {time}",
+      "rerunChecks": "Volver a comprobar",
+      "environment": "Entorno"
     }
   },
   "console": {
@@ -909,7 +919,7 @@
       "title": "Agentes",
       "subtitle": "Personalidades y conjuntos de habilidades personalizados con los que puedes chatear.",
       "settingsHint": "Los valores predeterminados de proveedor y modelo están en Ajustes",
-      "openSettings": "abrir ajustes",
+      "openSettings": "Abrir ajustes",
       "totalAgents": "Total de agentes",
       "builtinCount": "{n} integrados",
       "customCount": "{n} personalizados",
@@ -975,7 +985,7 @@
       "title": "Canales",
       "subtitle": "Estado del tiempo de ejecución de los canales configurados. Añade o cambia la configuración de canales en Ajustes o en la CLI.",
       "settingsHint": "La configuración de los canales está en Ajustes",
-      "openSettings": "abrir ajustes",
+      "openSettings": "Abrir ajustes",
       "totalChannels": "Total de canales",
       "typeCount": "{n} tipos",
       "connected": "Conectado",
@@ -1619,7 +1629,8 @@
       "autoFollow": "Seguimiento automático",
       "loading": "Cargando registros…",
       "noMatch": "Ninguna línea coincide con el filtro actual.",
-      "lineDetail": "Detalle de la línea de registro"
+      "lineDetail": "Detalle de la línea de registro",
+      "ofLoadedFoot": "{visible} visibles · {total} en búfer"
     }
   },
   "chat": {

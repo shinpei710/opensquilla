@@ -58,7 +58,9 @@
     "overview": "概要",
     "usage": "使用量",
     "logs": "ログ",
-    "settings": "設定"
+    "settings": "設定",
+    "groupBuild": "構築",
+    "groupMonitor": "モニター"
   },
   "chrome": {
     "settings": "設定",
@@ -134,7 +136,12 @@
         "delivery": "配信",
         "preferences": "環境設定",
         "capabilities": "機能"
-      }
+      },
+      "safety": "安全"
+    },
+    "safety": {
+      "title": "承認ポリシー",
+      "desc": "すべてのエージェントとチャンネルで、リスクのあるツール実行をどのように扱うかを選びます。"
     }
   },
   "errorBoundary": {
@@ -895,7 +902,10 @@
         "runLocalDoctorDetail": "ゲートウェイを再起動する前に、ローカルの設定とオンボーディングを確認します。",
         "startLocal": "ローカルゲートウェイを起動",
         "inspectLocal": "ローカルゲートウェイを確認"
-      }
+      },
+      "checkedAgo": "{time}に確認",
+      "rerunChecks": "再チェック",
+      "environment": "環境"
     }
   },
   "console": {
@@ -1619,7 +1629,8 @@
       "autoFollow": "自動追従",
       "loading": "ログを読み込み中…",
       "noMatch": "現在のフィルターに一致する行はありません。",
-      "lineDetail": "ログ行の詳細"
+      "lineDetail": "ログ行の詳細",
+      "ofLoadedFoot": "表示中 {visible} 件 · バッファ {total} 件"
     }
   },
   "chat": {

@@ -362,9 +362,15 @@ function onSelectRow(row: SidebarConversationItem) {
             ? selectedCount > 0
               ? t('shared.sidebar.selectedCountLabel', { count: selectedCount })
               : t('shared.sidebar.selectionModeLabel')
-            : t('shared.sidebar.recents')
+            : visibleSections.length === 1
+              ? visibleSections[0].label
+              : t('shared.sidebar.recents')
         }}
       </span>
+      <span
+        v-if="!selectionMode && visibleSections.length === 1 && totalRows > 0"
+        class="sidebar-recents-count"
+      >{{ totalRows }}</span>
       <button
         v-if="selectionMode"
         type="button"
@@ -449,7 +455,12 @@ function onSelectRow(row: SidebarConversationItem) {
         class="sidebar-group"
         :data-family="section.family"
       >
+        <!-- One vocabulary, one header: with a single family the panel's own
+             "Chats" eyebrow already labels the list, so the per-family header
+             renders only when there are actually multiple families to tell
+             apart (chats vs cron vs channels). -->
         <button
+          v-if="visibleSections.length > 1"
           type="button"
           class="sidebar-group__header"
           :aria-expanded="!isCollapsed(section.family)"
@@ -462,7 +473,7 @@ function onSelectRow(row: SidebarConversationItem) {
         </button>
 
         <div
-          v-show="!isCollapsed(section.family)"
+          v-show="visibleSections.length === 1 || !isCollapsed(section.family)"
           :id="`sidebar-group-${section.family}`"
           class="sidebar-group__body"
         >

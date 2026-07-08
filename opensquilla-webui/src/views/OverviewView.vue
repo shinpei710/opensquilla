@@ -1,12 +1,30 @@
 <template>
   <div class="ov-stage control-stage control-stage--spacious">
-    <!-- Header -->
-    <header class="ov-stage__header control-stage__header">
-      <div class="ov-stage__title-block control-stage__title-block">
-        <h1 class="ov-stage__title control-stage__title">OpenSquilla</h1>
-        <p class="ov-stage__subtitle control-stage__subtitle">{{ t('sessions.overview.subtitle') }}</p>
+    <!-- Status line: sits directly on the canvas (no card) per the chosen
+         direction. Dot-glyph + word + inline counts left; freshness + actions
+         right. The small ok-tinted glyph chip is the one warm accent. -->
+    <section class="ov-statusline" :class="stripClass" :aria-label="t('sessions.overview.healthSummary')">
+      <span class="ov-status-glyph" aria-hidden="true">
+        <Icon :name="healthLoading ? 'refresh' : statusGlyphIcon" :size="15" />
+      </span>
+      <strong class="ov-status-word" :title="statusSummary">{{ statusLabelText }}</strong>
+      <div v-if="!healthLoading" class="ov-status-counts">
+        <button
+          v-for="chip in impactChips"
+          :key="chip.key"
+          type="button"
+          class="ov-count"
+          :class="{ 'is-hot': chip.n > 0, [`is-${chip.tone}`]: chip.n > 0 }"
+          @click="scrollToHealth"
+        ><b>{{ chip.n }}</b> {{ chip.label }}</button>
       </div>
-      <div class="ov-stage__actions control-stage__actions">
+      <div class="ov-status-actions">
+        <span v-if="!healthLoading" class="ov-freshness" aria-live="polite">
+          {{ t('sessions.overview.checkedAgo', { time: relTime(healthCheckedAt) }) }} ·
+          <button type="button" class="ov-rerun" :disabled="healthLoading" @click="loadHealth">
+            {{ t('sessions.overview.rerunChecks') }}
+          </button>
+        </span>
         <button class="btn btn--ghost" :title="t('sessions.refresh')" :disabled="refreshing" @click="refresh">
           <Icon name="refresh" :size="16" />
           <span>{{ refreshing ? t('sessions.refreshing') : t('sessions.refresh') }}</span>
@@ -16,95 +34,55 @@
           <span>{{ t('sessions.overview.openChat') }}</span>
         </button>
       </div>
-    </header>
+    </section>
 
-    <!-- Stat cards -->
-    <section class="ov-stats control-stat-grid" style="--control-stat-min: 220px">
-      <button class="ov-stat ov-stat--accent control-stat control-stat--clickable control-stat--hero" type="button" @click="router.push('/usage')">
-        <div class="ov-stat__icon control-stat__icon">
-          <Icon name="usage" :size="18" />
-        </div>
-        <div class="ov-stat__label control-stat__label">{{ t('sessions.overview.totalTokens') }}</div>
-        <div class="ov-stat__value control-stat__value">{{ tokensDisplay }}</div>
-        <div class="ov-stat__hint control-stat__hint">{{ costLine }}</div>
+    <!-- Three real KPIs — quiet Settings-style cards, display numerals. -->
+    <section class="ov-kpis" :aria-label="t('sessions.overview.title')">
+      <button class="control-stat control-stat--clickable" type="button" @click="router.push('/usage')">
+        <div class="control-stat__icon"><Icon name="usage" :size="18" /></div>
+        <div class="control-stat__label">{{ t('sessions.overview.totalTokens') }}</div>
+        <div class="control-stat__value">{{ tokensDisplay }}</div>
+        <div class="control-stat__hint">{{ costLine }}</div>
       </button>
 
-      <button class="ov-stat control-stat control-stat--clickable" type="button" :title="t('sessions.overview.totalSessionsTitle')" @click="router.push('/sessions')">
-        <div class="ov-stat__icon control-stat__icon">
-          <Icon name="sessions" :size="18" />
-        </div>
-        <div class="ov-stat__label control-stat__label">{{ t('sessions.overview.totalSessions') }}</div>
-        <div class="ov-stat__value control-stat__value">{{ sessionsCount }}</div>
-        <div class="ov-stat__hint control-stat__hint">{{ t('sessions.overview.viewAll') }}</div>
+      <button class="control-stat control-stat--clickable" type="button" :title="t('sessions.overview.totalSessionsTitle')" @click="router.push('/sessions')">
+        <div class="control-stat__icon"><Icon name="sessions" :size="18" /></div>
+        <div class="control-stat__label">{{ t('sessions.overview.totalSessions') }}</div>
+        <div class="control-stat__value">{{ sessionsCount }}</div>
+        <div class="control-stat__hint">{{ t('sessions.overview.viewAll') }}</div>
       </button>
 
-      <button class="ov-stat control-stat control-stat--clickable" type="button" @click="router.push('/agents')">
-        <div class="ov-stat__icon control-stat__icon">
-          <Icon name="agents" :size="18" />
-        </div>
-        <div class="ov-stat__label control-stat__label">{{ t('sessions.overview.provider') }}</div>
-        <div class="ov-stat__value ov-stat__value--mono control-stat__value control-stat__value--mono">{{ provider }}</div>
-        <div class="ov-stat__hint control-stat__hint">{{ t('sessions.overview.manageAgents') }}</div>
-      </button>
-
-      <button class="ov-stat control-stat control-stat--clickable" type="button" :title="t('sessions.overview.jumpToReadiness')" @click="scrollToHealth">
-        <div class="ov-stat__icon control-stat__icon">
-          <Icon name="logs" :size="18" />
-        </div>
-        <div class="ov-stat__label control-stat__label">{{ t('sessions.overview.health') }}</div>
-        <div class="ov-stat__value ov-stat__value--status control-stat__value">{{ statusLabelText }}</div>
-        <div class="ov-stat__hint control-stat__hint">{{ statusSummary }}</div>
-      </button>
-
-      <div class="ov-stat ov-stat--static control-stat control-stat--static">
-        <div class="ov-stat__icon control-stat__icon">
-          <Icon name="cron" :size="18" />
-        </div>
-        <div class="ov-stat__label control-stat__label">{{ t('sessions.overview.uptime') }}</div>
-        <div class="ov-stat__value ov-stat__value--mono control-stat__value control-stat__value--mono">{{ uptime }}</div>
-        <div class="ov-stat__hint control-stat__hint">{{ versionLine }}</div>
+      <div class="control-stat control-stat--static">
+        <div class="control-stat__icon"><Icon name="cron" :size="18" /></div>
+        <div class="control-stat__label">{{ t('sessions.overview.uptime') }}</div>
+        <div class="control-stat__value control-stat__value--mono">{{ uptime }}</div>
+        <div class="control-stat__hint">{{ versionLine }}</div>
       </div>
     </section>
 
-    <!-- Readiness report (doctor.status) -->
-    <section
-      id="overview-health"
-      class="health-status__rail"
-      :class="stripClass"
-      :aria-label="t('sessions.overview.healthSummary')"
-    >
-      <div class="health-score control-stat control-stat--hero">
-        <span class="health-score__label control-stat__label">{{ t('sessions.overview.readiness') }}</span>
-        <strong class="control-stat__value">{{ statusLabelText }}</strong>
-        <span class="health-score__summary control-stat__hint">{{ statusSummary }}</span>
-        <div v-if="contextItems.length" class="health-report-context" :aria-label="t('sessions.overview.healthContext')">
-          <span v-for="([label, value], idx) in contextItems" :key="idx" class="health-report-context__item">
-            <b>{{ label }}</b>
-            <span class="health-report-context__value">{{ value }}</span>
-          </span>
-        </div>
-      </div>
-      <div class="health-count-grid">
-        <div class="health-count control-stat" :class="`is-${classToken('blocks_ready')}`">
-          <span class="control-stat__label">{{ t('sessions.overview.needsAction') }}</span>
-          <strong class="control-stat__value">{{ impactCounts.blocks_ready || 0 }}</strong>
-        </div>
-        <div class="health-count control-stat" :class="`is-${classToken('degrades')}`">
-          <span class="control-stat__label">{{ t('sessions.overview.degraded') }}</span>
-          <strong class="control-stat__value">{{ impactCounts.degrades || 0 }}</strong>
-        </div>
-        <div class="health-count control-stat" :class="`is-${classToken('optional')}`">
-          <span class="control-stat__label">{{ t('sessions.overview.optional') }}</span>
-          <strong class="control-stat__value">{{ impactCounts.optional || 0 }}</strong>
-        </div>
-        <div class="health-count control-stat" :class="`is-${classToken('none')}`">
-          <span class="control-stat__label">{{ t('sessions.overview.ready') }}</span>
-          <strong class="control-stat__value">{{ impactCounts.none || 0 }}</strong>
-        </div>
-      </div>
+    <!-- Environment readout: gateway / config path / agent / provider as a quiet
+         copyable footer strip, not raw hero content. Config path is abbreviated
+         with the full value in the title tooltip + a copy button. -->
+    <section class="ov-readout" :aria-label="t('sessions.overview.environment')">
+      <span v-for="item in readoutItems" :key="item.key" class="ov-readout__kv">
+        <b>{{ item.label }}</b>
+        <code :title="item.full">{{ item.display }}</code>
+        <button
+          v-if="item.copy"
+          type="button"
+          class="ov-readout__copy"
+          :class="{ 'ov-readout__copy--ok': copiedCommandKey === item.key }"
+          :title="copiedCommandKey === item.key ? t('setup.toast.copiedCommand') : t('sessions.overview.copyCommand')"
+          :aria-label="copiedCommandKey === item.key ? t('setup.toast.copiedCommand') : t('sessions.overview.copyCommand')"
+          @click="copyCommand(item.full, item.key)"
+        >
+          <Icon :name="copiedCommandKey === item.key ? 'check' : 'copy'" :size="13" />
+        </button>
+      </span>
+      <span class="ov-readout__version">v{{ statusData?.version || '—' }} · {{ uptime }}</span>
     </section>
 
-    <section class="health-findings" :aria-label="t('sessions.overview.healthFindings')">
+    <section id="overview-health" class="health-findings" :aria-label="t('sessions.overview.healthFindings')">
       <template v-if="healthLoading">
         <article class="health-empty control-card">{{ t('sessions.overview.loadingHealth') }}</article>
       </template>
@@ -136,9 +114,7 @@
             </div>
             <div class="health-finding__body">
               <div class="health-finding__meta">
-                <span>{{ finding.severity || 'info' }}</span>
-                <span class="health-impact">{{ impactLabel(impactValue(finding)) }}</span>
-                <span class="health-surface">{{ finding.surface || 'system' }}</span>
+                <span class="health-surface">{{ impactLabel(impactValue(finding)) }} · {{ finding.surface || 'system' }}</span>
                 <span
                   v-if="findingBadges(finding)"
                   class="health-chip"
@@ -451,6 +427,8 @@ const recentSessions = computed<Session[]>(() => {
 const healthLoading = ref(true)
 const healthReport = ref<HealthReport | null>(null)
 const healthError = ref<Error | null>(null)
+// ISO timestamp of the last completed doctor.status, for the freshness line.
+const healthCheckedAt = ref<string | undefined>(undefined)
 const copiedCommandKey = ref('')
 
 const eventLog = ref<LogEvent[]>([])
@@ -499,6 +477,15 @@ const statusSummary = computed(() => {
   return healthReport.value?.summary || healthReport.value?.status || ''
 })
 
+// Status glyph inside the tinted chip: ready → check, degraded → shield,
+// action-required / unavailable → x. Tone follows stripClass.
+const statusGlyphIcon = computed<'check' | 'shield' | 'x'>(() => {
+  const cls = stripClass.value
+  if (cls === 'is-action_required' || cls === 'is-unavailable') return 'x'
+  if (cls === 'is-degraded') return 'shield'
+  return 'check'
+})
+
 const impactCounts = computed(() => {
   if (healthLoading.value || healthError.value) {
     return { blocks_ready: 0, degrades: 0, optional: 0, none: 0 }
@@ -506,16 +493,44 @@ const impactCounts = computed(() => {
   return healthReport.value?.impactCounts || impactCountsFromSeverity(healthReport.value?.counts || {})
 })
 
-const contextItems = computed<[string, string][]>(() => {
-  if (healthLoading.value) return []
-  const items: [string, string][] = []
-  const gatewayUrl = healthReport.value?.gatewayUrl || gatewayContextUrl()
-  if (gatewayUrl) items.push([t('sessions.overview.ctxGateway'), gatewayUrl])
-  if (healthReport.value?.configPath) items.push([t('sessions.overview.ctxConfig'), healthReport.value.configPath])
-  if (healthReport.value?.requestedConfigPath && healthReport.value.requestedConfigPath !== healthReport.value.configPath) {
-    items.push([t('sessions.overview.ctxRequestedConfig'), healthReport.value.requestedConfigPath])
+// Impact counts rendered as tone-colored chips inside the readiness hero,
+// replacing the four near-empty count cards. Zero-count chips read muted.
+const impactChips = computed(() => [
+  { key: 'blocks_ready', label: t('sessions.overview.needsAction'), tone: 'danger', n: impactCounts.value.blocks_ready || 0 },
+  { key: 'degrades', label: t('sessions.overview.degraded'), tone: 'warn', n: impactCounts.value.degrades || 0 },
+  { key: 'optional', label: t('sessions.overview.optional'), tone: 'info', n: impactCounts.value.optional || 0 },
+  { key: 'none', label: t('sessions.overview.ready'), tone: 'ok', n: impactCounts.value.none || 0 },
+])
+
+// Environment footer readout: gateway URL, config path (abbreviated + copyable),
+// agent, provider — quiet utility detail, not hero content.
+function abbreviatePath(path: string): string {
+  let p = path
+  const home = '/Users/'
+  if (p.startsWith(home)) {
+    const rest = p.slice(home.length)
+    const slash = rest.indexOf('/')
+    if (slash !== -1) p = '~' + rest.slice(slash)
   }
-  if (healthReport.value?.agentId) items.push([t('sessions.overview.ctxAgent'), healthReport.value.agentId])
+  if (p.length > 42) {
+    const tail = p.slice(-30)
+    const head = p.slice(0, 10)
+    p = `${head}…${tail}`
+  }
+  return p
+}
+
+interface ReadoutItem { key: string; label: string; display: string; full: string; copy: boolean }
+const readoutItems = computed<ReadoutItem[]>(() => {
+  if (healthLoading.value) return []
+  const items: ReadoutItem[] = []
+  const gatewayUrl = healthReport.value?.gatewayUrl || gatewayContextUrl()
+  if (gatewayUrl) items.push({ key: 'gateway', label: t('sessions.overview.ctxGateway'), display: gatewayUrl, full: gatewayUrl, copy: true })
+  if (healthReport.value?.configPath) {
+    items.push({ key: 'config', label: t('sessions.overview.ctxConfig'), display: abbreviatePath(healthReport.value.configPath), full: healthReport.value.configPath, copy: true })
+  }
+  if (healthReport.value?.agentId) items.push({ key: 'agent', label: t('sessions.overview.ctxAgent'), display: healthReport.value.agentId, full: healthReport.value.agentId, copy: false })
+  if (provider.value && provider.value !== '—') items.push({ key: 'provider', label: t('sessions.overview.provider'), display: provider.value, full: provider.value, copy: false })
   return items
 })
 
@@ -633,6 +648,7 @@ async function loadHealth() {
     const data = await rpc.call<HealthReport>('doctor.status', { agentId: 'main', deep: true })
     if (!data.gatewayUrl) data.gatewayUrl = gatewayContextUrl()
     healthReport.value = data
+    healthCheckedAt.value = new Date().toISOString()
   } catch (err) {
     healthError.value = err instanceof Error ? err : new Error(String(err))
     healthReport.value = null
@@ -683,6 +699,9 @@ function loadData() {
   void refreshStatus()
   void refreshUsage()
   void refreshSessions()
+  // Keep the readiness report fresh alongside the stat tiles so the findings and
+  // the "Checked …" line never silently drift; deep checks stay on manual Refresh.
+  void loadHealth()
 }
 
 // ---------------------------------------------------------------------------
@@ -984,15 +1003,130 @@ function gatewayContextUrl(): string {
 </script>
 
 <style scoped>
-.ov-stats > .ov-stat:nth-child(1) { animation-delay: 40ms; }
-.ov-stats > .ov-stat:nth-child(2) { animation-delay: 80ms; }
-.ov-stats > .ov-stat:nth-child(3) { animation-delay: 120ms; }
-.ov-stats > .ov-stat:nth-child(4) { animation-delay: 160ms; }
-.ov-stat__value--status {
-  font-size: clamp(1.35rem, 1.35vw, 1.55rem);
-  line-height: 1.2;
+/* Status line — sits on the canvas like a page header (NOT a filled card).
+   The one warm accent is the small status glyph chip. Compact single row that
+   wraps gracefully; no hollow band. */
+.ov-statusline {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-3);
+  padding: var(--sp-2) 0 var(--sp-1);
+}
+.ov-status-glyph {
+  align-items: center;
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  border-radius: var(--radius-md);
+  color: var(--ok);
+  display: inline-flex;
+  height: 30px;
+  justify-content: center;
+  width: 30px;
+  flex: none;
+}
+.is-action_required .ov-status-glyph,
+.is-unavailable .ov-status-glyph { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); }
+.is-degraded .ov-status-glyph { background: color-mix(in srgb, var(--warn-fill) 14%, transparent); color: var(--warn); }
+.is-loading .ov-status-glyph { background: var(--bg-surface-2); color: var(--text-dim); }
+
+.ov-status-word {
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1;
+  margin-right: var(--sp-1);
+}
+.ov-status-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+.ov-count {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--fs-sm);
+  padding: 2px 0;
+}
+.ov-count b { color: var(--text); font-weight: 600; margin-right: 4px; font-variant-numeric: tabular-nums; }
+.ov-count.is-hot.is-danger b { color: var(--danger); }
+.ov-count.is-hot.is-warn b { color: var(--warn); }
+.ov-count.is-hot.is-info b { color: var(--info); }
+.ov-count.is-hot.is-ok b { color: var(--ok); }
+.ov-count:hover { color: var(--text); }
+.ov-count:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-sm); }
+
+.ov-status-actions {
+  align-items: center;
+  display: flex;
+  gap: var(--sp-3);
+  margin-left: auto;
+}
+.ov-freshness { color: var(--text-dim); font-size: var(--fs-xs); white-space: nowrap; }
+.ov-rerun {
+  background: none; border: none; color: var(--accent); cursor: pointer;
+  font: inherit; font-weight: 600; padding: 0;
+}
+.ov-rerun:hover { color: var(--accent-hover); }
+.ov-rerun:disabled { color: var(--text-dim); cursor: default; }
+.ov-rerun:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-sm); }
+
+/* Three quiet KPI cards */
+.ov-kpis {
+  display: grid;
+  gap: var(--sp-3);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: var(--sp-4);
+}
+.ov-kpis > .control-stat { animation: control-fade-up var(--dur-enter) var(--ease-out) both; }
+.ov-kpis > .control-stat:nth-child(2) { animation-delay: 40ms; }
+.ov-kpis > .control-stat:nth-child(3) { animation-delay: 80ms; }
+
+/* Environment footer readout: quiet, copyable env detail (not hero content) */
+.ov-readout {
+  align-items: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  box-shadow: var(--elev-1);
+  color: var(--text-dim);
+  column-gap: var(--sp-5);
+  display: flex;
+  flex-wrap: wrap;
+  font-size: var(--fs-xs);
+  padding: 11px var(--sp-4);
+  row-gap: 6px;
+}
+.ov-readout__kv { align-items: center; display: flex; gap: 7px; min-width: 0; }
+.ov-readout__kv b { color: var(--text-muted); font-weight: 600; }
+.ov-readout__kv code {
+  background: var(--bg-surface-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 2px 8px;
   white-space: nowrap;
 }
+.ov-readout__copy {
+  align-items: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  cursor: pointer;
+  display: inline-flex;
+  height: 22px;
+  justify-content: center;
+  width: 22px;
+}
+.ov-readout__copy:hover { background: var(--bg-hover); color: var(--text); }
+.ov-readout__copy--ok { color: var(--ok); }
+.ov-readout__copy:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.ov-readout__version { margin-left: auto; white-space: nowrap; }
 
 /* Grid panels */
 .ov-grid {
@@ -1373,15 +1507,9 @@ function gatewayContextUrl(): string {
   }
 }
 
-/* Readiness report (moved from the retired Health view) */
-.health-status__rail {
-  display: grid;
-  gap: var(--sp-3);
-  grid-template-columns: minmax(250px, 1.1fr) minmax(0, 2.4fr);
-}
-
-.health-score,
-.health-count,
+/* Readiness hero tone bar reuses control-stat--hero::before; findings keep the
+   dot tones below. The former .health-status__rail / .health-score /
+   .health-count grid was retired with the 10-tile band. */
 .health-finding,
 .health-empty {
   background: var(--bg-surface);
@@ -1392,148 +1520,20 @@ function gatewayContextUrl(): string {
   position: relative;
 }
 
-.health-score {
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-end;
-  min-height: 116px;
-  padding: var(--sp-5);
-}
-
-.health-score::before {
-  background: var(--border);
-  bottom: 0;
-  content: "";
-  left: 0;
-  position: absolute;
-  top: 0;
-  width: 4px;
-}
-
-.health-status__rail.is-action_required .health-score::before,
-.health-count.is-blocks_ready::before,
-.health-count.is-error::before,
 .health-finding.is-error .health-finding__dot {
   background: var(--danger);
 }
 
-.health-status__rail.is-degraded .health-score::before,
-.health-count.is-degrades::before,
-.health-count.is-warn::before,
 .health-finding.is-warn .health-finding__dot {
   background: var(--warn-fill);
 }
 
-.health-count.is-optional::before,
-.health-count.is-info::before,
 .health-finding.is-info .health-finding__dot {
   background: var(--accent);
 }
 
-.health-status__rail.is-ready .health-score::before,
-.health-count.is-none::before,
-.health-count.is-ok::before,
 .health-finding.is-ok .health-finding__dot {
   background: var(--ok);
-}
-
-.health-status__rail.is-unavailable .health-score::before {
-  background: var(--danger);
-}
-
-.health-score__label,
-.health-count span:first-child {
-  color: var(--text-dim);
-  display: block;
-  font-size: 12px;
-  font-weight: 750;
-  letter-spacing: 0.08em;
-  line-height: 1.25;
-  text-transform: uppercase;
-}
-
-.health-score strong {
-  display: block;
-  font-size: clamp(1.6rem, 1.2rem + 1vw, 2.35rem);
-  letter-spacing: 0;
-  line-height: 1.12;
-  margin-top: var(--sp-2);
-}
-
-.health-score__summary {
-  color: var(--text-muted);
-  display: block;
-  font-size: var(--fs-sm);
-  margin-top: var(--sp-2);
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
-.health-report-context {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: var(--sp-3);
-  min-width: 0;
-}
-
-.health-report-context__item {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text-muted);
-  display: inline-grid;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 6px;
-  line-height: 1.5;
-  max-width: 100%;
-  min-width: 0;
-  padding: 3px 7px;
-}
-
-.health-report-context__item b {
-  color: var(--text-dim);
-  font-family: inherit;
-  font-weight: 700;
-}
-
-.health-report-context__value {
-  min-width: 0;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-}
-
-.health-count-grid {
-  display: grid;
-  gap: var(--sp-3);
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-}
-
-.health-count {
-  min-height: 116px;
-  padding: var(--sp-4);
-}
-
-.health-count::before {
-  background: var(--border);
-  border-radius: var(--radius-full);
-  content: "";
-  height: 8px;
-  position: absolute;
-  right: var(--sp-4);
-  top: var(--sp-4);
-  width: 8px;
-}
-
-.health-count strong {
-  display: block;
-  font-size: 2rem;
-  font-variant-numeric: tabular-nums;
-  letter-spacing: 0;
-  line-height: 1.12;
-  margin-top: var(--sp-4);
 }
 
 .health-findings {
@@ -1555,7 +1555,7 @@ function gatewayContextUrl(): string {
   padding: 0 2px var(--sp-2);
 }
 
-.health-finding-group__header h3 {
+.health-finding-group__header h2 {
   font-size: var(--fs-md);
   letter-spacing: 0;
   margin: 0;
@@ -1816,33 +1816,33 @@ function gatewayContextUrl(): string {
 }
 
 @media (max-width: 980px) {
-  .health-status__rail {
-    grid-template-columns: 1fr;
+  .ov-kpis {
+    grid-template-columns: 1fr 1fr;
+  }
+  .ov-readiness__actions {
+    flex-basis: 100%;
+    margin-left: 0;
   }
 }
 
 @media (max-width: 760px) {
-  .health-count-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .health-finding {
     grid-template-columns: 16px minmax(0, 1fr);
     padding: var(--sp-3);
   }
+  .ov-readout__version {
+    margin-left: 0;
+  }
 }
 
 @media (max-width: 480px) {
-  .health-report-context {
-    display: grid;
+  .ov-kpis {
+    grid-template-columns: 1fr;
   }
-
-  .health-report-context__item {
-    gap: 2px;
-    grid-template-columns: minmax(0, 1fr);
-    width: 100%;
+  .ov-readiness__counts {
+    flex-wrap: wrap;
+    gap: var(--sp-2) var(--sp-4);
   }
-
   .health-step__command {
     display: flex;
     width: 100%;

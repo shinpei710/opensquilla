@@ -366,9 +366,10 @@ function agentSkills(a: Agent): string[] {
   return Array.isArray(a.skills) ? a.skills : []
 }
 
-// Both platforms own a `/settings` route (web overlay / desktop settings view).
+// The button's hint promises provider/model defaults, so deep-link straight to
+// that Settings section rather than the dialog's default landing.
 function openSettingsSurface() {
-  router.push('/settings')
+  router.push('/settings/provider')
 }
 
 function openChat(id?: string) {

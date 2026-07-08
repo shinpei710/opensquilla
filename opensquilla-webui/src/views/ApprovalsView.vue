@@ -373,13 +373,13 @@ async function onModeChange() {
 }
 
 .stat-label {
-  color: var(--text-dim);
+  color: var(--text-muted);
   display: block;
-  font-size: 12px;
-  font-weight: 750;
-  letter-spacing: 0.08em;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0;
   line-height: 1.25;
-  text-transform: uppercase;
+  text-transform: none;
 }
 
 .stat-value {

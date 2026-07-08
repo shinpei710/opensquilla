@@ -29,11 +29,23 @@ const navRoutes = [
 ]
 
 // Operator-facing band labels for the console fold, decoupled from the routing
-// `group` key so the wording reads as goals (Manage / Monitor) without renaming
-// the taxonomy the routes are keyed on.
-const CONSOLE_GROUP_LABELS: Partial<Record<NavGroup, string>> = {
-  Operate: 'Manage',
-  Observe: 'Monitor',
+// `group` key so the wording reads as goals (Build / Monitor) without renaming
+// the taxonomy the routes are keyed on. Resolved through i18n at call time
+// (mirroring navTitle) so the rail/drawer re-render on a language switch and
+// non-English locales get translated bands.
+const CONSOLE_GROUP_LABEL_KEYS: Partial<Record<NavGroup, string>> = {
+  Operate: 'nav.groupBuild',
+  Observe: 'nav.groupMonitor',
+}
+
+function consoleGroupLabel(group: NavGroup): string {
+  const key = CONSOLE_GROUP_LABEL_KEYS[group]
+  if (key) {
+    const translated = i18n.global.t(key)
+    if (translated !== key) return translated
+  }
+  // Dev-facing fallback for an unmapped/untranslated band.
+  return group
 }
 
 function routePlatforms(platforms: unknown): PlatformId[] {
@@ -82,19 +94,17 @@ export function getConsoleNavigationSections(): NavGroupSection[] {
   return CONSOLE_GROUP_ORDER
     .map((group) => ({
       group,
-      label: CONSOLE_GROUP_LABELS[group] ?? group,
+      label: consoleGroupLabel(group),
       items: primary.filter((item) => groupOf.get(item.path) === group),
     }))
     .filter((section) => section.items.length > 0)
 }
 
+// Retired fold accessor: with the full-index rail every console destination is
+// visible, so the popover no longer filters anything. Kept as an alias while
+// call sites migrate to getConsoleNavigationSections().
 export function getMoreNavigationSections(): NavGroupSection[] {
   return getConsoleNavigationSections()
-    .map((section) => ({
-      ...section,
-      items: section.items.filter((item) => item.path !== '/approvals'),
-    }))
-    .filter((section) => section.items.length > 0)
 }
 
 // The Work band: the always-visible level-1 destinations that pin to the rail

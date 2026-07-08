@@ -98,29 +98,18 @@
   cursor: default;
 }
 
-.control-stat--accent::before,
-.control-stat--hero::before {
-  background: var(--accent);
+/* Quiet-canvas language: hero tiles are ordinary cards — no accent bar, no
+   radial wash. Status/emphasis is carried by content (display numerals, tone
+   dots), never by tile decoration; the accent is reserved for the primary
+   action, active nav, and links. Only --warn keeps an edge (it is a signal). */
+.control-stat--warn::before {
+  background: var(--warn-fill);
   bottom: 0;
   content: "";
   left: 0;
   position: absolute;
   top: 0;
   width: 3px;
-}
-
-.control-stat--warn::before {
-  background: var(--warn-fill);
-}
-
-.control-stat--hero::after,
-.control-card--accent::after {
-  background: radial-gradient(circle at 0% 0%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 62%);
-  border-radius: inherit;
-  content: "";
-  inset: 0;
-  pointer-events: none;
-  position: absolute;
 }
 
 .control-stat--clickable:hover,
@@ -155,15 +144,15 @@
 }
 
 .control-stat__label {
-  color: var(--text-dim);
+  color: var(--text-muted);
   display: block;
-  font-family: var(--label-font);
-  font-size: 11px;
-  font-weight: var(--fw-quiet);
-  letter-spacing: var(--label-track);
+  font-family: var(--font-sans);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0;
   line-height: 1.25;
   margin-bottom: 6px;
-  text-transform: uppercase;
+  text-transform: none;
 }
 
 .control-stat__value {

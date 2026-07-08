@@ -5,9 +5,9 @@ import { isRestorableRoute, saveLastRoute, readLastRoute, LAST_ROUTE_KEY } from 
 beforeEach(() => localStorage.clear())
 
 describe('isRestorableRoute', () => {
-  it('accepts the known top-level views', () => {
+  it('accepts the known top-level views (incl. the Monitor-hub tab routes)', () => {
     for (const p of [
-      '/chat', '/sessions', '/approvals', '/agents', '/channels',
+      '/chat', '/sessions', '/agents', '/channels',
       '/cron', '/skills', '/overview', '/usage', '/logs',
     ]) {
       expect(isRestorableRoute(p)).toBe(true)
@@ -17,6 +17,9 @@ describe('isRestorableRoute', () => {
   it('rejects root, the chat draft, the settings overlay, and unknown/removed paths', () => {
     for (const p of [
       '/', '/chat/new', '/settings', '/settings/router', '/settings/auto',
+      // /approvals now redirects to /sessions — restoring it would loop the
+      // saved value through a redirect on every launch, so it is not saved.
+      '/approvals',
       '/health', '/nope', '/settingsx', '',
     ]) {
       expect(isRestorableRoute(p)).toBe(false)

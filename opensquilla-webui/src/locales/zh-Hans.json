@@ -58,7 +58,9 @@
     "overview": "概览",
     "usage": "用量",
     "logs": "日志",
-    "settings": "设置"
+    "settings": "设置",
+    "groupBuild": "构建",
+    "groupMonitor": "监控"
   },
   "chrome": {
     "settings": "设置",
@@ -134,7 +136,12 @@
         "delivery": "分发",
         "preferences": "偏好设置",
         "capabilities": "能力"
-      }
+      },
+      "safety": "安全"
+    },
+    "safety": {
+      "title": "审批策略",
+      "desc": "选择 OpenSquilla 如何在所有智能体和频道中处理有风险的工具执行。"
     }
   },
   "errorBoundary": {
@@ -895,7 +902,10 @@
         "runLocalDoctorDetail": "在重启网关前检查本地配置和初始化设置。",
         "startLocal": "启动本地网关",
         "inspectLocal": "检查本地网关"
-      }
+      },
+      "checkedAgo": "{time}检查",
+      "rerunChecks": "重新检查",
+      "environment": "环境"
     }
   },
   "console": {
@@ -1619,7 +1629,8 @@
       "autoFollow": "自动跟随",
       "loading": "正在加载日志…",
       "noMatch": "没有符合当前过滤条件的日志行。",
-      "lineDetail": "日志行详情"
+      "lineDetail": "日志行详情",
+      "ofLoadedFoot": "当前显示 {visible} 条 · 已缓冲 {total} 条"
     }
   },
   "chat": {
