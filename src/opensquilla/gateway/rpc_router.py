@@ -17,6 +17,8 @@ per-session gating. These handlers observe routing; they never change it.
 
 from __future__ import annotations
 
+import os
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -138,3 +140,132 @@ async def _handle_router_feedback_submit(params: Any, ctx: RpcContext) -> dict[s
         rating=rating,
     )
     return {"accepted": True}
+
+
+@_d.method("router.selflearning.status", scope="operator.read")
+async def _handle_selflearning_status(params: Any, ctx: RpcContext) -> dict[str, Any]:
+    """Read-only status of the router self-learning loop for one agent.
+
+    Everything here is derived from on-disk state the loop already writes
+    (event store scan, train-state JSON, active pointer, receipts) plus a live
+    gate evaluation — no side effects, no model loads, no training. This is
+    the single source the Web UI status card and CLI doctor consume, so gate
+    reason codes are surfaced verbatim for the client to localize.
+
+    Params (optional): ``agentId`` (defaults to ``main``).
+    """
+
+    p = params if isinstance(params, dict) else {}
+    agent_raw = p.get("agentId") or p.get("agent_id") or "main"
+    agent_id = sanitize_token(agent_raw)
+    if agent_id is None:
+        raise RpcHandlerError(ERROR_INVALID_REQUEST, "agentId must be an id token")
+
+    router_cfg = getattr(ctx.config, "squilla_router", None)
+    sl_cfg = getattr(router_cfg, "self_learning", None)
+    memory_cfg = getattr(ctx.config, "memory", None)
+    dream_cfg = getattr(memory_cfg, "dream", None)
+
+    enabled = bool(getattr(sl_cfg, "enabled", False))
+    dream_enabled = bool(getattr(dream_cfg, "enabled", False))
+    dream_scheduled = bool(getattr(dream_cfg, "auto_schedule", False))
+    dream_killed = os.getenv("OPENSQUILLA_MEMORY_DREAM_DISABLED") == "1"
+
+    payload: dict[str, Any] = {
+        "agentId": agent_id,
+        "enabled": enabled,
+        "captureEnabled": enabled and bool(getattr(sl_cfg, "capture_enabled", True)),
+        # The training trigger rides the dream cadence; false while
+        # self-learning is on means samples accumulate but training never
+        # runs. Mirrors the boot warning's condition, kill switch included.
+        "trainingReachable": enabled and dream_enabled and dream_scheduled and not dream_killed,
+        "dream": {
+            "enabled": dream_enabled,
+            "autoSchedule": dream_scheduled,
+            "killSwitchActive": dream_killed,
+        },
+        "activeModel": {"kind": "baseline", "version": None, "promotedAt": None},
+        "samples": None,
+        "gate": None,
+        "lastReceipt": None,
+    }
+    if not enabled:
+        return payload
+
+    def _collect_disk_state() -> dict[str, Any]:
+        # Blocking file IO (event-store scan can be many JSONL files); runs in
+        # a worker thread so the gateway event loop never stalls on it.
+        from opensquilla.squilla_router.self_learning.gates import evaluate_training_gates
+        from opensquilla.squilla_router.self_learning.promotion import read_active
+        from opensquilla.squilla_router.self_learning.state import (
+            load_train_state,
+            scan_event_store,
+        )
+        from opensquilla.squilla_router.self_learning.store import (
+            router_data_root,
+            self_learning_disabled_by_env,
+        )
+
+        state = load_train_state(agent_id)
+        stats = scan_event_store(agent_id)
+        gate = evaluate_training_gates(config=sl_cfg, state=state, stats=stats)
+
+        out: dict[str, Any] = {}
+        active = read_active()
+        if active.startswith("learned/") and state.active_version:
+            out["activeModel"] = {
+                "kind": "learned",
+                "version": state.active_version,
+                "promotedAt": state.promoted_at,
+            }
+        out["samples"] = {
+            "total": stats.total,
+            "highValue": stats.high_value,
+            "requiredHighValue": gate.effective_min_samples,
+            "distinctClasses": stats.distinct_classes,
+            "complaintRate": round(stats.complaint_rate, 4),
+            "lastCapturedAt": stats.last_ts,
+        }
+        out["gate"] = {
+            "wouldTrain": gate.should_train,
+            "reason": gate.reason,
+            "consecutiveFailures": state.consecutive_failures,
+            "lastAttemptAt": state.last_attempt_ts,
+            "lastTrainedAt": state.last_train_ts,
+            "killSwitchActive": self_learning_disabled_by_env(),
+        }
+
+        receipts_dir = router_data_root() / ".receipts"
+        if receipts_dir.is_dir():
+            # Receipt names are "<agent_id>-<20-digit stamp>-<kind>.json"; the
+            # stamp-digit anchor keeps agent "main" from matching another
+            # agent's "main-backup-..." receipts on the shared prefix.
+            name_re = re.compile(rf"^{re.escape(agent_id)}-\d{{14,20}}-[a-z_]+\.json$")
+            candidates = [
+                f for f in receipts_dir.glob(f"{agent_id}-*.json") if name_re.match(f.name)
+            ]
+            latest = max(candidates, key=lambda f: f.name, default=None)
+            if latest is not None:
+                import json as _json
+
+                try:
+                    receipt = _json.loads(latest.read_text(encoding="utf-8"))
+                    out["lastReceipt"] = {
+                        "kind": receipt.get("kind"),
+                        "version": receipt.get("version"),
+                        "reason": receipt.get("reason"),
+                        "file": latest.name,
+                    }
+                except (OSError, ValueError):
+                    out["lastReceipt"] = {"kind": "unreadable", "file": latest.name}
+        return out
+
+    try:
+        import anyio
+
+        payload.update(await anyio.to_thread.run_sync(_collect_disk_state))
+    except Exception as exc:  # noqa: BLE001 — status must degrade, not error
+        log.warning("router_selflearning.status_failed", agent_id=agent_id, error=str(exc))
+        payload["error"] = "status_partial"
+
+    return payload

@@ -6,6 +6,8 @@ import copy
 from pathlib import Path
 from typing import Any, cast
 
+import structlog
+
 from opensquilla.gateway.config_secrets import (
     REDACTED_PUBLIC_VALUE as _REDACTED_PUBLIC_VALUE,
 )
@@ -26,6 +28,8 @@ from opensquilla.gateway.config_secrets import (
 )
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.paths import default_opensquilla_home
+
+log = structlog.get_logger(__name__)
 
 _d = get_dispatcher()
 
@@ -81,6 +85,94 @@ def _strip_public_derived_config_fields(payload: dict[str, Any]) -> dict[str, An
         privacy.pop("network_observability_disabled_effective", None)
         payload["privacy"] = privacy
     return payload
+
+
+async def _reconcile_dream_crons_live(response: dict[str, Any]) -> None:
+    """Make a dream linkage take effect in the running scheduler.
+
+    Boot registers dream crons from config once; without this, the linkage
+    flips ``memory.dream.*`` while the jobs stay absent/paused until restart —
+    the exact silent never-trains gap the linkage exists to close. The
+    reconciler is the boot registrar rebound to the live config; when it is
+    unavailable (standalone/config-only contexts) the response says so and
+    flags the restart honestly.
+    """
+
+    from opensquilla.gateway.dream_bridge import get_dream_reconciler
+
+    reconciler = get_dream_reconciler()
+    if reconciler is None:
+        response["linkedLive"] = False
+        response["restartRequired"] = True
+        sections = response.get("restartSections")
+        if isinstance(sections, list) and "memory.dream" not in sections:
+            sections.append("memory.dream")
+        return
+    try:
+        await reconciler()
+        response["linkedLive"] = True
+    except Exception as exc:  # noqa: BLE001 — linkage stays valid in config
+        log.warning("config.dream_link_reconcile_failed", error=str(exc))
+        response["linkedLive"] = False
+        response["restartRequired"] = True
+
+
+def _link_dream_for_self_learning_patch(
+    source_config: Any,
+    cfg_dict: dict[str, Any],
+    explicit_paths: set[str],
+) -> list[str]:
+    """Atomically enable the dream chain when self-learning is switched on.
+
+    Router self-learning's training trigger rides the post-dream hook; enabling
+    it while dream is off (the default) captures samples that never train. When
+    an edit flips ``squilla_router.self_learning.enabled`` to true, pull
+    ``memory.dream.enabled`` and ``memory.dream.auto_schedule`` up with it —
+    unless the same edit also touches those keys explicitly (the operator's
+    word wins). Deliberately one-directional: disabling self-learning never
+    touches dream, which the operator may rely on independently. Returns the
+    linked dot-paths for the response so clients can show what changed.
+    """
+
+    sl_paths = {
+        "squilla_router.self_learning.enabled",
+        "squilla_router.self_learning",
+        "squilla_router",
+    }
+    if not (explicit_paths & sl_paths):
+        return []
+
+    router = cfg_dict.get("squilla_router")
+    sl = router.get("self_learning") if isinstance(router, dict) else None
+    if not isinstance(sl, dict) or not bool(sl.get("enabled")):
+        return []
+
+    was_enabled = bool(
+        getattr(
+            getattr(getattr(source_config, "squilla_router", None), "self_learning", None),
+            "enabled",
+            False,
+        )
+    )
+    if was_enabled:  # only the off -> on transition links
+        return []
+
+    memory = cfg_dict.setdefault("memory", {})
+    if not isinstance(memory, dict):
+        return []
+    dream = memory.setdefault("dream", {})
+    if not isinstance(dream, dict):
+        return []
+
+    linked: list[str] = []
+    for key in ("enabled", "auto_schedule"):
+        path = f"memory.dream.{key}"
+        if path in explicit_paths or "memory.dream" in explicit_paths:
+            continue  # explicit operator value wins over linkage
+        if not bool(dream.get(key)):
+            dream[key] = True
+            linked.append(path)
+    return linked
 
 
 def _align_auto_router_profile_for_provider_patch(
@@ -449,26 +541,33 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
     restored_value, redacted_paths = _restore_redacted_values(value, source_value, path)
     _set_path(cfg_dict, path, restored_value)
 
+    explicit_paths = {path} | _collect_paths(value, path)
+    linked_paths = _link_dream_for_self_learning_patch(ctx.config, cfg_dict, explicit_paths)
+    explicit_paths.update(linked_paths)
+
     # Re-validate full config
     from opensquilla.gateway.config import GatewayConfig
 
     new_config = GatewayConfig(**cfg_dict)
     if _memory_restart_required_for_paths({path}):
         _validate_memory_embedding_semantics(new_config)
-    explicit_paths = {path} | _collect_paths(value, path)
     inherit_then_clear_explicit(ctx.config, new_config, explicit_paths - redacted_paths)
     _sync_provider_selector(ctx, new_config)
     _update_config_in_place(ctx.config, new_config)
     _sync_image_generation(new_config)
     _sync_model_catalog_overrides(new_config)
     _persist_config(ctx.config)
-    return _change_meta(
+    response = _change_meta(
         old_memory_fingerprint=old_memory_fingerprint,
         old_channels_fingerprint=old_channels_fingerprint,
         old_sandbox_posture_fingerprint=old_sandbox_posture_fingerprint,
         old_dump=old_dump,
         new_config=new_config,
     )
+    if linked_paths:
+        response["linked"] = linked_paths
+        await _reconcile_dream_crons_live(response)
+    return response
 
 
 @_d.method("config.patch", scope="operator.admin")
@@ -520,6 +619,8 @@ async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str
     for path, value in dot_patches.items():
         explicit_paths.update(_collect_paths(value, path))
     _align_auto_router_profile_for_provider_patch(ctx.config, cfg_dict, explicit_paths)
+    linked_paths = _link_dream_for_self_learning_patch(ctx.config, cfg_dict, explicit_paths)
+    explicit_paths.update(linked_paths)
 
     from opensquilla.gateway.config import GatewayConfig
 
@@ -542,10 +643,14 @@ async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str
         old_dump=source_cfg_dict,
         new_config=new_config,
     )
-    return {
+    response: dict[str, Any] = {
         "patched": list(dot_patches.keys()) + (["(merge)"] if patch_data else []),
         **change_meta,
     }
+    if linked_paths:
+        response["linked"] = linked_paths
+        await _reconcile_dream_crons_live(response)
+    return response
 
 
 @_d.method("config.patch.safe", scope="operator.write")

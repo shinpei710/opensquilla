@@ -357,3 +357,350 @@ def test_orchestrator_auto_rolls_back_regressed_candidate(tmp_path) -> None:
     assert state.active_version is None
     assert (tmp_path / "router" / "learned" / ".quarantine" / "vBad").exists()
     assert list((tmp_path / "router" / ".receipts").glob("agx-*-rollback.json"))
+
+
+# --------------------------------------------------------------------------- #
+# Base-upgrade detach guard (verify_active_bundle)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture(autouse=True)
+def _reset_verify_memo():
+    """The verify memo is process-global; isolate it per test."""
+    import opensquilla.squilla_router.self_learning.promotion as promo
+
+    promo._verify_key = None
+    promo._verify_result = None
+    promo._fp_cache = None
+    yield
+    promo._verify_key = None
+    promo._verify_result = None
+    promo._fp_cache = None
+
+
+def _make_learned(tmp_path, version: str, *, base_fingerprint: str | None) -> None:
+    import json
+
+    bundle = learned_bundle_dir(version, tmp_path)
+    bundle.mkdir(parents=True)
+    (bundle / "lgbm_main.bin").write_bytes(b"learned-head")
+    manifest: dict = {"version": version}
+    if base_fingerprint is not None:
+        manifest["base_fingerprint"] = base_fingerprint
+    (bundle / "learned_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _make_base(tmp_path, content: bytes = b"base-model-v1"):
+    base = tmp_path / "base"
+    base.mkdir(exist_ok=True)
+    (base / "lgbm_main.bin").write_bytes(content)
+    return base
+
+
+def test_verify_detaches_on_base_upgrade(tmp_path) -> None:
+    from opensquilla.squilla_router.self_learning.promotion import verify_active_bundle
+    from opensquilla.squilla_router.self_learning.train import base_bundle_fingerprint
+
+    base = _make_base(tmp_path)
+    old_fp = base_bundle_fingerprint(base)
+    _make_learned(tmp_path, "v1", base_fingerprint=old_fp)
+    write_active_atomic("learned/v1", tmp_path)
+
+    # Same base: nothing happens.
+    check = verify_active_bundle(base, tmp_path)
+    assert not check.detached and read_active(tmp_path) == "learned/v1"
+
+    # Base replaced (package upgrade): detach + quarantine + baseline.
+    (base / "lgbm_main.bin").write_bytes(b"base-model-v2-NEW-WEIGHTS")
+    check = verify_active_bundle(base, tmp_path)
+    assert check.detached and check.reason == "base_upgraded"
+    assert read_active(tmp_path) == "baseline"
+    assert (tmp_path / "router" / "learned" / ".quarantine" / "v1").exists()
+
+
+def test_verify_trusts_legacy_bundle_without_fingerprint(tmp_path) -> None:
+    """Pre-fingerprint candidates must not be mass-detached on upgrade."""
+    from opensquilla.squilla_router.self_learning.promotion import verify_active_bundle
+
+    base = _make_base(tmp_path)
+    _make_learned(tmp_path, "vLegacy", base_fingerprint=None)
+    write_active_atomic("learned/vLegacy", tmp_path)
+
+    check = verify_active_bundle(base, tmp_path)
+    assert not check.detached
+    assert read_active(tmp_path) == "learned/vLegacy"
+
+
+def test_verify_memoizes_per_pointer_and_base(tmp_path, monkeypatch) -> None:
+    """The 39MB hash must not run on every strategy-cache-key computation."""
+    import opensquilla.squilla_router.self_learning.train as train_mod
+    from opensquilla.squilla_router.self_learning.promotion import verify_active_bundle
+
+    base = _make_base(tmp_path)
+    fp = train_mod.base_bundle_fingerprint(base)
+    _make_learned(tmp_path, "v1", base_fingerprint=fp)
+    write_active_atomic("learned/v1", tmp_path)
+
+    calls = {"n": 0}
+    real = train_mod.base_bundle_fingerprint
+
+    def counting(base_dir):
+        calls["n"] += 1
+        return real(base_dir)
+
+    monkeypatch.setattr(train_mod, "base_bundle_fingerprint", counting)
+    import opensquilla.squilla_router.self_learning.promotion as promo
+
+    promo._fp_cache = None
+    verify_active_bundle(base, tmp_path)
+    verify_active_bundle(base, tmp_path)
+    verify_active_bundle(base, tmp_path)
+    # Repeated calls are stable, never detach, and the expensive hash is
+    # stat-gated to a single computation (see the dedicated hash-once test).
+    assert read_active(tmp_path) == "learned/v1"
+    assert calls["n"] == 1
+    promo._fp_cache = None
+
+
+def test_verify_noop_on_baseline_pointer(tmp_path) -> None:
+    from opensquilla.squilla_router.self_learning.promotion import verify_active_bundle
+
+    base = _make_base(tmp_path)
+    check = verify_active_bundle(base, tmp_path)
+    assert not check.detached
+    assert read_active(tmp_path) == "baseline"
+
+
+def test_orchestrator_reconciles_detached_candidate(tmp_path) -> None:
+    """After a base upgrade the offline pass clears promotion-monitor state."""
+    from opensquilla.squilla_router.self_learning.train import base_bundle_fingerprint
+
+    base = _make_base(tmp_path)
+    old_fp = base_bundle_fingerprint(base)
+    _make_learned(tmp_path, "vOld", base_fingerprint=old_fp)
+    write_active_atomic("learned/vOld", tmp_path)
+    save_train_state(
+        TrainState(
+            active_version="vOld",
+            promoted_at="2026-06-05T00:00:00Z",
+            pre_promotion_complaint_rate=0.10,
+        ),
+        "agd",
+        tmp_path,
+    )
+    # Upgrade the base.
+    (base / "lgbm_main.bin").write_bytes(b"base-model-v2")
+
+    res = maybe_run_update_router(
+        "agd",
+        router_cfg=SquillaRouterConfig(self_learning=_cfg()),
+        home=tmp_path,
+        now=NOW,
+        trainer=in_process_trainer,
+        base_dir=base,
+    )
+    # No training data -> gates fail, but the detach must have reconciled.
+    assert not res.rolled_back  # detach is not a regression rollback
+    assert read_active(tmp_path) == "baseline"
+    state = load_train_state("agd", tmp_path)
+    assert state.active_version is None and state.promoted_at is None
+    assert state.pre_promotion_complaint_rate is None
+    assert list((tmp_path / "router" / ".receipts").glob("agd-*-detached.json"))
+    assert (tmp_path / "router" / "learned" / ".quarantine" / "vOld").exists()
+
+
+def test_candidate_manifest_records_base_fingerprint(tmp_path) -> None:
+    import json
+
+    pytest.importorskip("lightgbm")
+    from types import SimpleNamespace
+
+    from opensquilla.squilla_router.self_learning.train import (
+        base_bundle_fingerprint,
+        build_candidate_bundle,
+        train_booster,
+    )
+
+    base = tmp_path / "base"
+    base.mkdir()
+    booster, _ = train_booster(
+        _mini_dataset(), base_model_path=None, config=SimpleNamespace(num_boost_round=8)
+    )
+    booster.save_model(str(base / "lgbm_main.bin"))
+    expected = base_bundle_fingerprint(base)
+
+    info = build_candidate_bundle(
+        _mini_dataset(),
+        base_dir=base,
+        learned_root=tmp_path / "learned",
+        config=SimpleNamespace(num_boost_round=4),
+    )
+    assert info.base_fingerprint == expected
+    manifest = json.loads(
+        (tmp_path / "learned" / info.version / "learned_manifest.json").read_text()
+    )
+    assert manifest["base_fingerprint"] == expected
+
+
+def _mini_dataset() -> TrainingDataset:
+    rng = np.random.RandomState(0)
+    n = 24
+    return TrainingDataset(
+        X=rng.rand(n, 390).astype(np.float32),
+        y=(np.arange(n) % 3).astype(np.int64),
+        w=np.ones(n, dtype=np.float32),
+        served=(np.arange(n) % 3).astype(np.int64),
+        session_keys=[f"s{i // 4}" for i in range(n)],
+        turn_indices=[i % 4 for i in range(n)],
+        days=["2026-06-01"] * n,
+        reasons=["normal"] * n,
+        feature_schema_version="v1",
+        n_sessions=6,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Engine fallback chain: learned -> baseline -> heuristic
+# --------------------------------------------------------------------------- #
+
+
+def test_broken_learned_bundle_falls_back_to_baseline(tmp_path, monkeypatch) -> None:
+    """A corrupt learned bundle must degrade to the shipped ML baseline, not
+    straight to heuristic tiering."""
+    from opensquilla.engine.steps import squilla_router as step
+
+    built = []
+
+    class _FakeStrategy:
+        source = "v4_phase3"
+        _available = True
+
+        def __init__(self, bundle_dir=None, **_kw):
+            built.append(bundle_dir)
+            if bundle_dir == "/learned/broken":
+                raise RuntimeError("incomplete V4 router artifact bundle")
+
+    import opensquilla.squilla_router.v4_phase3 as v4mod
+
+    monkeypatch.setattr(v4mod, "V4Phase3Strategy", _FakeStrategy)
+    monkeypatch.setattr(step, "_active_bundle_dir", lambda _c: "/learned/broken")
+    step.invalidate_strategy_cache()
+
+    cfg = SquillaRouterConfig(self_learning=_cfg())
+    strategy = step._get_strategy(cfg)
+    # First attempt hit the learned dir, second the baseline (None -> packaged).
+    assert built == ["/learned/broken", None]
+    assert isinstance(strategy, _FakeStrategy)
+    step.invalidate_strategy_cache()
+
+
+def test_learned_and_baseline_both_broken_degrades_to_heuristic(
+    tmp_path, monkeypatch
+) -> None:
+    from opensquilla.engine.routing.heuristic import HeuristicRouterStrategy
+    from opensquilla.engine.steps import squilla_router as step
+
+    class _AlwaysBroken:
+        source = "v4_phase3"
+
+        def __init__(self, **_kw):
+            raise RuntimeError("no runtime")
+
+    import opensquilla.squilla_router.v4_phase3 as v4mod
+
+    monkeypatch.setattr(v4mod, "V4Phase3Strategy", _AlwaysBroken)
+    monkeypatch.setattr(step, "_active_bundle_dir", lambda _c: "/learned/broken")
+    monkeypatch.setattr(step, "_router_runtime_warning_emitted", False)
+    step.invalidate_strategy_cache()
+
+    cfg = SquillaRouterConfig(self_learning=_cfg())
+    strategy = step._get_strategy(cfg)
+    assert isinstance(strategy, HeuristicRouterStrategy)
+    step.invalidate_strategy_cache()
+
+
+def test_failed_detach_is_not_memoized_and_retries(tmp_path, monkeypatch) -> None:
+    """A transient detach failure must not permanently trust the stale bundle."""
+    import opensquilla.squilla_router.self_learning.promotion as promo
+    from opensquilla.squilla_router.self_learning.promotion import verify_active_bundle
+    from opensquilla.squilla_router.self_learning.train import base_bundle_fingerprint
+
+    base = _make_base(tmp_path)
+    old_fp = base_bundle_fingerprint(base)
+    _make_learned(tmp_path, "v1", base_fingerprint=old_fp)
+    write_active_atomic("learned/v1", tmp_path)
+    (base / "lgbm_main.bin").write_bytes(b"base-model-v2-UPGRADED")
+
+    calls = {"n": 0}
+    real_rollback = promo.rollback_active
+
+    def flaky_rollback(home=None, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError("disk full")
+        return real_rollback(home, **kw)
+
+    monkeypatch.setattr(promo, "rollback_active", flaky_rollback)
+
+    first = verify_active_bundle(base, tmp_path)
+    assert not first.detached  # fail-open on the transient error
+    assert read_active(tmp_path) == "learned/v1"
+
+    second = verify_active_bundle(base, tmp_path)  # must RETRY, not trust memo
+    assert second.detached and second.reason == "base_upgraded"
+    assert read_active(tmp_path) == "baseline"
+    assert calls["n"] == 2
+
+
+def test_fingerprint_hash_runs_once_per_base_file_change(tmp_path, monkeypatch) -> None:
+    """The 39MB sha256 must be stat-gated, not recomputed per call."""
+    import opensquilla.squilla_router.self_learning.promotion as promo
+    import opensquilla.squilla_router.self_learning.train as train_mod
+    from opensquilla.squilla_router.self_learning.promotion import verify_active_bundle
+
+    base = _make_base(tmp_path)
+    fp = train_mod.base_bundle_fingerprint(base)
+    _make_learned(tmp_path, "v1", base_fingerprint=fp)
+    write_active_atomic("learned/v1", tmp_path)
+    promo._fp_cache = None
+
+    hashes = {"n": 0}
+    real = train_mod.base_bundle_fingerprint
+
+    def counting(base_dir):
+        hashes["n"] += 1
+        return real(base_dir)
+
+    monkeypatch.setattr(train_mod, "base_bundle_fingerprint", counting)
+    for _ in range(5):
+        verify_active_bundle(base, tmp_path)
+    assert hashes["n"] == 1  # one hash; four stat-gated cache hits
+
+    promo._fp_cache = None
+
+
+def test_engine_active_bundle_dir_invokes_verify_and_detaches(
+    tmp_path, monkeypatch
+) -> None:
+    """The real engine path must run the base-upgrade guard, not just resolve.
+
+    No monkeypatching of _active_bundle_dir itself: config points v4_bundle_dir
+    at a synthetic base, the state home holds a promoted-but-stale candidate,
+    and resolving the bundle through the engine must detach it.
+    """
+    from opensquilla.engine.steps import squilla_router as step
+    from opensquilla.squilla_router.self_learning.train import base_bundle_fingerprint
+
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
+    base = _make_base(tmp_path)
+    old_fp = base_bundle_fingerprint(base)
+    _make_learned(tmp_path, "vStale", base_fingerprint=old_fp)
+    write_active_atomic("learned/vStale", tmp_path)
+    (base / "lgbm_main.bin").write_bytes(b"base-model-v2-UPGRADED")
+
+    cfg = SquillaRouterConfig(self_learning=_cfg(), v4_bundle_dir=str(base))
+    resolved = step._active_bundle_dir(cfg)
+
+    assert resolved is None  # stale candidate detached -> baseline
+    assert read_active(tmp_path) == "baseline"
+    assert (tmp_path / "router" / "learned" / ".quarantine" / "vStale").exists()

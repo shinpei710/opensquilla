@@ -300,6 +300,41 @@ async def _list_scheduler_jobs(scheduler: Any) -> list[Any]:
     return result if isinstance(result, list) else []
 
 
+def _warn_if_self_learning_unreachable(config: Any) -> None:
+    """Warn when self-learning is on but its training trigger can never fire.
+
+    The retrain rides the post-dream hook, so with dream disabled (or its cron
+    unscheduled) capture accumulates samples while training silently never
+    runs. Config carries no cross-section validation for this, and the CLI is
+    often the only surface an operator watches — one explicit boot line turns
+    the silent gap into a diagnosable one. Mirrored by the
+    ``router.selflearning.status`` RPC's ``trainingReachable`` field.
+    """
+
+    sl_cfg = getattr(getattr(config, "squilla_router", None), "self_learning", None)
+    if sl_cfg is None or not bool(getattr(sl_cfg, "enabled", False)):
+        return
+    if os.getenv("OPENSQUILLA_ROUTER_SELFLEARN_DISABLED") == "1":
+        return  # the whole loop is deliberately off; unreachable-trigger noise helps no one
+    dream_cfg = getattr(getattr(config, "memory", None), "dream", None)
+    dream_on = bool(getattr(dream_cfg, "enabled", False))
+    dream_scheduled = dream_on and bool(getattr(dream_cfg, "auto_schedule", False))
+    if dream_scheduled and os.getenv("OPENSQUILLA_MEMORY_DREAM_DISABLED") != "1":
+        return
+    log.warning(
+        "router_self_learning.trigger_unreachable",
+        dream_enabled=dream_on,
+        dream_auto_schedule=bool(getattr(dream_cfg, "auto_schedule", False)),
+        hint=(
+            "squilla_router.self_learning.enabled is true but the post-dream "
+            "training trigger cannot fire; capture will accumulate samples "
+            "without ever training. Set memory.dream.enabled=true and "
+            "memory.dream.auto_schedule=true (and clear "
+            "OPENSQUILLA_MEMORY_DREAM_DISABLED) to activate training."
+        ),
+    )
+
+
 async def _register_dream_crons(
     *,
     scheduler: Any,
@@ -363,6 +398,18 @@ async def _register_dream_crons(
                 result = update_job(getattr(existing, "id"), **patch)
                 if inspect.isawaitable(result):
                     await result
+            # A previous disabled-config pass (or boot) may have left the row
+            # paused; with dream now enabled the job must actually fire again.
+            # Matters for live re-reconciliation after a config RPC edit.
+            status = getattr(
+                getattr(existing, "status", None), "value", getattr(existing, "status", "")
+            )
+            resume_job = getattr(scheduler, "resume_job", None)
+            if status == "paused" and callable(resume_job):
+                result = resume_job(getattr(existing, "id"))
+                if inspect.isawaitable(result):
+                    await result
+                log.info("boot.dream.resumed", agent_id=agent_id)
             log.info(
                 "boot.dream.already_registered",
                 agent_id=agent_id,
@@ -3389,6 +3436,22 @@ async def start_gateway_server(
             memory_config=config.memory,
             agent_ids=_configured_agent_ids(config),
         )
+        _warn_if_self_learning_unreachable(config)
+
+        async def _reconcile_dream_runtime_crons() -> None:
+            # Re-run the idempotent registrar against the LIVE config object:
+            # a config RPC edit (e.g. the self-learning -> dream linkage) has
+            # already mutated it in place by the time this fires, so jobs are
+            # created/resumed/paused to match without a gateway restart.
+            await _register_dream_crons(
+                scheduler=svc.cron_scheduler,
+                memory_config=config.memory,
+                agent_ids=_configured_agent_ids(config),
+            )
+
+        from opensquilla.gateway.dream_bridge import register_dream_reconciler
+
+        register_dream_reconciler(_reconcile_dream_runtime_crons)
         if bool(getattr(auto_cfg, "enabled", False)):
             await _register_auto_propose_runtime_crons()
         else:

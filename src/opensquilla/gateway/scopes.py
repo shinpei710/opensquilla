@@ -151,6 +151,10 @@ METHOD_SCOPES: dict[str, str] = {
     # router_decisions). The table stores enum tokens and numbers only (no
     # prompt text), so the listing is a plain operator read.
     "router.decisions.list": READ_SCOPE,
+    # OpenSquilla-only — self-learning loop status (active model, sample
+    # counts, gate reason, last receipt). Derived from on-disk loop state;
+    # no prompt text, no side effects — a plain operator read.
+    "router.selflearning.status": READ_SCOPE,
     # OpenSquilla-only — onboarding catalog and status are operator-readable.
     "onboarding.status": READ_SCOPE,
     "onboarding.catalog": READ_SCOPE,

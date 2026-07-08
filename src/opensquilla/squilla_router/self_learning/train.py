@@ -43,6 +43,31 @@ class CandidateInfo:
     used_init_model: bool
     class_distribution: dict[int, int]
     cv_metrics: dict[str, Any] | None = None
+    # Fingerprint of the base bundle this candidate was built against. When an
+    # upgrade replaces the shipped bundle, the mismatch detaches the candidate
+    # (its symlinked artifacts now point at different files than the head was
+    # trained with). Optional so pre-existing manifests keep loading.
+    base_fingerprint: str | None = None
+
+
+def base_bundle_fingerprint(base_dir: Path) -> str | None:
+    """Fingerprint the base bundle a candidate is built from.
+
+    ``sha256(lgbm_main.bin)`` — the one artifact every retrain both consumes
+    (``init_model``) and replaces. Version metadata is deliberately not used:
+    ``version.json`` may be absent or unchanged across a weight refresh, while
+    the binary hash cannot lie. Returns ``None`` when the base model is missing
+    (trained-fresh candidates have nothing to pin against).
+    """
+
+    path = base_dir / _LGBM_FILENAME
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _lgbm_params(config: Any) -> dict[str, Any]:
@@ -186,6 +211,10 @@ def build_candidate_bundle(
 
     cv_metrics = cross_validate(dataset, config=config)
 
+    # Fingerprint before training: init_model reads the same file, so hashing
+    # first guarantees the pin describes the exact bytes the head continued from.
+    base_fp = base_bundle_fingerprint(base_dir)
+
     booster, used_init = train_booster(
         dataset, base_model_path=base_dir / _LGBM_FILENAME, config=config
     )
@@ -207,6 +236,7 @@ def build_candidate_bundle(
         used_init_model=used_init,
         class_distribution=dataset.class_distribution(),
         cv_metrics=cv_metrics,
+        base_fingerprint=base_fp,
     )
     (out_dir / "learned_manifest.json").write_text(
         json.dumps(asdict(info), ensure_ascii=False, indent=2), encoding="utf-8"

@@ -161,7 +161,13 @@ def subprocess_trainer(
     last_line = proc.stdout.strip().splitlines()[-1]
     out = json.loads(last_line)
     manifest = Path(out["bundle_dir"]) / "learned_manifest.json"
-    return CandidateInfo(**json.loads(manifest.read_text(encoding="utf-8")))
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    # Tolerate manifest/schema skew (worker newer or older than this process):
+    # unknown keys are dropped instead of failing an otherwise successful train.
+    from dataclasses import fields as _dc_fields
+
+    allowed = {f.name for f in _dc_fields(CandidateInfo)}
+    return CandidateInfo(**{k: v for k, v in payload.items() if k in allowed})
 
 
 def _lower_priority() -> None:  # pragma: no cover — child-process only
@@ -190,6 +196,11 @@ def maybe_run_update_router(
             return UpdateResult(ran=False, reason="disabled", gate_reason="disabled")
 
         state = load_train_state(agent_id, home)
+        resolved_base = base_dir or _default_base_dir(router_cfg)
+
+        # Base-upgrade guard: detach a promoted candidate whose base bundle was
+        # replaced (package upgrade) before the regression monitor reads it.
+        _reconcile_detached_state(agent_id, state, resolved_base, home, now)
 
         # M4: before anything else, check whether a live candidate has regressed.
         rolled_back = _check_and_maybe_rollback(agent_id, sl_cfg, state, home, now)
@@ -208,7 +219,6 @@ def maybe_run_update_router(
             return UpdateResult(ran=False, reason="empty_dataset", gate_reason=gate.reason)
 
         run_trainer = trainer or subprocess_trainer
-        resolved_base = base_dir or _default_base_dir(router_cfg)
         try:
             info = run_trainer(
                 dataset,
@@ -325,6 +335,67 @@ def _invalidate_router_strategy_cache() -> None:
         invalidate_router_cache()
     except Exception as exc:  # pragma: no cover — best effort
         log.warning("router_self_learning.cache_invalidate_failed", error=str(exc))
+
+
+def _reconcile_detached_state(
+    agent_id: str,
+    state: Any,
+    base_dir: Path,
+    home: Path | None,
+    now: datetime | None,
+) -> None:
+    """Sync train-state bookkeeping when a base upgrade detached the candidate.
+
+    The engine-side pointer check (``verify_active_bundle``) may fire first and
+    detach without access to this agent's state file; here the offline pass
+    writes the receipt and clears the promotion-monitor fields so
+    ``_check_and_maybe_rollback`` never compares complaint rates against a
+    candidate that is no longer serving. Also runs the verification itself for
+    headless installs where the engine never rebuilt its strategy.
+    """
+
+    if state.active_version is None:
+        return
+    try:
+        from opensquilla.squilla_router.self_learning.promotion import (
+            read_active,
+            verify_active_bundle,
+        )
+
+        check = verify_active_bundle(base_dir, home)
+        still_active = read_active(home) == f"learned/{state.active_version}"
+        if not check.detached and still_active:
+            return
+
+        reason = check.reason or "pointer_reset_externally"
+        write_receipt(
+            agent_id,
+            "detached",
+            {
+                "version": state.active_version,
+                "reason": reason,
+                "pinned_fingerprint": check.pinned_fingerprint,
+                "current_fingerprint": check.current_fingerprint,
+            },
+            home,
+        )
+        log.info(
+            "router_self_learning.state_detached",
+            agent_id=agent_id,
+            version=state.active_version,
+            reason=reason,
+        )
+        state.active_version = None
+        state.promoted_at = None
+        state.pre_promotion_complaint_rate = None
+        save_train_state(state, agent_id, home)
+        _invalidate_router_strategy_cache()
+    except Exception as exc:  # noqa: BLE001 — reconcile must not block training
+        log.warning(
+            "router_self_learning.detach_reconcile_failed",
+            agent_id=agent_id,
+            error=str(exc),
+        )
 
 
 def _evaluate_candidate(info: CandidateInfo, base_dir: Path, config: Any):

@@ -287,7 +287,15 @@ async def test_feedback_submit_denies_read_only_dispatch() -> None:
 
 
 def test_feedback_handler_is_dormant_static() -> None:
-    """The handler module must not touch routing, calibration, or selection."""
+    """The handler module must not touch routing, calibration, or selection.
+
+    The read-only ``router.selflearning.status`` handler may import the
+    self-learning *state readers* (gates evaluation, pointer/state/store
+    reads) — those observe the loop without feeding routing. What stays
+    forbidden is anything that could route, calibrate, or mutate loop state:
+    the routing engines themselves, and the self-learning mutation surfaces
+    (training, promotion pointer writes, sample writes).
+    """
     source = Path("src/opensquilla/gateway/rpc_router.py").read_text()
     assert "Dormant until F7" in source
     assert "RoutingHistoryStore" not in source
@@ -296,9 +304,30 @@ def test_feedback_handler_is_dormant_static() -> None:
         for line in source.splitlines()
         if line.strip().startswith(("import ", "from "))
     ]
+    allowed_readonly = (
+        "squilla_router.self_learning.gates",
+        "squilla_router.self_learning.promotion",
+        "squilla_router.self_learning.state",
+        "squilla_router.self_learning.store",
+    )
     forbidden = ("smart_routing", "router_control", "squilla_router", "calibration", "routing")
     for line in import_lines:
+        if any(mod in line for mod in allowed_readonly):
+            continue
         assert not any(token in line for token in forbidden), line
+    # The status handler must stay read-only: no training/mutation imports.
+    # ("train" as a bare token would false-positive on "training"/"trainedAt",
+    # so the mutation modules are matched as import paths.)
+    for mutating in (
+        "self_learning.orchestrator",
+        "self_learning.train",
+        "write_sample",
+        "write_active_atomic",
+        "promote_candidate",
+        "rollback_active",
+        "quarantine_candidate",
+    ):
+        assert mutating not in source, mutating
 
 
 # ---------------------------------------------------------------------------
