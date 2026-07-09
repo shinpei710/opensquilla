@@ -72,6 +72,22 @@ def test_redact_secret_text_does_not_mask_token_counters() -> None:
     )
 
 
+def test_redact_secret_text_masks_non_bearer_authorization_credentials() -> None:
+    basic = redact_secret_text("Authorization: Basic dXNlcjpwYXNz")
+    assert "dXNlcjpwYXNz" not in basic
+
+    proxy = redact_secret_text("Proxy-Authorization: Basic Zm9vOmJhcg==")
+    assert "Zm9vOmJhcg==" not in proxy
+
+    digest = redact_secret_text('Authorization: Digest username="admin", response="deadbeef"')
+    assert "deadbeef" not in digest
+
+
+def test_redact_secret_value_masks_basic_auth_in_string() -> None:
+    out = redact_secret_value("curl -v ... > Authorization: Basic dXNlcjpwYXNz")
+    assert "dXNlcjpwYXNz" not in out
+
+
 def test_redact_secret_value_masks_secret_keys_and_nested_strings() -> None:
     payload = {
         "api_key": "plain-secret",

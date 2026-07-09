@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import io
 import json
+import socket
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
 from reportlab.pdfgen import canvas
 
 from opensquilla.tools.builtin import media
-from opensquilla.tools.types import SafeToolError, ToolContext, current_tool_context
+from opensquilla.tools.types import SafeToolError, ToolContext, ToolError, current_tool_context
 
 
 def _write_pdf(path: Path) -> None:
@@ -102,3 +105,167 @@ async def test_image_tool_reports_corrupt_image_as_safe_error(tmp_path: Path) ->
         current_tool_context.reset(token)
 
     assert "corrupt or unreadable" in exc_info.value.user_message
+
+
+_INTERNAL_SECRET = b"INTERNAL-METADATA-SECRET-169.254.169.254"
+_PUBLIC_IP = "93.184.216.34"
+
+
+class _SecretHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802 - stdlib API name
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(_INTERNAL_SECRET)))
+        self.end_headers()
+        self.wfile.write(_INTERNAL_SECRET)
+
+    def log_message(self, *args: object) -> None:
+        return
+
+
+@pytest.fixture()
+def loopback_server():
+    server = HTTPServer(("127.0.0.1", 0), _SecretHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield port
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_image_url_pins_vetted_ip_against_dns_rebind(
+    monkeypatch: pytest.MonkeyPatch, loopback_server: int
+) -> None:
+    port = loopback_server
+    counter = {"n": 0}
+    real = socket.getaddrinfo
+
+    def rebinding_getaddrinfo(host, req_port, *args, **kwargs):
+        host_str = host.decode("ascii") if isinstance(host, bytes) else host
+        if host_str != "rebind.test":
+            return real(host, req_port, *args, **kwargs)
+        counter["n"] += 1
+        # First resolution (the guard) sees a public IP; every later resolution
+        # rebinds to loopback — the connection must never follow it.
+        if counter["n"] == 1:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (_PUBLIC_IP, req_port or 0))]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", rebinding_getaddrinfo)
+
+    try:
+        image_bytes, _ = await media._fetch_image_url(f"http://rebind.test:{port}/metadata.png")
+    except ToolError:
+        return
+    assert image_bytes != _INTERNAL_SECRET
+
+
+@pytest.mark.asyncio
+async def test_fetch_image_url_resolves_relative_redirect_against_logical_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    requested: list[str] = []
+
+    class RedirectingClient:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> RedirectingClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, url: str) -> httpx.Response:
+            requested.append(url)
+            if len(requested) == 1:
+                return httpx.Response(
+                    302,
+                    headers={"location": "/image.png"},
+                    request=httpx.Request("GET", "https://93.184.216.34/start"),
+                )
+            return httpx.Response(
+                200,
+                headers={"content-type": "image/png"},
+                content=b"png-bytes",
+                request=httpx.Request("GET", "https://93.184.216.34/image.png"),
+            )
+
+    monkeypatch.setattr(media, "validate_http_url_for_fetch", lambda url: ["93.184.216.34"])
+    monkeypatch.setattr(httpx, "AsyncClient", RedirectingClient)
+    monkeypatch.setattr(
+        "opensquilla.tools.ssrf.pinned_transport", lambda *args, **kwargs: object()
+    )
+
+    image_bytes, media_type = await media._fetch_image_url(
+        "https://images.example.test/start"
+    )
+
+    assert requested == [
+        "https://images.example.test/start",
+        "https://images.example.test/image.png",
+    ]
+    assert image_bytes == b"png-bytes"
+    assert media_type == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_fetch_image_url_uses_opted_in_environment_proxy_with_pinning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, str] = {}
+
+    class ProxyHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib API name
+            seen["path"] = self.path
+            seen["host"] = self.headers.get("Host", "")
+            if self.path.startswith("http://127.0.0.1:"):
+                payload = b"proxied-png"
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
+            self.send_response(502)
+            self.end_headers()
+
+        def log_message(self, *args: object) -> None:
+            return
+
+    proxy = HTTPServer(("127.0.0.1", 0), ProxyHandler)
+    thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+    thread.start()
+    port = int(proxy.server_address[1])
+    try:
+        for name in (
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "https_proxy",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("OPENSQUILLA_TRUST_ENV", "1")
+        monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{port}")
+        monkeypatch.delenv("http_proxy", raising=False)
+        monkeypatch.setattr(media, "validate_http_url_for_fetch", lambda url: ["127.0.0.1"])
+
+        image_bytes, media_type = await media._fetch_image_url(
+            f"http://proxy-target.test:{port}/image.png"
+        )
+    finally:
+        proxy.shutdown()
+        proxy.server_close()
+
+    assert image_bytes == b"proxied-png"
+    assert media_type == "image/png"
+    assert seen["path"].startswith(f"http://127.0.0.1:{port}/")
+    assert seen["host"] == f"proxy-target.test:{port}"

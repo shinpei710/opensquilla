@@ -138,6 +138,15 @@ def _mark_env_absorbed_runtime_secrets(cfg: GatewayConfig, raw: Any) -> None:
         cfg.mark_runtime_secret("llm.api_key")
     if cfg.search_api_key and not _raw_key_present(raw, "search_api_key"):
         cfg.mark_runtime_secret("search_api_key")
+    # Auth secrets are absorbed from OPENSQUILLA_AUTH_TOKEN / _PASSWORD into
+    # the AuthConfig pydantic-settings model. Without marking them, any
+    # full-dump persist bakes the env-sourced token into config.toml, where
+    # it then silently overrides later env rotation.
+    auth = getattr(cfg, "auth", None)
+    if getattr(auth, "token", "") and not _raw_key_present(raw, "auth.token"):
+        cfg.mark_runtime_secret("auth.token")
+    if getattr(auth, "password", "") and not _raw_key_present(raw, "auth.password"):
+        cfg.mark_runtime_secret("auth.password")
     for section_path, key in _ENV_ABSORBED_NESTED_SECRET_SECTIONS:
         section: Any = cfg
         for part in section_path.split("."):

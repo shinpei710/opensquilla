@@ -6,6 +6,7 @@ import ipaddress
 import socket
 from collections.abc import Iterable
 from urllib.parse import urlparse
+from urllib.request import getproxies, proxy_bypass
 
 from opensquilla.tools.types import SSRFBlockedError, UnsupportedURLSchemeError
 
@@ -17,6 +18,7 @@ RFC2544_FAKE_IP_NETWORK = ipaddress.IPv4Network("198.18.0.0/15")
 _HARD_BLOCKED_NETWORKS: tuple[IPNetwork, ...] = (
     ipaddress.ip_network("0.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),  # RFC 6598 CGNAT / shared address space
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("169.254.0.0/16"),
     ipaddress.ip_network("172.16.0.0/12"),
@@ -65,8 +67,15 @@ def validate_http_url_for_fetch(
     url: str,
     *,
     trusted_fake_ip_cidrs: Iterable[str] | None = None,
-) -> None:
-    """Validate that an HTTP(S) URL does not resolve to a blocked address."""
+) -> list[str]:
+    """Validate that an HTTP(S) URL does not resolve to a blocked address.
+
+    Returns the list of vetted IP addresses the hostname resolved to (as
+    strings), so callers can *pin* the connection to an approved address and
+    avoid a second, unguarded DNS resolution (the DNS-rebinding TOCTOU). The
+    return value is safe to ignore for callers that only want the raise-on-block
+    behavior.
+    """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise UnsupportedURLSchemeError("Only HTTP/HTTPS URLs are supported")
@@ -88,12 +97,14 @@ def validate_http_url_for_fetch(
         else _trusted_fake_ip_cidrs
     )
 
+    vetted: list[str] = []
     for info in infos:
         addr = ipaddress.ip_address(info[4][0])
         block_reason = _hard_block_reason(addr)
         if block_reason is not None:
             raise SSRFBlockedError(_blocked_message(hostname, addr, block_reason))
         if _is_trusted_fake_ip(addr, trusted_networks):
+            vetted.append(str(addr))
             continue
         if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
             reason = (
@@ -103,6 +114,8 @@ def validate_http_url_for_fetch(
                 else "private/internal range"
             )
             raise SSRFBlockedError(_blocked_message(hostname, addr, reason))
+        vetted.append(str(addr))
+    return vetted
 
 
 def _hard_block_reason(addr: IPAddress) -> str | None:
@@ -147,3 +160,56 @@ def _hostname_is_ip_literal(hostname: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def environment_proxy_url(url: str) -> str | None:
+    """Return the opted-in environment proxy applicable to ``url``.
+
+    Callers remain responsible for gating this helper with
+    ``opensquilla.env.trust_env()``. Resolving the proxy explicitly lets the
+    pinned transport preserve DNS-rebinding protection instead of relying on
+    HTTPX's ambient proxy discovery, which is disabled by a custom transport.
+    """
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname or proxy_bypass(hostname):
+        return None
+    proxies = getproxies()
+    proxy = proxies.get(parsed.scheme.lower()) or proxies.get("all")
+    return str(proxy) if proxy else None
+
+
+def pinned_transport(url: str, vetted_ips: list[str], **transport_kwargs: object) -> object | None:
+    """Return an httpx transport that pins connections to a vetted IP.
+
+    For HTTPS the connection must reach the pre-validated IP while still
+    presenting the original hostname for SNI and certificate verification, so a
+    URL rewrite is not enough. This returns an ``httpx.AsyncHTTPTransport``
+    subclass that swaps the request URL host to the vetted IP at connect time
+    and sets the ``sni_hostname`` extension to the original hostname (httpx then
+    verifies the certificate against that name). Returns ``None`` when pinning
+    is not applicable (no vetted IPs, or the host is already an IP literal), so
+    the caller can use a normal client.
+    """
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname or not vetted_ips or _hostname_is_ip_literal(hostname):
+        return None
+
+    import httpx
+
+    ip = vetted_ips[0]
+
+    class _PinnedTransport(httpx.AsyncHTTPTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.url.host == hostname:
+                request.extensions = dict(request.extensions)
+                request.extensions.setdefault("sni_hostname", hostname)
+                if "host" not in {k.lower() for k in request.headers}:
+                    request.headers["Host"] = (
+                        hostname if parsed.port is None else f"{hostname}:{parsed.port}"
+                    )
+                request.url = request.url.copy_with(host=ip)
+            return await super().handle_async_request(request)
+
+    return _PinnedTransport(**transport_kwargs)  # type: ignore[arg-type]

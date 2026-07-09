@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import socket
 from contextlib import suppress
 
@@ -34,6 +35,15 @@ def test_proxy_resolver_allows_rfc2544_fake_ip_dns_by_default(
     monkeypatch.setattr(mod.socket, "getaddrinfo", _fake_getaddrinfo("198.18.0.24"))
 
     assert mod._resolve_validated_upstream("github.com", 443) == ("198.18.0.24", 443)
+
+
+@pytest.mark.parametrize("cgnat_ip", ["100.64.0.1", "100.127.255.254"])
+def test_proxy_resolver_fails_closed_on_rfc6598_cgnat_range(cgnat_ip: str) -> None:
+    from opensquilla.sandbox import network_proxy as mod
+
+    trusted = mod._trusted_fake_ip_networks()
+    reason = mod._unsafe_resolved_address_reason(ipaddress.ip_address(cgnat_ip), trusted)
+    assert reason is not None
 
 
 def _route_public_destination_to_upstream(

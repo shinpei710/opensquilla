@@ -115,7 +115,13 @@ def media_root_from_config(config: object | None = None) -> Path:
     state_root = getattr(config, "state_dir", None)
     if isinstance(state_root, str) and state_root.strip():
         state_path = _expand_user(state_root.strip())
-        return state_path.parent / "media"
+        # Only use the sibling `<home>/media` layout when state_dir follows the
+        # default `<home>/state` shape. A relocated/custom state dir must keep
+        # its media inside it, not escape to the parent (which could land media
+        # outside the intended state tree entirely).
+        if state_path.name == "state":
+            return state_path.parent / "media"
+        return state_path / "media"
 
     config_path = getattr(config, "config_path", None)
     if isinstance(config_path, str) and config_path.strip():

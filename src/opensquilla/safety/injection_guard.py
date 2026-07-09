@@ -223,8 +223,25 @@ def scan_for_injection(
         for threat_class in threat_classes
     ]
     if normalized_mode == "enforce":
+        if threat_classes == ["invisible_char"]:
+            return _strip_invisible_chars(content), findings
         return f"[BLOCKED: unsafe prompt content removed from {source}]", findings
     return content, findings
+
+
+def _strip_invisible_chars(content: str) -> str:
+    """Remove zero-width/bidi-override characters, keeping the rest intact.
+
+    Used when ``invisible_char`` is the only matched threat class — those
+    characters are stripped in place instead of nuking benign content, since
+    BOM-prefixed files and composed emoji ZWJ sequences trip this class
+    without carrying any intent-based payload.
+    """
+
+    stripped = content
+    for pattern in _INVISIBLE_CHAR_PATTERNS:
+        stripped = pattern.sub("", stripped)
+    return stripped
 
 
 def xml_escape(text: str) -> str:

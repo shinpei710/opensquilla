@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, cast
 
@@ -73,8 +76,21 @@ def _persist_config(config: Any) -> None:
     restore_runtime_overrides(payload, config)
     path = Path(config.config_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as f:
-        tomli_w.dump(payload, f)
+    # Write atomically with 0o600 so a freshly created config.toml (which may
+    # carry secrets) is never group/other-readable, matching config_store's
+    # persist_config hardening.
+    fd, tmp_name = tempfile.mkstemp(prefix=".config.", suffix=".toml", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as f:
+            tomli_w.dump(payload, f)
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
 
 
 def _strip_public_derived_config_fields(payload: dict[str, Any]) -> dict[str, Any]:
@@ -453,6 +469,43 @@ def _sync_model_catalog_overrides(config: Any) -> None:
 # config_version is the migration stamp owned by migrate_config_payload;
 # client writes to it could re-run or skip one-time migrations.
 _READONLY_PATHS = frozenset({"auth.token", "auth.password", "config_version"})
+
+
+def _path_is_or_contains_readonly(path: str) -> bool:
+    """Return whether setting ``path`` could replace a read-only descendant."""
+
+    return any(readonly == path or readonly.startswith(f"{path}.") for readonly in _READONLY_PATHS)
+
+
+def _prune_readonly_paths(patch: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``patch`` with every read-only path protected.
+
+    Mirrors the ``continue`` guard the dot-path form applies to
+    ``_READONLY_PATHS`` (auth.token, auth.password, config_version), so the
+    dict-merge form cannot smuggle a write to those paths past the guard. A
+    non-mapping replacement of a read-only ancestor is dropped because it
+    would otherwise replace or delete the protected descendants wholesale.
+    """
+    def _walk(node: dict[str, Any], prefix: str) -> dict[str, Any]:
+        cleaned: dict[str, Any] = {}
+        for key, value in node.items():
+            path = f"{prefix}.{key}" if prefix else key
+            if path in _READONLY_PATHS:
+                continue
+            if isinstance(value, dict):
+                nested = _walk(value, path)
+                # Drop a section that became empty only because everything in
+                # it was read-only; keep genuinely-empty client sections.
+                if nested or not value:
+                    cleaned[key] = nested
+            elif _path_is_or_contains_readonly(path):
+                continue
+            else:
+                cleaned[key] = value
+        return cleaned
+
+    return _walk(patch, "")
+
 _SAFE_WRITE_PATCH_PATHS = frozenset(
     {
         "skills.filter_enabled",
@@ -526,7 +579,7 @@ async def _handle_config_set(params: dict | None, ctx: RpcContext) -> dict[str, 
         raise ValueError("params.path and params.value are required")
 
     path: str = params["path"]
-    if path in _READONLY_PATHS:
+    if _path_is_or_contains_readonly(path):
         raise ValueError(f"Path is read-only: {path}")
 
     if ctx.config is None:
@@ -601,7 +654,7 @@ async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str
 
     # Apply dot-path patches (e.g. {"skills.filter_enabled": true})
     for path, value in dot_patches.items():
-        if path in _READONLY_PATHS:
+        if _path_is_or_contains_readonly(path):
             continue
         if value == _REDACTED_PUBLIC_VALUE and _is_sensitive_redacted_path(path):
             raise ValueError(
@@ -618,6 +671,11 @@ async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str
 
     # Apply dict merge patch
     if patch_data:
+        # The merge form must honor _READONLY_PATHS exactly like the dot-path
+        # form above; without this, a client could overwrite auth.token /
+        # auth.password / config_version through the nested patch and leak the
+        # token to disk. Drop any read-only leaf before merging.
+        patch_data = _prune_readonly_paths(patch_data)
         patch_data, merge_restored_paths = _restore_redacted_values(patch_data, source_cfg_dict)
         redacted_paths.update(merge_restored_paths)
         cfg_dict = _deep_merge(cfg_dict, patch_data)
@@ -625,6 +683,7 @@ async def _handle_config_patch(params: dict | None, ctx: RpcContext) -> dict[str
     explicit_paths = set(dot_patches.keys()) | _collect_paths(patch_data)
     for path, value in dot_patches.items():
         explicit_paths.update(_collect_paths(value, path))
+    explicit_paths -= _READONLY_PATHS
     _align_auto_router_profile_for_provider_patch(ctx.config, cfg_dict, explicit_paths)
     linked_paths = _link_dream_for_self_learning_patch(ctx.config, cfg_dict, explicit_paths)
     explicit_paths.update(linked_paths)

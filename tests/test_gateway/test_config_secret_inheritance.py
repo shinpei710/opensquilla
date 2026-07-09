@@ -18,7 +18,9 @@ unambiguous. These are offline, credential-free tests.
 from __future__ import annotations
 
 import json
+import os
 import tomllib
+from pathlib import Path
 
 import pytest
 import structlog
@@ -28,6 +30,7 @@ from opensquilla.gateway import config_secrets
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
+from opensquilla.gateway.rpc_config import _persist_config
 from opensquilla.onboarding.mutations import upsert_llm_provider
 from opensquilla.onboarding.redaction import REDACTED_PLACEHOLDER
 
@@ -252,6 +255,59 @@ def test_onboarding_explicit_key_replaces_and_clears_marker() -> None:
 
 
 # --- Part 4: no secret value ever reaches a structlog event -----------------
+
+
+# --- Part 5: env-absorbed auth token must not be baked to disk -------------
+
+
+async def test_config_set_does_not_bake_env_auth_token_into_toml(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_AUTH_TOKEN", "tok-env-original")
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[auth]\nmode = "token"\n')
+
+    cfg = GatewayConfig.load(cfg_path)
+    assert cfg.auth.token == "tok-env-original"
+
+    res = await get_dispatcher().dispatch(
+        "r1", "config.set", {"path": "port", "value": 18795}, _admin_ctx(cfg)
+    )
+    assert res.error is None, res.error
+
+    text = cfg_path.read_text()
+    assert tomllib.loads(text)["port"] == 18795
+    assert "tok-env-original" not in text
+
+
+async def test_env_auth_token_rotation_survives_config_save(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_AUTH_TOKEN", "tok-env-original")
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text('[auth]\nmode = "token"\n')
+
+    cfg = GatewayConfig.load(cfg_path)
+    await get_dispatcher().dispatch(
+        "r1", "config.set", {"path": "port", "value": 18795}, _admin_ctx(cfg)
+    )
+
+    monkeypatch.setenv("OPENSQUILLA_AUTH_TOKEN", "tok-env-rotated")
+    rebooted = GatewayConfig.load(cfg_path)
+    assert rebooted.auth.token == "tok-env-rotated"
+
+
+def test_persist_config_fresh_file_is_not_world_readable(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_AUTH_TOKEN", "tok-env-original")
+    old_umask = os.umask(0o022)
+    try:
+        cfg = GatewayConfig()
+        cfg_path = tmp_path / "fresh" / "config.toml"
+        cfg.config_path = str(cfg_path)
+        _persist_config(cfg)
+    finally:
+        os.umask(old_umask)
+
+    mode = Path(cfg_path).stat().st_mode & 0o777
+    assert mode & 0o077 == 0
 
 
 @pytest.mark.asyncio

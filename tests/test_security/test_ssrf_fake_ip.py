@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import socket
 from importlib import import_module
 from pathlib import Path
@@ -36,6 +37,17 @@ def test_rfc2544_fake_ip_is_blocked_by_default(monkeypatch):
     assert "198.18.0.2" in str(excinfo.value)
     assert "198.18.0.0/15" in str(excinfo.value)
     assert "ISP-level fake/private IP" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("cgnat_ip", ["100.64.0.1", "100.127.255.254"])
+def test_rfc6598_cgnat_ip_is_blocked_by_default(monkeypatch, cgnat_ip):
+    monkeypatch.setattr(ssrf.socket, "getaddrinfo", _fake_getaddrinfo(cgnat_ip))
+
+    with pytest.raises(SSRFBlockedError) as excinfo:
+        ssrf.validate_http_url_for_fetch("https://github.com/OpenSquilla/opensquilla")
+
+    assert cgnat_ip in str(excinfo.value)
+    assert ssrf._hard_block_reason(ipaddress.ip_address(cgnat_ip)) is not None
 
 
 def test_private_dns_hijack_message_names_public_domain_scenario(monkeypatch):

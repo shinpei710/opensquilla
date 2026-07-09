@@ -45,6 +45,7 @@ _RFC2544_FAKE_IP_NETWORK = ipaddress.IPv4Network("198.18.0.0/15")
 _HARD_BLOCKED_NETWORKS = (
     ipaddress.ip_network("0.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),  # RFC 6598 CGNAT / shared address space
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("169.254.0.0/16"),
     ipaddress.ip_network("172.16.0.0/12"),

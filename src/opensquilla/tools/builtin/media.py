@@ -278,12 +278,16 @@ def _sensitive_media_url_block(tool_name: str, url: str) -> dict | None:
 async def _fetch_image_url(url: str) -> tuple[bytes, str]:
     import httpx
 
+    from opensquilla.tools.ssrf import environment_proxy_url, pinned_transport
+
+    vetted: dict[str, list[str]] = {"ips": []}
+
     def _check_image_url(candidate_url: str) -> None:
         marker = _sensitive_media_url_block("image", candidate_url)
         if marker is not None:
             raise ToolError("Blocked: URL contains sensitive data")
         try:
-            validate_http_url_for_fetch(candidate_url)
+            vetted["ips"] = validate_http_url_for_fetch(candidate_url)
         except UnsupportedURLSchemeError as exc:
             raise ToolError("Only HTTP/HTTPS URLs are supported for image fetch") from exc
         except SSRFBlockedError as exc:
@@ -292,23 +296,36 @@ async def _fetch_image_url(url: str) -> tuple[bytes, str]:
             raise ToolError(str(exc)) from exc
 
     try:
-        async with httpx.AsyncClient(
-            timeout=30.0, follow_redirects=False, trust_env=_trust_env()
-        ) as client:
-            current_url = url
-            for _redirect_count in range(_MAX_REDIRECTS + 1):
-                _check_image_url(current_url)
+        current_url = url
+        for _redirect_count in range(_MAX_REDIRECTS + 1):
+            _check_image_url(current_url)
+            # Pin the connection to the address that just passed the guard so a
+            # second (rebinding) DNS resolution cannot land on a private IP.
+            transport_kwargs: dict[str, object] = {}
+            if _trust_env():
+                proxy_url = environment_proxy_url(current_url)
+                if proxy_url is not None:
+                    transport_kwargs["proxy"] = proxy_url
+            transport = pinned_transport(current_url, vetted["ips"], **transport_kwargs)
+            client_kwargs: dict[str, object] = {
+                "timeout": 30.0,
+                "follow_redirects": False,
+                "trust_env": _trust_env(),
+            }
+            if transport is not None:
+                client_kwargs["transport"] = transport
+            async with httpx.AsyncClient(**client_kwargs) as client:  # type: ignore[arg-type]
                 resp = await client.get(current_url)
-                if resp.status_code not in {301, 302, 303, 307, 308}:
-                    break
-                location = resp.headers.get("location")
-                if not location:
-                    break
-                current_url = urljoin(str(resp.url), location)
-            else:
-                raise ToolError(f"Too many redirects (>{_MAX_REDIRECTS})")
-            resp.raise_for_status()
-            image_bytes = resp.content
+            if resp.status_code not in {301, 302, 303, 307, 308}:
+                break
+            location = resp.headers.get("location")
+            if not location:
+                break
+            current_url = urljoin(current_url, location)
+        else:
+            raise ToolError(f"Too many redirects (>{_MAX_REDIRECTS})")
+        resp.raise_for_status()
+        image_bytes = resp.content
     except ToolError:
         raise
     except Exception as exc:
@@ -319,7 +336,7 @@ async def _fetch_image_url(url: str) -> tuple[bytes, str]:
 
     # Detect format from content-type or URL extension
     content_type = resp.headers.get("content-type", "")
-    final_parsed = urlparse(str(resp.url))
+    final_parsed = urlparse(current_url)
     ext = _mime_to_ext(content_type) or Path(final_parsed.path).suffix.lstrip(".").lower()
     if ext not in _SUPPORTED_IMAGE_FORMATS:
         raise ToolError(

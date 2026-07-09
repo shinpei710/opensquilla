@@ -1,10 +1,11 @@
 """Tool risk-tier declarations.
 
 Every tool that goes through the dispatch pipeline has exactly one
-:class:`RiskTier`. Four tool names are always :attr:`RiskTier.ADMIN_ONLY`
-regardless of any :func:`declare_tier` override:
+:class:`RiskTier`. A fixed set of tool names are always
+:attr:`RiskTier.ADMIN_ONLY` regardless of any :func:`declare_tier`
+override:
 
-* ``shell_exec`` / ``exec_command`` / ``background_process``
+* ``shell_exec`` / ``exec_command`` / ``background_process`` / ``execute_code``
 * ``file_write`` / ``write_file`` / ``edit_file`` / ``apply_patch``
 * ``git_push``
 * ``channel_send_as_admin``
@@ -35,14 +36,17 @@ class RiskTier(StrEnum):
     ADMIN_ONLY = "admin_only"
 
 
-# The four tools whose tier is not negotiable. These names are enforced
+# The tools whose tier is not negotiable. These names are enforced
 # by `get_tier` even when `declare_tier` has been called with a lower
-# tier — a defense against mis-declared contrib tools.
+# tier — a defense against mis-declared contrib tools. ``execute_code``
+# runs arbitrary Python (and can shell out via os.system/subprocess), so
+# it is pinned alongside the other arbitrary-execution tools.
 HARDCODED_ADMIN_ONLY: Final[frozenset[str]] = frozenset(
     {
         "shell_exec",
         "exec_command",
         "background_process",
+        "execute_code",
         "file_write",
         "write_file",
         "edit_file",

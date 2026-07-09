@@ -99,3 +99,57 @@ async def test_web_fetch_timeout_returns_skipped_source_payload(
     assert payload["text"] == ""
     assert payload["error"] == "timed_out"
     assert "timed out" in payload["hint"]
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_resolves_relative_redirect_against_logical_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested: list[str] = []
+
+    class RedirectingClient:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def __aenter__(self) -> RedirectingClient:
+            return self
+
+        async def __aexit__(self, *args: object) -> None:
+            return None
+
+        async def get(self, url: str) -> httpx.Response:
+            requested.append(url)
+            if len(requested) == 1:
+                return httpx.Response(
+                    302,
+                    headers={"location": "/final"},
+                    request=httpx.Request("GET", "https://93.184.216.34/start"),
+                )
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html"},
+                text="<html><title>Done</title><body>logical host retained</body></html>",
+                request=httpx.Request("GET", "https://93.184.216.34/final"),
+            )
+
+    _cache.clear()
+    monkeypatch.setattr("opensquilla.tools.builtin.web_fetch.httpx.AsyncClient", RedirectingClient)
+    monkeypatch.setattr(
+        "opensquilla.tools.builtin.web_fetch._check_ssrf", lambda url: ["93.184.216.34"]
+    )
+    monkeypatch.setattr(
+        "opensquilla.tools.builtin.web_fetch._pinned_transport", lambda *args, **kwargs: object()
+    )
+    monkeypatch.setattr(
+        "opensquilla.tools.builtin.web_fetch.managed_network_httpx_kwargs",
+        lambda: {"trust_env": False},
+    )
+
+    raw_web_fetch = inspect.unwrap(web_fetch)
+    payload = json.loads(await raw_web_fetch("https://origin.example.test/start"))
+
+    assert requested == [
+        "https://origin.example.test/start",
+        "https://origin.example.test/final",
+    ]
+    assert payload["final_url"] == "https://origin.example.test/final"

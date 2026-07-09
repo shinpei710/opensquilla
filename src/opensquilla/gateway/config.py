@@ -2526,10 +2526,13 @@ class GatewayConfig(BaseSettings):
 
         candidates: list[Path] = []
         if config_path:
-            candidates.append(Path(config_path))
+            # Expand ~ / $HOME so an explicit path like "~/cfg.toml" resolves,
+            # mirroring config_store.resolve_config_path; without this an
+            # explicit config was silently dropped and defaults loaded.
+            candidates.append(Path(config_path).expanduser())
         else:
-            candidates.append(Path.cwd() / "opensquilla.toml")
-            candidates.append(default_opensquilla_home() / "config.toml")
+            candidates.append((Path.cwd() / "opensquilla.toml").expanduser())
+            candidates.append((default_opensquilla_home() / "config.toml").expanduser())
 
         for path in candidates:
             if path.is_file():
@@ -2540,9 +2543,31 @@ class GatewayConfig(BaseSettings):
                 if migration.changed:
                     _rewrite_migrated_config_best_effort(path, migration)
                 cfg.config_path = str(path)
+                cfg._mark_env_absorbed_secrets(data)
                 return cfg
 
-        return cls()
+        cfg = cls()
+        cfg._mark_env_absorbed_secrets(None)
+        return cfg
+
+    def _mark_env_absorbed_secrets(self, raw: Any) -> None:
+        """Mark auth secrets present only because the environment supplied them.
+
+        ``OPENSQUILLA_AUTH_TOKEN`` / ``_PASSWORD`` are absorbed into
+        :class:`AuthConfig` at construction. If such an env-only value is not
+        marked as a runtime secret, ``to_toml_dict`` would bake it into a
+        full-dump persist, after which the on-disk value silently overrides
+        later env rotation. The shared marking logic (which also covers
+        ``llm.api_key`` and provider keys) lives in ``config_store``; import it
+        lazily to avoid an import cycle.
+        """
+        try:
+            from opensquilla.onboarding.config_store import (
+                _mark_env_absorbed_runtime_secrets,
+            )
+        except Exception:  # pragma: no cover - defensive, keep boot resilient
+            return
+        _mark_env_absorbed_runtime_secrets(self, raw)
 
 
 # --- bind-address resolution ----------------------------------------------

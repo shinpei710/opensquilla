@@ -17,7 +17,23 @@ _SECRET_TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bsk_tr_[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
 )
-_AUTH_BEARER_RE = re.compile(r"(?i)(authorization\s*:\s*bearer\s+)[^\s,;'\")}\]]+")
+# Matches an Authorization / Proxy-Authorization header for ANY scheme (Bearer,
+# Basic, Digest, Negotiate, NTLM, token, ...) and masks the entire credential
+# after the header, up to a line boundary. A known scheme word is preserved for
+# readability (optional group 2); an unknown/absent scheme is masked whole. The
+# prior Bearer-only regex left Basic/Digest credentials (which contain '=', ' ',
+# '"') exposed.
+_AUTH_HEADER_RE = re.compile(
+    r"(?i)((?:proxy-)?authorization\s*:\s*)"
+    r"((?:bearer|basic|digest|negotiate|ntlm|token)\s+)?"
+    r"[^\r\n]+"
+)
+
+
+def _redact_auth_header(match: re.Match[str]) -> str:
+    header = match.group(1)
+    scheme = match.group(2) or ""
+    return f"{header}{scheme}{_REDACTED}"
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b([A-Za-z0-9_.-]+)\s*([:=])\s*([^\s,;'\")}\]]+)"
 )
@@ -71,7 +87,7 @@ def _redact_assignment(match: re.Match[str]) -> str:
 
 def redact_secret_text(text: str) -> str:
     redacted = text
-    redacted = _AUTH_BEARER_RE.sub(lambda m: f"{m.group(1)}{_REDACTED}", redacted)
+    redacted = _AUTH_HEADER_RE.sub(_redact_auth_header, redacted)
     redacted = _SECRET_ASSIGNMENT_RE.sub(_redact_assignment, redacted)
     redacted = _SECRET_QUOTED_ASSIGNMENT_RE.sub(_redact_assignment, redacted)
     for pattern in _SECRET_TOKEN_PATTERNS:

@@ -371,3 +371,86 @@ async def test_config_patch_skips_config_version(tmp_path: Path) -> None:
     persisted = config_path.read_text(encoding="utf-8")
     assert "config_version = 1" in persisted
     assert "config_version = 99" not in persisted
+
+
+async def test_config_patch_merge_form_honors_readonly_paths(tmp_path: Path) -> None:
+    config_path = tmp_path / "c.toml"
+    cfg = GatewayConfig(config_path=str(config_path))
+    cfg.auth = cfg.auth.model_copy(update={"mode": "token", "token": "BOOT_SECRET"})
+    cfg.mark_runtime_secret("auth.token")
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "config.patch",
+        {"patch": {"auth": {"token": "CLIENT_CHOSEN"}, "config_version": 987654}},
+        _admin_ctx(cfg),
+    )
+
+    assert res.error is None, res.error
+    assert cfg.auth.token == "BOOT_SECRET"
+    assert cfg.config_version == LATEST_CONFIG_VERSION
+    persisted = config_path.read_text(encoding="utf-8")
+    assert "CLIENT_CHOSEN" not in persisted
+    assert "987654" not in persisted
+
+
+@pytest.mark.parametrize("replacement", [None, "disabled", []])
+async def test_config_patch_merge_form_drops_scalar_readonly_parent(
+    tmp_path: Path, replacement: object
+) -> None:
+    config_path = tmp_path / "c.toml"
+    cfg = GatewayConfig(config_path=str(config_path))
+    cfg.auth = cfg.auth.model_copy(update={"mode": "token", "token": "BOOT_SECRET"})
+    cfg.mark_runtime_secret("auth.token")
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "config.patch",
+        {"patch": {"auth": replacement, "diagnostics_enabled": True}},
+        _admin_ctx(cfg),
+    )
+
+    assert res.error is None, res.error
+    assert cfg.auth.mode == "token"
+    assert cfg.auth.token == "BOOT_SECRET"
+    assert "auth.token" in cfg._runtime_secret_paths
+    assert cfg.diagnostics_enabled is True
+
+
+async def test_config_set_rejects_parent_of_readonly_auth_secret(tmp_path: Path) -> None:
+    config_path = tmp_path / "c.toml"
+    cfg = GatewayConfig(config_path=str(config_path))
+    cfg.auth = cfg.auth.model_copy(update={"mode": "token", "token": "BOOT_SECRET"})
+    cfg.mark_runtime_secret("auth.token")
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "config.set",
+        {"path": "auth", "value": {"mode": "token", "token": "CLIENT_CHOSEN"}},
+        _admin_ctx(cfg),
+    )
+
+    assert res.error is not None
+    assert "read-only" in res.error.message
+    assert cfg.auth.token == "BOOT_SECRET"
+    assert "auth.token" in cfg._runtime_secret_paths
+    assert not config_path.exists()
+
+
+async def test_config_patch_dot_parent_skips_readonly_auth_secret(tmp_path: Path) -> None:
+    config_path = tmp_path / "c.toml"
+    cfg = GatewayConfig(config_path=str(config_path))
+    cfg.auth = cfg.auth.model_copy(update={"mode": "token", "token": "BOOT_SECRET"})
+    cfg.mark_runtime_secret("auth.token")
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "config.patch",
+        {"patches": {"auth": {"mode": "token", "token": "CLIENT_CHOSEN"}}},
+        _admin_ctx(cfg),
+    )
+
+    assert res.error is None, res.error
+    assert cfg.auth.token == "BOOT_SECRET"
+    assert "auth.token" in cfg._runtime_secret_paths
+    assert "CLIENT_CHOSEN" not in config_path.read_text(encoding="utf-8")

@@ -24,6 +24,8 @@ from opensquilla.sandbox.operation_runtime import (
     SandboxToolDescriptor,
 )
 from opensquilla.tools.registry import tool
+from opensquilla.tools.ssrf import environment_proxy_url as _environment_proxy_url
+from opensquilla.tools.ssrf import pinned_transport as _pinned_transport
 from opensquilla.tools.ssrf import validate_http_url_for_fetch
 from opensquilla.tools.types import SSRFBlockedError, current_tool_context
 
@@ -80,9 +82,13 @@ def _web_fetch_request(args: Mapping[str, Any]) -> NetworkOperationRequest:
     )
 
 
-def _check_ssrf(url: str) -> None:
-    """Raise ValueError if the URL resolves to a private/internal address."""
-    validate_http_url_for_fetch(url)
+def _check_ssrf(url: str) -> list[str]:
+    """Validate the URL and return the vetted IPs to pin the connection to.
+
+    Raises ValueError/SSRFBlockedError if the URL resolves to a private or
+    internal address.
+    """
+    return validate_http_url_for_fetch(url)
 
 
 def _html_to_markdown(html: str) -> str:
@@ -276,35 +282,51 @@ async def run_web_fetch_payload(
     async def _do_fetch(user_agent: str) -> tuple[int, str, str, str]:
         headers = dict(_DEFAULT_HEADERS)
         headers["User-Agent"] = user_agent
-        async with httpx.AsyncClient(
-            timeout=30.0,
-            follow_redirects=False,
-            headers=headers,
-            **managed_network_httpx_kwargs(),
-        ) as client:
-            current_url = url
-            for _redirect_count in range(_MAX_REDIRECTS + 1):
-                _check_ssrf(current_url)
-                marker = _sensitive_url_marker(current_url)
-                if marker is not None:
-                    raise ValueError("Blocked redirect URL containing sensitive data")
+        managed_kwargs = managed_network_httpx_kwargs()
+        current_url = url
+        for _redirect_count in range(_MAX_REDIRECTS + 1):
+            vetted = _check_ssrf(current_url)
+            marker = _sensitive_url_marker(current_url)
+            if marker is not None:
+                raise ValueError("Blocked redirect URL containing sensitive data")
 
+            # Pin the connection to the address that just passed the SSRF guard
+            # so a rebinding second DNS resolution cannot reach a private IP.
+            # When a managed proxy is active it already resolves once through the
+            # guarded path, so skip client-side pinning in that mode.
+            transport = None
+            if "proxy" not in managed_kwargs:
+                transport_kwargs: dict[str, object] = {}
+                if managed_kwargs.get("trust_env"):
+                    proxy_url = _environment_proxy_url(current_url)
+                    if proxy_url is not None:
+                        transport_kwargs["proxy"] = proxy_url
+                transport = _pinned_transport(current_url, vetted, **transport_kwargs)
+            client_kwargs: dict[str, object] = {
+                "timeout": 30.0,
+                "follow_redirects": False,
+                "headers": headers,
+                **managed_kwargs,
+            }
+            if transport is not None:
+                client_kwargs["transport"] = transport
+            async with httpx.AsyncClient(**client_kwargs) as client:  # type: ignore[arg-type]
                 response = await client.get(current_url)
-                if response.status_code not in {301, 302, 303, 307, 308}:
-                    break
-                location = response.headers.get("location")
-                if not location:
-                    break
-                current_url = urljoin(str(response.url), location)
-            else:
-                raise ValueError(f"Too many redirects (>{_MAX_REDIRECTS})")
+            if response.status_code not in {301, 302, 303, 307, 308}:
+                break
+            location = response.headers.get("location")
+            if not location:
+                break
+            current_url = urljoin(current_url, location)
+        else:
+            raise ValueError(f"Too many redirects (>{_MAX_REDIRECTS})")
 
-            return (
-                response.status_code,
-                str(response.url),
-                response.headers.get("content-type", ""),
-                response.text,
-            )
+        return (
+            response.status_code,
+            current_url,
+            response.headers.get("content-type", ""),
+            response.text,
+        )
 
     last_error: str | None = None
     for attempt_idx, user_agent in enumerate((_UA_PRIMARY, _UA_FALLBACK)):
