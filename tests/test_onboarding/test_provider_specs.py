@@ -61,7 +61,7 @@ from opensquilla.onboarding.provider_specs import (  # noqa: E402
 EXPECTED_VERIFIED = {
     "openrouter", "openai", "openai_responses", "anthropic", "ollama", "deepseek",
     "gemini", "dashscope", "moonshot", "zhipu", "qianfan",
-    "volcengine", "byteplus",
+    "volcengine", "byteplus", "tokenrhythm",
 }
 # Experimental: registry-runnable, offered with a visible caveat.
 EXPECTED_EXPERIMENTAL = {

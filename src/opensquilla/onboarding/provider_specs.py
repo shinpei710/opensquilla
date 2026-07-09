@@ -79,6 +79,7 @@ _PROVIDER_LABELS: dict[str, str] = {
     "tencent_tokenhub_intl": "Tencent TokenHub International",
     "tencent_token_plan": "Tencent Token Plan",
     "tencent_token_plan_anthropic": "Tencent Token Plan (Anthropic)",
+    "tokenrhythm": "TokenRhythm",
     "vllm": "vLLM (self-hosted)",
     "custom": "Custom OpenAI-compatible endpoint",
     "litellm_proxy": "LiteLLM Proxy",
@@ -108,6 +109,7 @@ _ONBOARDING_VERIFIED_PROVIDER_IDS = frozenset(
         "qianfan",
         "volcengine",
         "byteplus",
+        "tokenrhythm",
     }
 )
 

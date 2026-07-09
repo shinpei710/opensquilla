@@ -107,6 +107,7 @@ base_url = "https://openrouter.ai/api/v1"
 #
 # provider      env var                 default base_url
 # openrouter    OPENROUTER_API_KEY       https://openrouter.ai/api/v1
+# tokenrhythm   TOKENRHYTHM_API_KEY      https://tokenrhythm.studio/v1
 # openai        OPENAI_API_KEY           https://api.openai.com/v1
 # openai_responses OPENAI_API_KEY        https://api.openai.com/v1  (native Responses-API shape; chat+responses)
 # anthropic     ANTHROPIC_API_KEY        https://api.anthropic.com
@@ -136,6 +137,15 @@ base_url = "https://openrouter.ai/api/v1"
 # model = "deepseek-v4-flash"
 # api_key = ""          # env DEEPSEEK_API_KEY also works
 # base_url = "https://api.deepseek.com"
+#
+# Example direct TokenRhythm config (aggregator: DeepSeek/GLM/MiniMax/Kimi/
+# MiMo/Qwen families on one key). Every served model streams
+# reasoning_content, and reasoning tokens count against max_tokens — keep
+# max_tokens = 0 (auto) rather than setting small caps:
+# provider = "tokenrhythm"
+# model = "deepseek-v4-pro"
+# api_key = ""          # env TOKENRHYTHM_API_KEY also works
+# base_url = "https://tokenrhythm.studio/v1"
 #
 # Example self-hosted / custom OpenAI-compatible endpoint (vLLM, SGLang, TGI,
 # llama.cpp server, or any proxy speaking the Chat Completions API):
