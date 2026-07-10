@@ -75,24 +75,84 @@ try {
   await page.locator('[data-screen="0"].active .next-button').click()
   await page.locator('[data-screen="1"].active').waitFor({ state: 'visible', timeout: 10_000 })
   assert.equal(await page.locator('[data-step-label="2"]').count(), 1, 'advanced setup should expose the routing-mode progress step')
-  const zhProviderHint = await page.locator('#providerHint').innerText()
-  assert.match(zhProviderHint, /适合混合模型路由/)
-  assert.doesNotMatch(zhProviderHint, /保存在本机/)
-  assert.doesNotMatch(zhProviderHint, /OPENROUTER_API_KEY/)
-  assert.doesNotMatch(zhProviderHint, /注入/)
-  assert.doesNotMatch(zhProviderHint, /Best default/)
-  assert.doesNotMatch(zhProviderHint, /存储为/)
+
+  assert.equal(await page.locator('#provider').inputValue(), 'tokenrhythm')
+  assert.equal(await page.locator('#baseUrl').inputValue(), 'https://tokenrhythm.studio/v1')
+  assert.equal(await page.locator('#model').inputValue(), 'deepseek-v4-pro')
+  assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'direct')
+  assert.equal(await page.locator('#routerMode').inputValue(), 'disabled')
+
+  const tokenRhythmFeature = page.locator('[data-provider-feature="tokenrhythm"]')
+  assert.equal(await tokenRhythmFeature.count(), 1)
+  assert.equal(await tokenRhythmFeature.locator('[data-tokenrhythm-title]').innerText(), '推荐使用 TokenRhythm')
+  assert.equal(
+    await tokenRhythmFeature.locator('[data-tokenrhythm-value]').innerText(),
+    '一个 API Key，统一接入 DeepSeek、GLM、MiniMax、Kimi 等主流模型。',
+  )
+  assert.equal(
+    await tokenRhythmFeature.locator('[data-tokenrhythm-registration]').innerText(),
+    '免费注册，立即获取 API Key。',
+  )
+  const tokenRhythmCta = tokenRhythmFeature.locator('#tokenrhythmRegister')
+  assert.equal(await tokenRhythmCta.innerText(), '免费获取 API Key')
+  assert.equal(await tokenRhythmCta.getAttribute('href'), 'https://tokenrhythm.studio/register')
+  assert.equal(await tokenRhythmCta.getAttribute('target'), '_blank')
+  assert.equal(await tokenRhythmCta.getAttribute('rel'), 'noopener noreferrer')
+  assert.equal(
+    await tokenRhythmCta.getAttribute('aria-label'),
+    '免费获取 TokenRhythm API Key（在外部浏览器中打开）',
+  )
+  assert.equal(await tokenRhythmFeature.locator('img, svg, canvas').count(), 0)
+  assert.equal(await tokenRhythmFeature.locator('[data-provider="tokenrhythm"]').getAttribute('aria-pressed'), 'true')
+
+  const providerMoreToggle = page.locator('#providerMoreToggle')
+  const providerMorePanel = page.locator('#providerMorePanel')
+  assert.equal(await providerMoreToggle.getAttribute('aria-expanded'), 'false')
+  assert.equal(await providerMoreToggle.getAttribute('aria-controls'), 'providerMorePanel')
+  assert.equal(await providerMorePanel.isHidden(), true)
 
   await page.locator('#onboardingLocale').selectOption('en')
   assert.equal(await page.evaluate(() => document.documentElement.lang), 'en')
   assert.equal(await page.locator('[data-screen="1"] h2').innerText(), 'Connect a provider')
+  assert.equal(await page.locator('#provider').inputValue(), 'tokenrhythm', 'locale changes should preserve the selected provider')
+  assert.equal(await tokenRhythmFeature.locator('[data-tokenrhythm-title]').innerText(), 'Recommended: TokenRhythm')
+  assert.equal(
+    await tokenRhythmFeature.locator('[data-tokenrhythm-value]').innerText(),
+    'One API key connects DeepSeek, GLM, MiniMax, Kimi, and other leading models.',
+  )
+  assert.equal(
+    await tokenRhythmFeature.locator('[data-tokenrhythm-registration]').innerText(),
+    'Register free and get an API key.',
+  )
+  assert.equal(await tokenRhythmCta.innerText(), 'Get a free API key')
+  assert.equal(
+    await tokenRhythmCta.getAttribute('aria-label'),
+    'Get a free TokenRhythm API key (opens in external browser)',
+  )
+
+  await providerMoreToggle.click()
+  assert.equal(await providerMoreToggle.getAttribute('aria-expanded'), 'true')
+  assert.equal(await providerMorePanel.isVisible(), true)
+  const openRouterProvider = page.locator('#providerGrid [data-provider="openrouter"]')
+  await openRouterProvider.click()
+  assert.equal(await page.locator('#provider').inputValue(), 'openrouter')
+  assert.equal(await openRouterProvider.getAttribute('aria-pressed'), 'true')
+  assert.equal(await tokenRhythmFeature.locator('[data-provider="tokenrhythm"]').getAttribute('aria-pressed'), 'false')
+  await page.locator('#onboardingLocale').selectOption('zh-Hans')
+  assert.equal(await page.locator('#provider').inputValue(), 'openrouter', 'locale changes should preserve another provider selection')
+  await page.locator('#onboardingLocale').selectOption('en')
+  assert.equal(await page.locator('#provider').inputValue(), 'openrouter')
+  await tokenRhythmFeature.locator('[data-provider="tokenrhythm"]').click()
+  assert.equal(await page.locator('#provider').inputValue(), 'tokenrhythm', 'TokenRhythm should remain re-selectable')
+  assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'direct')
+  assert.equal(await tokenRhythmFeature.locator('[data-provider="tokenrhythm"]').getAttribute('aria-pressed'), 'true')
+  await openRouterProvider.click()
+  assert.equal(await page.locator('#provider').inputValue(), 'openrouter')
   const enProviderHint = await page.locator('#providerHint').innerText()
-  assert.match(enProviderHint, /Best default for mixed model routing/)
   assert.doesNotMatch(enProviderHint, /saved locally/)
   assert.doesNotMatch(enProviderHint, /OPENROUTER_API_KEY/)
   assert.doesNotMatch(enProviderHint, /supplied to the local runtime/)
 
-  assert.equal(await page.locator('#providerMoreToggle').count(), 0, 'providers should be peers, not hidden behind a More providers hierarchy')
   await page.locator('#apiKey').fill('test-openrouter-key')
   await page.locator('[data-screen="1"].active .next-button').click()
   await page.locator('[data-screen="2"].active').waitFor({ state: 'visible', timeout: 10_000 })
@@ -115,12 +175,11 @@ try {
   await page.locator('[data-screen="2"].active .back-button').click()
   await page.locator('[data-screen="1"].active').waitFor({ state: 'visible', timeout: 5_000 })
 
-  await page.locator('#providerGrid [data-provider="qianfan"]').click()
+  await page.locator('#providerGrid [data-provider="ollama"]').click()
   assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'direct')
   assert.equal(await page.locator('#routerMode').inputValue(), 'disabled')
   assert.equal(await page.locator('#model').inputValue(), '', 'direct-only providers without a default model should not inherit the previous provider model')
   assert.equal(await page.locator('#endpointToggle').getAttribute('aria-expanded'), 'true', 'direct-only providers that need a model should open the endpoint panel')
-  await page.locator('#apiKey').fill('test-qianfan-key')
   await page.locator('[data-screen="1"].active .next-button').click()
   await page.locator('[data-screen="2"].active').waitFor({ state: 'visible', timeout: 5_000 })
   assert.equal(await page.locator('[data-model-routing-mode="squilla_router"]').isDisabled(), true)

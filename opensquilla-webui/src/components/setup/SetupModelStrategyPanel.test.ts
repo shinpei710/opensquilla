@@ -528,7 +528,8 @@ describe('SetupModelStrategyPanel', () => {
     const { app, el } = await mountPanel({ hasSavedProvider: false }, { onGoToSection })
 
     const guidance = el.querySelector('[data-testid="model-strategy-provider-first"]')
-    expect(guidance?.textContent).toContain('Choose a Chat Model first')
+    expect(guidance?.textContent).toContain('Choose a Model Service first')
+    expect(guidance?.querySelector('button')?.textContent).toContain('Go to Model Service')
     guidance?.querySelector('button')?.click()
     await nextTick()
 

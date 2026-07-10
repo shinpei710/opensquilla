@@ -654,6 +654,7 @@ function canonicalTierKey(name: string): string {
   return LEGACY_TEXT_TIER_ALIASES[name] ?? name
 }
 const ROUTER_PROFILE_IDS = new Set(['openrouter', 'dashscope', 'deepseek', 'gemini', 'volcengine', 'openai', 'zhipu', 'moonshot'])
+const TOKENRHYTHM_REGISTER_URL = 'https://tokenrhythm.studio/register'
 
 const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   {
@@ -676,7 +677,7 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     requiresApiKey: true,
     routerSupported: true,
     deployment: 'cloud',
-    note: 'Best default for mixed model routing.',
+    note: 'One account for mixed-model routing.',
   },
   {
     id: 'openai',
@@ -1799,7 +1800,7 @@ let desktopLocale: DesktopLocale = 'en'
 const PROVIDER_NOTE_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   en: {
     tokenrhythm: 'DeepSeek, GLM, MiniMax and Kimi model families on one key.',
-    openrouter: 'Best default for mixed model routing.',
+    openrouter: 'One account for mixed-model routing.',
     openai: 'OpenAI-only tier profile.',
     openai_responses: 'OpenAI Responses-API shape (chat + responses).',
     anthropic: 'Direct Claude access without SquillaRouter tiers.',
@@ -1814,7 +1815,7 @@ const PROVIDER_NOTE_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   },
   'zh-Hans': {
     tokenrhythm: '一把密钥即可使用 DeepSeek、GLM、MiniMax、Kimi 全系模型。',
-    openrouter: '适合混合模型路由的初始默认选项。',
+    openrouter: '通过一个账户进行混合模型路由。',
     openai: '仅使用 OpenAI 的层级配置。',
     openai_responses: 'OpenAI Responses API 格式（chat + responses）。',
     anthropic: '直接访问 Claude，不使用 SquillaRouter 层级。',
@@ -1829,7 +1830,7 @@ const PROVIDER_NOTE_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   },
   ja: {
     tokenrhythm: 'DeepSeek・GLM・MiniMax・Kimi の各モデルを 1 つのキーで利用できます。',
-    openrouter: '混合モデルルーティングに適した初期デフォルトです。',
+    openrouter: '1 つのアカウントで複数モデルをルーティングできます。',
     openai: 'OpenAI のみを使うティアプロファイルです。',
     openai_responses: 'OpenAI Responses API 形式（chat + responses）です。',
     anthropic: 'SquillaRouter ティアを使わず Claude に直接アクセスします。',
@@ -1844,7 +1845,7 @@ const PROVIDER_NOTE_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   },
   fr: {
     tokenrhythm: 'Les familles DeepSeek, GLM, MiniMax et Kimi avec une seule clé.',
-    openrouter: 'Bon choix initial par défaut pour le routage de modèles mixtes.',
+    openrouter: 'Routage de plusieurs modèles avec un seul compte.',
     openai: 'Profil de niveaux limité à OpenAI.',
     openai_responses: 'Format OpenAI Responses API (chat + responses).',
     anthropic: 'Accès direct à Claude sans niveaux SquillaRouter.',
@@ -1859,7 +1860,7 @@ const PROVIDER_NOTE_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   },
   de: {
     tokenrhythm: 'DeepSeek-, GLM-, MiniMax- und Kimi-Modelle mit einem einzigen Schlüssel.',
-    openrouter: 'Gute anfängliche Voreinstellung für gemischtes Modellrouting.',
+    openrouter: 'Routing mehrerer Modelle über ein Konto.',
     openai: 'Nur-OpenAI-Stufenprofil.',
     openai_responses: 'OpenAI Responses-API-Format (chat + responses).',
     anthropic: 'Direkter Claude-Zugriff ohne SquillaRouter-Stufen.',
@@ -1874,7 +1875,7 @@ const PROVIDER_NOTE_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
   },
   es: {
     tokenrhythm: 'Las familias DeepSeek, GLM, MiniMax y Kimi con una sola clave.',
-    openrouter: 'Buena opción inicial para el enrutamiento mixto de modelos.',
+    openrouter: 'Enrutamiento de varios modelos con una sola cuenta.',
     openai: 'Perfil de niveles solo con OpenAI.',
     openai_responses: 'Formato OpenAI Responses API (chat + responses).',
     anthropic: 'Acceso directo a Claude sin niveles SquillaRouter.',
@@ -2067,7 +2068,13 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': 'Continue',
     'onboarding.step2.badge': 'Required',
     'onboarding.step2.heading': 'Connect a provider',
-    'onboarding.step2.subtitle': 'Choose the provider account the local runtime uses for model calls. OpenRouter starts selected, but any supported provider can be used.',
+    'onboarding.step2.subtitle': 'Choose the provider account the local runtime uses for model calls.',
+    'onboarding.step2.tokenrhythmTitle': 'Recommended: TokenRhythm',
+    'onboarding.step2.tokenrhythmValue': 'One API key connects DeepSeek, GLM, MiniMax, Kimi, and other leading models.',
+    'onboarding.step2.tokenrhythmRegistration': 'Register free and get an API key.',
+    'onboarding.step2.tokenrhythmCta': 'Get a free API key',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Get a free TokenRhythm API key (opens in external browser)',
+    'onboarding.step2.otherProviders': 'Other providers',
     'onboarding.step2.apiKey': 'API key',
     'onboarding.step2.endpointSummary': 'Endpoint and direct model',
     'onboarding.step2.baseUrl': 'Base URL',
@@ -2173,7 +2180,13 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': '继续',
     'onboarding.step2.badge': '必填',
     'onboarding.step2.heading': '连接提供商',
-    'onboarding.step2.subtitle': '选择本地运行时用于模型调用的提供商账户。OpenRouter 只是初始默认选项，可改用任何支持的提供商。',
+    'onboarding.step2.subtitle': '选择本地运行时用于模型调用的提供商账户。',
+    'onboarding.step2.tokenrhythmTitle': '推荐使用 TokenRhythm',
+    'onboarding.step2.tokenrhythmValue': '一个 API Key，统一接入 DeepSeek、GLM、MiniMax、Kimi 等主流模型。',
+    'onboarding.step2.tokenrhythmRegistration': '免费注册，立即获取 API Key。',
+    'onboarding.step2.tokenrhythmCta': '免费获取 API Key',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': '免费获取 TokenRhythm API Key（在外部浏览器中打开）',
+    'onboarding.step2.otherProviders': '其他提供商',
     'onboarding.step2.apiKey': 'API 密钥',
     'onboarding.step2.endpointSummary': '端点和直连模型',
     'onboarding.step2.baseUrl': 'Base URL',
@@ -2274,7 +2287,13 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': '続行',
     'onboarding.step2.badge': '必須',
     'onboarding.step2.heading': 'プロバイダーを接続',
-    'onboarding.step2.subtitle': 'ローカルランタイムがモデル呼び出しに使用するプロバイダーアカウントを選択します。OpenRouter は初期選択であり、対応する任意のプロバイダーに変更できます。',
+    'onboarding.step2.subtitle': 'ローカルランタイムがモデル呼び出しに使用するプロバイダーアカウントを選択します。',
+    'onboarding.step2.tokenrhythmTitle': '推奨：TokenRhythm',
+    'onboarding.step2.tokenrhythmValue': '1 つの API キーで DeepSeek、GLM、MiniMax、Kimi などの主要モデルに接続できます。',
+    'onboarding.step2.tokenrhythmRegistration': '無料で登録して、API キーをすぐに取得できます。',
+    'onboarding.step2.tokenrhythmCta': '無料で API キーを取得',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'TokenRhythm の無料 API キーを取得（外部ブラウザーで開きます）',
+    'onboarding.step2.otherProviders': 'その他のプロバイダー',
     'onboarding.step2.apiKey': 'API キー',
     'onboarding.step2.endpointSummary': 'エンドポイントと直接モデル',
     'onboarding.step2.baseUrl': 'Base URL',
@@ -2378,7 +2397,13 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': 'Continuer',
     'onboarding.step2.badge': 'Requis',
     'onboarding.step2.heading': 'Connecter un fournisseur',
-    'onboarding.step2.subtitle': 'Choisissez le compte fournisseur utilisé par le runtime local pour les appels de modèle. OpenRouter est sélectionné au départ, mais tout fournisseur pris en charge peut être utilisé.',
+    'onboarding.step2.subtitle': 'Choisissez le compte fournisseur utilisé par le runtime local pour les appels de modèle.',
+    'onboarding.step2.tokenrhythmTitle': 'Recommandé : TokenRhythm',
+    'onboarding.step2.tokenrhythmValue': 'Une seule clé API permet d’accéder à DeepSeek, GLM, MiniMax, Kimi et à d’autres modèles majeurs.',
+    'onboarding.step2.tokenrhythmRegistration': 'Inscrivez-vous gratuitement et obtenez une clé API.',
+    'onboarding.step2.tokenrhythmCta': 'Obtenir une clé API gratuitement',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Obtenir une clé API TokenRhythm gratuitement (s’ouvre dans le navigateur externe)',
+    'onboarding.step2.otherProviders': 'Autres fournisseurs',
     'onboarding.step2.apiKey': 'Clé API',
     'onboarding.step2.endpointSummary': 'Point de terminaison et modèle direct',
     'onboarding.step2.baseUrl': 'Base URL',
@@ -2482,7 +2507,13 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': 'Weiter',
     'onboarding.step2.badge': 'Erforderlich',
     'onboarding.step2.heading': 'Anbieter verbinden',
-    'onboarding.step2.subtitle': 'Wählen Sie das Anbieterkonto, das die lokale Laufzeitumgebung für Modellaufrufe verwendet. OpenRouter ist anfangs ausgewählt, aber jeder unterstützte Anbieter kann verwendet werden.',
+    'onboarding.step2.subtitle': 'Wählen Sie das Anbieterkonto, das die lokale Laufzeitumgebung für Modellaufrufe verwendet.',
+    'onboarding.step2.tokenrhythmTitle': 'Empfohlen: TokenRhythm',
+    'onboarding.step2.tokenrhythmValue': 'Ein API-Schlüssel verbindet DeepSeek, GLM, MiniMax, Kimi und weitere führende Modelle.',
+    'onboarding.step2.tokenrhythmRegistration': 'Kostenlos registrieren und einen API-Schlüssel erhalten.',
+    'onboarding.step2.tokenrhythmCta': 'Kostenlosen API-Schlüssel erhalten',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Kostenlosen TokenRhythm-API-Schlüssel erhalten (wird im externen Browser geöffnet)',
+    'onboarding.step2.otherProviders': 'Weitere Anbieter',
     'onboarding.step2.apiKey': 'API-Schlüssel',
     'onboarding.step2.endpointSummary': 'Endpunkt und direktes Modell',
     'onboarding.step2.baseUrl': 'Base URL',
@@ -2586,7 +2617,13 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': 'Continuar',
     'onboarding.step2.badge': 'Obligatorio',
     'onboarding.step2.heading': 'Conectar un proveedor',
-    'onboarding.step2.subtitle': 'Elige la cuenta de proveedor que usa el runtime local para las llamadas a modelos. OpenRouter empieza seleccionado, pero puedes usar cualquier proveedor compatible.',
+    'onboarding.step2.subtitle': 'Elige la cuenta de proveedor que usa el runtime local para las llamadas a modelos.',
+    'onboarding.step2.tokenrhythmTitle': 'Recomendado: TokenRhythm',
+    'onboarding.step2.tokenrhythmValue': 'Una clave API conecta DeepSeek, GLM, MiniMax, Kimi y otros modelos líderes.',
+    'onboarding.step2.tokenrhythmRegistration': 'Regístrate gratis y obtén una clave API.',
+    'onboarding.step2.tokenrhythmCta': 'Obtener una clave API gratis',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Obtener una clave API de TokenRhythm gratis (se abre en el navegador externo)',
+    'onboarding.step2.otherProviders': 'Otros proveedores',
     'onboarding.step2.apiKey': 'Clave API',
     'onboarding.step2.endpointSummary': 'Endpoint y modelo directo',
     'onboarding.step2.baseUrl': 'Base URL',
@@ -3248,6 +3285,123 @@ function onboardingHtml(
       gap: 10px;
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+    .provider-feature {
+      position: relative;
+      width: 100%;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.62);
+      padding: 17px 18px;
+      transition: border-color 160ms ease, box-shadow 160ms ease, background 160ms ease;
+    }
+    .provider-feature.active {
+      border-color: var(--accent);
+      background: #fffaf4;
+      box-shadow: 0 12px 26px rgba(54, 42, 28, 0.065);
+    }
+    .provider-feature.active::after {
+      content: "";
+      position: absolute;
+      top: 11px;
+      right: 11px;
+      width: 7px;
+      height: 7px;
+      border-radius: 999px;
+      background: var(--accent);
+    }
+    .provider-feature-select {
+      appearance: none;
+      min-height: 0;
+      display: grid;
+      gap: 5px;
+      border: 0;
+      background: transparent;
+      color: var(--ink);
+      cursor: pointer;
+      padding: 0;
+      text-align: left;
+    }
+    .provider-feature-select strong {
+      padding-right: 12px;
+      font-size: 17px;
+      font-weight: 700;
+      line-height: 1.25;
+    }
+    .provider-feature-value {
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 550;
+      line-height: 1.45;
+    }
+    .provider-feature-registration {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 500;
+      line-height: 1.4;
+    }
+    .provider-feature-cta {
+      display: inline-flex;
+      min-height: 38px;
+      align-items: center;
+      justify-content: center;
+      border-radius: 8px;
+      background: var(--accent-dark);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 700;
+      padding: 0 14px;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .provider-feature-cta:hover {
+      background: var(--accent);
+    }
+    .provider-disclosure {
+      display: grid;
+      gap: 10px;
+    }
+    .provider-disclosure-toggle {
+      appearance: none;
+      width: 100%;
+      min-height: 40px;
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255,255,255,0.46);
+      color: #565c54;
+      cursor: pointer;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 650;
+      padding: 0 13px;
+      text-align: left;
+    }
+    .provider-disclosure-toggle::before {
+      content: "";
+      width: 7px;
+      height: 7px;
+      border-right: 2px solid #747a73;
+      border-bottom: 2px solid #747a73;
+      transform: rotate(-45deg);
+      transition: transform 180ms ease, border-color 180ms ease;
+    }
+    .provider-disclosure-toggle[aria-expanded="true"]::before {
+      border-color: var(--accent-dark);
+      transform: rotate(45deg);
+    }
+    .provider:focus-visible,
+    .provider-feature-select:focus-visible,
+    .provider-feature-cta:focus-visible,
+    .provider-disclosure-toggle:focus-visible {
+      outline: 3px solid rgba(242, 106, 27, 0.35);
+      outline-offset: 2px;
+    }
     .provider-picker {
       min-height: 0;
       max-height: min(310px, 42vh);
@@ -3591,6 +3745,8 @@ function onboardingHtml(
       .rail { display: none; }
       .setup-card { position: relative; min-height: 620px; height: auto; }
       .provider-grid, .setup-mode-grid, .choice-row, .tier-defaults, .field-pair { grid-template-columns: 1fr; }
+      .provider-feature { grid-template-columns: 1fr; }
+      .provider-feature-cta { width: 100%; }
     }
   </style>
 </head>
@@ -3699,11 +3855,26 @@ function onboardingHtml(
           <span class="card-badge" data-i18n="onboarding.step2.badge">${ot('onboarding.step2.badge')}</span>
         </header>
         <div class="card-body">
-        <div class="provider-picker">
-          <div class="provider-grid" id="providerGrid"></div>
+        <div class="provider-feature active" data-provider-feature="tokenrhythm">
+          <button class="provider-feature-select" type="button" data-provider="tokenrhythm" aria-pressed="true">
+            <strong data-i18n="onboarding.step2.tokenrhythmTitle" data-tokenrhythm-title>${ot('onboarding.step2.tokenrhythmTitle')}</strong>
+            <span class="provider-feature-value" data-i18n="onboarding.step2.tokenrhythmValue" data-tokenrhythm-value>${ot('onboarding.step2.tokenrhythmValue')}</span>
+            <span class="provider-feature-registration" data-i18n="onboarding.step2.tokenrhythmRegistration" data-tokenrhythm-registration>${ot('onboarding.step2.tokenrhythmRegistration')}</span>
+          </button>
+          <a class="provider-feature-cta" id="tokenrhythmRegister" href="${TOKENRHYTHM_REGISTER_URL}" target="_blank" rel="noopener noreferrer" data-i18n="onboarding.step2.tokenrhythmCta" data-i18n-aria="onboarding.step2.tokenrhythmCtaExternalLabel" aria-label="${ot('onboarding.step2.tokenrhythmCtaExternalLabel')}">${ot('onboarding.step2.tokenrhythmCta')}</a>
         </div>
-        <input id="provider" type="hidden" value="openrouter" />
-        <input id="routerMode" type="hidden" value="recommended" />
+        <div class="provider-disclosure">
+          <button class="provider-disclosure-toggle" id="providerMoreToggle" type="button" aria-expanded="false" aria-controls="providerMorePanel">
+            <span data-i18n="onboarding.step2.otherProviders">${ot('onboarding.step2.otherProviders')}</span>
+          </button>
+          <div id="providerMorePanel" hidden>
+            <div class="provider-picker">
+              <div class="provider-grid" id="providerGrid"></div>
+            </div>
+          </div>
+        </div>
+        <input id="provider" type="hidden" value="tokenrhythm" />
+        <input id="routerMode" type="hidden" value="disabled" />
         <label>
           <span data-i18n="onboarding.step2.apiKey">${ot('onboarding.step2.apiKey')}</span>
           <input id="apiKey" name="apiKey" type="password" autocomplete="off" placeholder="sk-..." />
@@ -3745,7 +3916,7 @@ function onboardingHtml(
         </header>
         <div class="card-body">
           <div class="choice-row" id="modelRoutingModeGrid" role="radiogroup" aria-label="${ot('onboarding.aria.modelRoutingMode')}" data-i18n-aria="onboarding.aria.modelRoutingMode"></div>
-          <input id="modelRoutingMode" type="hidden" value="squilla_router" />
+          <input id="modelRoutingMode" type="hidden" value="direct" />
           <div id="directModelPanel" hidden>
             <label>
               <span data-i18n="onboarding.step3.directModel">${ot('onboarding.step3.directModel')}</span>
@@ -3850,6 +4021,10 @@ function onboardingHtml(
 	    const endpointPanel = document.getElementById('endpointPanel');
 	    const endpointToggle = document.getElementById('endpointToggle');
 	    const endpointContent = document.getElementById('endpointContent');
+    const tokenRhythmFeature = document.querySelector('[data-provider-feature="tokenrhythm"]');
+    const tokenRhythmProviderButton = tokenRhythmFeature.querySelector('[data-provider="tokenrhythm"]');
+    const providerMoreToggle = document.getElementById('providerMoreToggle');
+    const providerMorePanel = document.getElementById('providerMorePanel');
     function clone(value) {
       return JSON.parse(JSON.stringify(value || {}));
     }
@@ -3884,6 +4059,10 @@ function onboardingHtml(
 	      endpointToggle.setAttribute('aria-expanded', String(open));
 	      endpointContent.setAttribute('aria-hidden', String(!open));
 	    }
+	    function setProviderDisclosureOpen(open) {
+	      providerMoreToggle.setAttribute('aria-expanded', String(open));
+	      providerMorePanel.hidden = !open;
+	    }
 	    function syncProviderDefaults(resetRouter) {
 	      const selected = currentProvider();
 	      if (resetRouter) {
@@ -3903,26 +4082,31 @@ function onboardingHtml(
 	      renderModelRoutingModeGrid();
 	      renderTiers();
 	    }
+    function selectProvider(nextProvider) {
+      const next = nextProvider || 'tokenrhythm';
+      // Re-clicking the already-active provider must not reset base URL, model,
+      // routing mode, and customized tiers back to catalog defaults.
+      if (next === provider.value) return;
+      provider.value = next;
+      errorBox.textContent = '';
+      syncProviderDefaults(true);
+      renderProviderGrid();
+      render();
+    }
     function renderProviderGrid() {
       const grid = document.getElementById('providerGrid');
-      grid.classList.toggle('single-provider', providers.length === 1);
-      grid.innerHTML = providers.map((item) => (
-        '<button class="provider' + (item.id === provider.value ? ' active' : '') + '" type="button" data-provider="' + escapeAttr(item.id) + '">' +
-        '<span class="provider-tag">' + escapeHtml(t.providerField) + '</span><strong>' + escapeHtml(item.label) + '</strong><small>' + escapeHtml(item.routerSupported ? t.tierDefaultsAvailable : providerNote(item)) + '</small></button>'
+      const otherProviders = providers.filter((item) => item.id !== 'tokenrhythm');
+      const tokenRhythmSelected = provider.value === 'tokenrhythm';
+      tokenRhythmFeature.classList.toggle('active', tokenRhythmSelected);
+      tokenRhythmProviderButton.setAttribute('aria-pressed', String(tokenRhythmSelected));
+      tokenRhythmProviderButton.onclick = () => selectProvider('tokenrhythm');
+      grid.classList.toggle('single-provider', otherProviders.length === 1);
+      grid.innerHTML = otherProviders.map((item) => (
+        '<button class="provider' + (item.id === provider.value ? ' active' : '') + '" type="button" data-provider="' + escapeAttr(item.id) + '" aria-pressed="' + String(item.id === provider.value) + '">' +
+        '<span class="provider-tag">' + escapeHtml(t.providerField) + '</span><strong>' + escapeHtml(item.label) + '</strong><small>' + escapeHtml(providerNote(item)) + '</small></button>'
       )).join('');
-      function selectProvider(nextProvider) {
-	        const next = nextProvider || 'openrouter';
-	        // Re-clicking the already-active provider must not reset base URL, model,
-	        // routing mode, and customized tiers back to catalog defaults.
-	        if (next === provider.value) return;
-	        provider.value = next;
-	        errorBox.textContent = '';
-	        syncProviderDefaults(true);
-	        renderProviderGrid();
-	        render();
-	      }
       const bindProviderButton = (button) => {
-        button.addEventListener('click', () => selectProvider(button.dataset.provider || 'openrouter'));
+        button.addEventListener('click', () => selectProvider(button.dataset.provider || 'tokenrhythm'));
       };
       grid.querySelectorAll('.provider').forEach(bindProviderButton);
     }
@@ -4160,6 +4344,9 @@ function onboardingHtml(
 	      errorBox.textContent = '';
 	      applyLocale(onboardingLocale.value);
 	    });
+	    providerMoreToggle.addEventListener('click', () => {
+	      setProviderDisclosureOpen(providerMoreToggle.getAttribute('aria-expanded') !== 'true');
+	    });
 	    endpointToggle.addEventListener('click', () => {
 	      setEndpointPanelOpen(!endpointPanel.classList.contains('open'));
 	    });
@@ -4230,6 +4417,21 @@ function onboardingHtml(
         errorBox.textContent = error && error.message ? error.message : String(error);
       }
     });
+    function applyMigrationPrefill(prefill) {
+      if (!prefill || typeof prefill !== 'object') return;
+      const nextProvider = String(prefill.provider || '').trim().toLowerCase();
+      if (nextProvider && nextProvider !== provider.value) {
+        provider.value = nextProvider;
+        syncProviderDefaults(true);
+      }
+      if (nextProvider && nextProvider !== 'tokenrhythm') setProviderDisclosureOpen(true);
+      if (prefill.baseUrl) baseUrl.value = String(prefill.baseUrl);
+      if (prefill.model) model.value = String(prefill.model);
+      if (prefill.apiKey) document.getElementById('apiKey').value = String(prefill.apiKey);
+      syncProviderDefaults(false);
+      renderProviderGrid();
+      render();
+    }
     if (migrationCandidate) {
       const migrationPreviewButton = document.getElementById('migrationPreview');
       const migrationImportButton = document.getElementById('migrationImport');
@@ -4294,21 +4496,6 @@ function onboardingHtml(
         migrationSummary.hidden = false;
         return items.filter((item) => item && item.status === 'error');
       }
-      function applyMigrationPrefill(prefill) {
-        if (!prefill || typeof prefill !== 'object') return;
-        const nextProvider = String(prefill.provider || '').trim().toLowerCase();
-        if (nextProvider && nextProvider !== provider.value) {
-          provider.value = nextProvider;
-          syncProviderDefaults(true);
-          renderProviderGrid();
-        }
-        if (prefill.baseUrl) baseUrl.value = String(prefill.baseUrl);
-        if (prefill.model) model.value = String(prefill.model);
-        if (prefill.apiKey) document.getElementById('apiKey').value = String(prefill.apiKey);
-        syncProviderDefaults(false);
-        render();
-      }
-      applyMigrationPrefill(initialProviderPrefill);
       if (typeof window.opensquillaDesktop.onMigrationProgress === 'function') {
         window.opensquillaDesktop.onMigrationProgress((payload) => {
           const phase = payload && payload.phase;
@@ -4396,6 +4583,7 @@ function onboardingHtml(
     renderProviderGrid();
     renderSearchProviderGrid();
     syncProviderDefaults(true);
+    applyMigrationPrefill(initialProviderPrefill);
     render();
   </script>
 </body>
@@ -4466,13 +4654,20 @@ async function runOnboarding(): Promise<DesktopConnection> {
     })
     installEditingContextMenu(onboardingWindow)
 
+    onboardingWindow.webContents.setWindowOpenHandler(({ url }) => {
+      if (url === TOKENRHYTHM_REGISTER_URL) {
+        void shell.openExternal(TOKENRHYTHM_REGISTER_URL)
+      }
+      return { action: 'deny' }
+    })
+
     // The wizard is a single data: URL page; block any renderer-initiated
     // top-frame navigation (e.g. a dropped file/link) so it can't replace the
     // onboarding UI — which holds the preload IPC bridge — with a foreign document.
     const guardOnboardingNavigation = (event: Electron.Event, targetUrl: string) => {
       event.preventDefault()
-      if (/^https?:\/\//i.test(targetUrl) || targetUrl.startsWith('mailto:')) {
-        void shell.openExternal(targetUrl)
+      if (targetUrl === TOKENRHYTHM_REGISTER_URL) {
+        void shell.openExternal(TOKENRHYTHM_REGISTER_URL)
       }
     }
     onboardingWindow.webContents.on('will-navigate', guardOnboardingNavigation)
