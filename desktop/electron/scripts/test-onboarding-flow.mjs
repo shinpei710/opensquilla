@@ -87,20 +87,20 @@ try {
   assert.equal(await tokenRhythmFeature.locator('[data-tokenrhythm-title]').innerText(), '推荐使用 TokenRhythm')
   assert.equal(
     await tokenRhythmFeature.locator('[data-tokenrhythm-value]').innerText(),
-    '一个 API Key，统一接入 DeepSeek、GLM、MiniMax、Kimi 等主流模型。',
+    'TokenRhythm API 调用限时免费。',
   )
   assert.equal(
     await tokenRhythmFeature.locator('[data-tokenrhythm-registration]').innerText(),
-    '免费注册，立即获取 API Key。',
+    '活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。',
   )
   const tokenRhythmCta = tokenRhythmFeature.locator('#tokenrhythmRegister')
-  assert.equal(await tokenRhythmCta.innerText(), '免费获取 API Key')
+  assert.equal(await tokenRhythmCta.innerText(), '注册并获取 API Key')
   assert.equal(await tokenRhythmCta.getAttribute('href'), 'https://tokenrhythm.studio/register')
   assert.equal(await tokenRhythmCta.getAttribute('target'), '_blank')
   assert.equal(await tokenRhythmCta.getAttribute('rel'), 'noopener noreferrer')
   assert.equal(
     await tokenRhythmCta.getAttribute('aria-label'),
-    '免费获取 TokenRhythm API Key（在外部浏览器中打开）',
+    '注册并获取 API Key — TokenRhythm（在外部浏览器中打开）',
   )
   assert.equal(await tokenRhythmFeature.locator('img, svg, canvas').count(), 0)
   assert.equal(await tokenRhythmFeature.locator('[data-provider="tokenrhythm"]').getAttribute('aria-pressed'), 'true')
@@ -118,16 +118,16 @@ try {
   assert.equal(await tokenRhythmFeature.locator('[data-tokenrhythm-title]').innerText(), 'Recommended: TokenRhythm')
   assert.equal(
     await tokenRhythmFeature.locator('[data-tokenrhythm-value]').innerText(),
-    'One API key connects DeepSeek, GLM, MiniMax, Kimi, and other leading models.',
+    'TokenRhythm API calls are free for a limited time.',
   )
   assert.equal(
     await tokenRhythmFeature.locator('[data-tokenrhythm-registration]').innerText(),
-    'Register free and get an API key.',
+    'During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.',
   )
-  assert.equal(await tokenRhythmCta.innerText(), 'Get a free API key')
+  assert.equal(await tokenRhythmCta.innerText(), 'Register and get an API key')
   assert.equal(
     await tokenRhythmCta.getAttribute('aria-label'),
-    'Get a free TokenRhythm API key (opens in external browser)',
+    'Register and get an API key — TokenRhythm (opens in external browser)',
   )
 
   await providerMoreToggle.click()
@@ -225,12 +225,13 @@ try {
   await page.locator('[data-screen="2"].active .next-button').click()
   await page.locator('[data-screen="4"].active').waitFor({ state: 'visible', timeout: 5_000 })
   await page.locator('#finish').click()
-  await waitFor(async () => {
+  const saved = await waitFor(async () => {
     const credential = JSON.parse(await readFile(join(userDataDir, 'desktop-credential.json'), 'utf8'))
-    return credential.modelRoutingMode === 'llm_ensemble' ? credential : null
-  }, 'saved ensemble credential')
-  const credential = JSON.parse(await readFile(join(userDataDir, 'desktop-credential.json'), 'utf8'))
-  const config = await readFile(join(userDataDir, 'opensquilla', 'config.toml'), 'utf8')
+    if (credential.modelRoutingMode !== 'llm_ensemble') return null
+    const config = await readFile(join(userDataDir, 'opensquilla', 'config.toml'), 'utf8')
+    return { credential, config }
+  }, 'saved ensemble credential and config')
+  const { credential, config } = saved
   assert.equal(credential.provider, 'openrouter')
   assert.equal(credential.modelRoutingMode, 'llm_ensemble')
   assert.equal(credential.routerMode, 'recommended')

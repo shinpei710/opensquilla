@@ -235,6 +235,9 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
       available: false,
       source: 'none',
       envKey: 'TOKENRHYTHM_API_KEY',
+      masked: '',
+      revealAllowed: false,
+      replacing: false,
       apiKeyValue: '',
       apiKeyEnvValue: 'TOKENRHYTHM_API_KEY',
       ...overrides,
@@ -265,9 +268,19 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     expect(recommendations).toHaveLength(1)
     expect(recommendation(el)?.textContent).toContain('Recommended: TokenRhythm')
     expect(recommendation(el)?.textContent)
-      .toContain('One API key connects DeepSeek, GLM, MiniMax, Kimi, and other leading models.')
-    expect(recommendation(el)?.textContent).toContain('Register free and get an API key.')
+      .toContain('TokenRhythm API calls are free for a limited time.')
+    expect(recommendation(el)?.textContent)
+      .toContain('During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.')
+    expect(
+      Array.from(recommendation(el)?.querySelectorAll('[data-testid="tokenrhythm-recommendation-step"]') || [])
+        .map(step => step.textContent?.replace(/\s+/g, ' ').trim()),
+    ).toEqual([
+      '1 Create a TokenRhythm account',
+      '2 Copy your API key',
+      '3 Select TokenRhythm above, then paste your API key',
+    ])
 
+    link?.addEventListener('click', event => event.preventDefault(), { once: true })
     link?.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
     await nextTick()
 
@@ -290,9 +303,35 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     expect(link?.getAttribute('target')).toBe('_blank')
     expect(link?.getAttribute('rel')).toBe('noopener noreferrer')
     expect(link?.getAttribute('aria-label')).toContain('opens in a new tab')
-    expect(link?.textContent).toContain('Get a free API key')
+    expect(link?.textContent).toContain('Register and get an API key')
     expect(card?.querySelector('img, svg, canvas')).toBeNull()
     expect(card?.querySelector('[role="alert"]')).toBeNull()
+    app.unmount()
+  })
+
+  it('guides users through registering, copying, and pasting the key before the primary action', async () => {
+    const { app, el } = await mountPanel({
+      providerSelected: 'tokenrhythm',
+      runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      credentialPanel: tokenRhythmCredential(),
+    })
+    const card = recommendation(el)
+    const steps = Array.from(
+      card?.querySelectorAll<HTMLElement>('[data-testid="tokenrhythm-recommendation-step"]') || [],
+    )
+    const link = card?.querySelector<HTMLAnchorElement>('a')
+
+    expect(card?.querySelector('ol')?.getAttribute('aria-label')).toBe('How to connect TokenRhythm')
+    expect(steps.map(step => step.textContent?.replace(/\s+/g, ' ').trim())).toEqual([
+      '1 Create a TokenRhythm account',
+      '2 Copy your API key',
+      '3 Paste it into the API key field below',
+    ])
+    expect(link?.classList.contains('btn')).toBe(true)
+    expect(link?.classList.contains('btn--primary')).toBe(true)
+    const thirdStep = steps[2]
+    if (!link || !thirdStep) throw new Error('TokenRhythm guidance controls are missing')
+    expect(link.compareDocumentPosition(thirdStep) & Node.DOCUMENT_POSITION_PRECEDING).toBeTruthy()
     app.unmount()
   })
 
@@ -308,17 +347,82 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     app.unmount()
   })
 
-  it.each([
-    ['an available credential', { available: true }],
-    ['a supplied draft key', { apiKeyValue: 'tr-test-key' }],
-  ])('hides the recommendation when selected TokenRhythm has %s', async (_case, credential) => {
+  it('keeps the registration entry actionable for a saved TokenRhythm credential', async () => {
     const { app, el } = await mountPanel({
       providerSelected: 'tokenrhythm',
       runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
-      credentialPanel: tokenRhythmCredential(credential),
+      credentialPanel: tokenRhythmCredential({
+        available: true,
+        source: 'explicit',
+        masked: 'tr-•••1234',
+        replacing: false,
+      }),
     })
 
-    expect(recommendation(el)).toBeNull()
+    const card = recommendation(el)
+    expect(card).toBeTruthy()
+    expect(card?.querySelector<HTMLAnchorElement>('a')?.href).toBe(TOKENRHYTHM_REGISTRATION_URL)
+    expect(
+      Array.from(card?.querySelectorAll('[data-testid="tokenrhythm-recommendation-step"]') || [])
+        .map(step => step.textContent?.replace(/\s+/g, ' ').trim()),
+    ).toEqual([
+      '1 Create a TokenRhythm account',
+      '2 Copy your API key',
+      '3 Choose Replace key below, then paste your API key',
+    ])
+    expect(el.querySelector<HTMLInputElement>('input[name="setup_provider_api_key_display"]')?.readOnly)
+      .toBe(true)
+    expect(Array.from(el.querySelectorAll('button')).some(button => button.textContent?.trim() === 'Replace key'))
+      .toBe(true)
+    app.unmount()
+  })
+
+  it('keeps the registration entry visible and direct-paste guidance for a draft TokenRhythm key', async () => {
+    const { app, el } = await mountPanel({
+      providerSelected: 'tokenrhythm',
+      runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      credentialPanel: tokenRhythmCredential({ apiKeyValue: 'tr-test-key' }),
+    })
+
+    const card = recommendation(el)
+    expect(card).toBeTruthy()
+    expect(card?.querySelector<HTMLAnchorElement>('a')?.href).toBe(TOKENRHYTHM_REGISTRATION_URL)
+    expect(
+      Array.from(card?.querySelectorAll('[data-testid="tokenrhythm-recommendation-step"]') || [])
+        .map(step => step.textContent?.replace(/\s+/g, ' ').trim()),
+    ).toEqual([
+      '1 Create a TokenRhythm account',
+      '2 Copy your API key',
+      '3 Paste it into the API key field below',
+    ])
+    app.unmount()
+  })
+
+  it('uses direct-paste guidance while replacing a saved TokenRhythm credential', async () => {
+    const { app, el } = await mountPanel({
+      providerSelected: 'tokenrhythm',
+      runtimeProviders: [OPENROUTER_PROVIDER, TOKENRHYTHM_PROVIDER],
+      credentialPanel: tokenRhythmCredential({
+        available: true,
+        source: 'explicit',
+        masked: 'tr-•••1234',
+        replacing: true,
+      }),
+    })
+
+    const card = recommendation(el)
+    expect(
+      Array.from(card?.querySelectorAll('[data-testid="tokenrhythm-recommendation-step"]') || [])
+        .map(step => step.textContent?.replace(/\s+/g, ' ').trim()),
+    ).toEqual([
+      '1 Create a TokenRhythm account',
+      '2 Copy your API key',
+      '3 Paste it into the API key field below',
+    ])
+    expect(el.querySelector<HTMLInputElement>('input[name="setup_provider_api_key"]')?.readOnly)
+      .toBe(false)
+    expect(Array.from(el.querySelectorAll('button')).some(button => button.textContent?.trim() === 'Cancel'))
+      .toBe(true)
     app.unmount()
   })
 
@@ -344,10 +448,18 @@ describe('SetupProviderPanel — TokenRhythm recommendation', () => {
     expect(card?.querySelector('[data-testid="tokenrhythm-recommendation-title"]')?.textContent)
       .toBe('推荐使用 TokenRhythm')
     expect(card?.querySelector('[data-testid="tokenrhythm-recommendation-value"]')?.textContent)
-      .toBe('一个 API Key，统一接入 DeepSeek、GLM、MiniMax、Kimi 等主流模型。')
+      .toBe('TokenRhythm API 调用限时免费。')
     expect(card?.querySelector('[data-testid="tokenrhythm-recommendation-registration"]')?.textContent)
-      .toBe('免费注册，立即获取 API Key。')
-    expect(card?.querySelector('a')?.textContent?.trim()).toBe('免费获取 API Key')
+      .toBe('活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。')
+    expect(
+      Array.from(card?.querySelectorAll('[data-testid="tokenrhythm-recommendation-step"]') || [])
+        .map(step => step.textContent?.replace(/\s+/g, ' ').trim()),
+    ).toEqual([
+      '1 注册 TokenRhythm 账户',
+      '2 复制你的 API Key',
+      '3 先在上方选择 TokenRhythm，再粘贴 API Key',
+    ])
+    expect(card?.querySelector('a')?.textContent?.trim()).toBe('注册并获取 API Key')
     expect(card?.querySelector('a')?.getAttribute('aria-label')).toContain('在新标签页中打开')
     app.unmount()
   })

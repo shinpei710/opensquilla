@@ -234,10 +234,16 @@
       "chooseToSeeFields": "Choisissez un fournisseur pour voir les champs requis.",
       "recommendation": {
         "title": "Recommandé : TokenRhythm",
-        "value": "Une seule clé API donne accès à DeepSeek, GLM, MiniMax, Kimi et à d’autres modèles de premier plan.",
-        "registration": "Inscrivez-vous gratuitement et obtenez une clé API.",
-        "cta": "Obtenir une clé API gratuite",
-        "externalLabel": "Obtenir une clé API TokenRhythm gratuite (s’ouvre dans un nouvel onglet)"
+        "value": "Les appels à l’API TokenRhythm sont gratuits pendant une durée limitée.",
+        "registration": "Pendant l’offre, inscrivez-vous et obtenez une clé API pour appeler gratuitement DeepSeek, GLM, MiniMax, Kimi et d’autres modèles majeurs.",
+        "cta": "S’inscrire et obtenir une clé API",
+        "externalLabel": "S’inscrire et obtenir une clé API — TokenRhythm (s’ouvre dans un nouvel onglet)",
+        "stepsLabel": "Comment connecter TokenRhythm",
+        "stepRegister": "Créer un compte TokenRhythm",
+        "stepCopy": "Copier votre clé API",
+        "stepPaste": "La coller dans le champ de clé API ci-dessous",
+        "stepSelectAndPaste": "Sélectionner TokenRhythm ci-dessus, puis coller votre clé API",
+        "stepReplaceAndPaste": "Sélectionner « Remplacer la clé » ci-dessous, puis coller votre clé API"
       },
       "advanced": "Options avancées du fournisseur",
       "timeoutLabel": "Délai d'expiration de la requête (secondes)",

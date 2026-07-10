@@ -234,10 +234,16 @@
       "chooseToSeeFields": "Elige un proveedor para ver los campos requeridos.",
       "recommendation": {
         "title": "Recomendado: TokenRhythm",
-        "value": "Una sola clave API conecta DeepSeek, GLM, MiniMax, Kimi y otros modelos líderes.",
-        "registration": "Regístrate gratis y obtén una clave API.",
-        "cta": "Obtener una clave API gratis",
-        "externalLabel": "Obtener una clave API gratuita de TokenRhythm (se abre en una pestaña nueva)"
+        "value": "Las llamadas a la API de TokenRhythm son gratis por tiempo limitado.",
+        "registration": "Durante la promoción, regístrate y obtén una clave API para usar gratis DeepSeek, GLM, MiniMax, Kimi y otros modelos líderes.",
+        "cta": "Registrarse y obtener una clave API",
+        "externalLabel": "Registrarse y obtener una clave API — TokenRhythm (se abre en una pestaña nueva)",
+        "stepsLabel": "Cómo conectar TokenRhythm",
+        "stepRegister": "Crear una cuenta de TokenRhythm",
+        "stepCopy": "Copiar tu clave API",
+        "stepPaste": "Pegarla en el campo de clave API de abajo",
+        "stepSelectAndPaste": "Seleccionar TokenRhythm arriba y luego pegar tu clave API",
+        "stepReplaceAndPaste": "Seleccionar «Cambiar clave» abajo y luego pegar tu clave API"
       },
       "advanced": "Opciones avanzadas del proveedor",
       "timeoutLabel": "Tiempo de espera de la solicitud (segundos)",

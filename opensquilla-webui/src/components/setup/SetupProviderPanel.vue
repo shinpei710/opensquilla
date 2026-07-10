@@ -148,17 +148,20 @@ const showContextWindowWarning = computed(() => (
 ))
 
 const showTokenRhythmRecommendation = computed(() => {
-  const tokenRhythmAvailable = props.panel.runtimeProviders.some(
+  return props.panel.runtimeProviders.some(
     provider => provider.providerId.trim().toLowerCase() === 'tokenrhythm',
   )
-  const selectedProvider = props.panel.providerSelected.trim().toLowerCase()
-  if (!tokenRhythmAvailable || !selectedProvider) return false
-  if (selectedProvider !== 'tokenrhythm') return true
-
-  const credential = props.panel.credentialPanel
-  const hasDraftKey = Boolean(credential?.apiKeyValue.trim())
-  return credential?.available !== true && !hasDraftKey
 })
+
+const tokenRhythmSelected = computed(() => (
+  props.panel.providerSelected.trim().toLowerCase() === 'tokenrhythm'
+))
+
+const tokenRhythmCredentialReplacementRequired = computed(() => (
+  tokenRhythmSelected.value
+  && Boolean(props.panel.credentialPanel?.masked)
+  && !props.panel.credentialPanel?.replacing
+))
 </script>
 
 <template>
@@ -177,7 +180,11 @@ const showTokenRhythmRecommendation = computed(() => {
         </select>
       </div>
     </label>
-    <SetupProviderRecommendation v-if="showTokenRhythmRecommendation" />
+    <SetupProviderRecommendation
+      v-if="showTokenRhythmRecommendation"
+      :token-rhythm-selected="tokenRhythmSelected"
+      :credential-replacement-required="tokenRhythmCredentialReplacementRequired"
+    />
     <div v-if="panel.canConfigureRouter" class="control-row">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('setup.provider.routerTiers') }}</span>

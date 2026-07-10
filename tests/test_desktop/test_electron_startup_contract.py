@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -275,6 +276,15 @@ def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_ct
         "onboarding.step2.otherProviders",
     ):
         assert main_ts.count(f"'{key}':") == 6, key
+
+    localized_ctas = re.findall(
+        r"'onboarding\.step2\.tokenrhythmCta': '([^']+)',\n"
+        r"\s*'onboarding\.step2\.tokenrhythmCtaExternalLabel': '([^']+)',",
+        main_ts,
+    )
+    assert len(localized_ctas) == 6
+    for visible_cta, accessible_label in localized_ctas:
+        assert visible_cta in accessible_label
 
 
 def test_desktop_onboarding_opens_only_trusted_registration_url_outside_renderer() -> None:

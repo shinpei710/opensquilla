@@ -234,10 +234,16 @@
       "chooseToSeeFields": "选择服务商以查看所需字段。",
       "recommendation": {
         "title": "推荐使用 TokenRhythm",
-        "value": "一个 API Key，统一接入 DeepSeek、GLM、MiniMax、Kimi 等主流模型。",
-        "registration": "免费注册，立即获取 API Key。",
-        "cta": "免费获取 API Key",
-        "externalLabel": "免费获取 TokenRhythm API Key（在新标签页中打开）"
+        "value": "TokenRhythm API 调用限时免费。",
+        "registration": "活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。",
+        "cta": "注册并获取 API Key",
+        "externalLabel": "注册并获取 API Key — TokenRhythm（在新标签页中打开）",
+        "stepsLabel": "如何接入 TokenRhythm",
+        "stepRegister": "注册 TokenRhythm 账户",
+        "stepCopy": "复制你的 API Key",
+        "stepPaste": "粘贴到下方 API key 输入框",
+        "stepSelectAndPaste": "先在上方选择 TokenRhythm，再粘贴 API Key",
+        "stepReplaceAndPaste": "先点击下方「更换密钥」，再粘贴 API Key"
       },
       "advanced": "高级服务商选项",
       "timeoutLabel": "请求超时（秒）",

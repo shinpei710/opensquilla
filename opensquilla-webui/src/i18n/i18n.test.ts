@@ -189,29 +189,47 @@ describe('catalog parity', () => {
   it('ships localized TokenRhythm recommendation copy with exact English and zh-Hans wording', () => {
     expect(en.setup.provider.recommendation).toEqual({
       title: 'Recommended: TokenRhythm',
-      value: 'One API key connects DeepSeek, GLM, MiniMax, Kimi, and other leading models.',
-      registration: 'Register free and get an API key.',
-      cta: 'Get a free API key',
-      externalLabel: 'Get a free TokenRhythm API key (opens in a new tab)',
+      value: 'TokenRhythm API calls are free for a limited time.',
+      registration: 'During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.',
+      cta: 'Register and get an API key',
+      externalLabel: 'Register and get an API key — TokenRhythm (opens in a new tab)',
+      stepsLabel: 'How to connect TokenRhythm',
+      stepRegister: 'Create a TokenRhythm account',
+      stepCopy: 'Copy your API key',
+      stepPaste: 'Paste it into the API key field below',
+      stepSelectAndPaste: 'Select TokenRhythm above, then paste your API key',
+      stepReplaceAndPaste: 'Choose Replace key below, then paste your API key',
     })
     expect(zhHans.setup.provider.recommendation).toEqual({
       title: '推荐使用 TokenRhythm',
-      value: '一个 API Key，统一接入 DeepSeek、GLM、MiniMax、Kimi 等主流模型。',
-      registration: '免费注册，立即获取 API Key。',
-      cta: '免费获取 API Key',
-      externalLabel: '免费获取 TokenRhythm API Key（在新标签页中打开）',
+      value: 'TokenRhythm API 调用限时免费。',
+      registration: '活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。',
+      cta: '注册并获取 API Key',
+      externalLabel: '注册并获取 API Key — TokenRhythm（在新标签页中打开）',
+      stepsLabel: '如何接入 TokenRhythm',
+      stepRegister: '注册 TokenRhythm 账户',
+      stepCopy: '复制你的 API Key',
+      stepPaste: '粘贴到下方 API key 输入框',
+      stepSelectAndPaste: '先在上方选择 TokenRhythm，再粘贴 API Key',
+      stepReplaceAndPaste: '先点击下方「更换密钥」，再粘贴 API Key',
     })
 
-    for (const messages of [ja, fr, de, es]) {
+    for (const messages of [en, zhHans, ja, fr, de, es]) {
       const copy = messages.setup.provider.recommendation
       expect(copy.title).toContain('TokenRhythm')
-      expect(copy.value).toContain('DeepSeek')
-      expect(copy.value).toContain('GLM')
-      expect(copy.value).toContain('MiniMax')
-      expect(copy.value).toContain('Kimi')
-      expect(copy.registration).toBeTruthy()
+      expect(copy.registration).toContain('DeepSeek')
+      expect(copy.registration).toContain('GLM')
+      expect(copy.registration).toContain('MiniMax')
+      expect(copy.registration).toContain('Kimi')
       expect(copy.cta).toBeTruthy()
       expect(copy.externalLabel).toBeTruthy()
+      expect(copy.externalLabel).toContain(copy.cta)
+      expect(copy.stepsLabel).toBeTruthy()
+      expect(copy.stepRegister).toBeTruthy()
+      expect(copy.stepCopy).toBeTruthy()
+      expect(copy.stepPaste).toBeTruthy()
+      expect(copy.stepSelectAndPaste).toBeTruthy()
+      expect(copy.stepReplaceAndPaste).toBeTruthy()
     }
   })
 })

@@ -234,10 +234,16 @@
       "chooseToSeeFields": "Anbieter auswählen, um die erforderlichen Felder zu sehen.",
       "recommendation": {
         "title": "Empfohlen: TokenRhythm",
-        "value": "Ein API-Schlüssel verbindet DeepSeek, GLM, MiniMax, Kimi und weitere führende Modelle.",
-        "registration": "Kostenlos registrieren und einen API-Schlüssel erhalten.",
-        "cta": "Kostenlosen API-Schlüssel erhalten",
-        "externalLabel": "Kostenlosen TokenRhythm-API-Schlüssel erhalten (wird in einem neuen Tab geöffnet)"
+        "value": "TokenRhythm-API-Aufrufe sind für kurze Zeit kostenlos.",
+        "registration": "Während der Aktion registrieren, API-Schlüssel erhalten und DeepSeek, GLM, MiniMax, Kimi und weitere führende Modelle kostenlos aufrufen.",
+        "cta": "Registrieren und API-Schlüssel erhalten",
+        "externalLabel": "Registrieren und API-Schlüssel erhalten — TokenRhythm (wird in einem neuen Tab geöffnet)",
+        "stepsLabel": "TokenRhythm verbinden",
+        "stepRegister": "TokenRhythm-Konto erstellen",
+        "stepCopy": "API-Schlüssel kopieren",
+        "stepPaste": "Unten in das API-Schlüsselfeld einfügen",
+        "stepSelectAndPaste": "Oben TokenRhythm auswählen und dann den API-Schlüssel einfügen",
+        "stepReplaceAndPaste": "Unten „Schlüssel ersetzen“ wählen und dann den API-Schlüssel einfügen"
       },
       "advanced": "Erweiterte Anbieteroptionen",
       "timeoutLabel": "Anfrage-Timeout (Sekunden)",

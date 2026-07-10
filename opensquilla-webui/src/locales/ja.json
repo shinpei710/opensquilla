@@ -234,10 +234,16 @@
       "chooseToSeeFields": "必須項目を表示するにはプロバイダーを選択してください。",
       "recommendation": {
         "title": "おすすめ: TokenRhythm",
-        "value": "1つの API キーで DeepSeek、GLM、MiniMax、Kimi などの主要モデルに接続できます。",
-        "registration": "無料登録して API キーを取得できます。",
-        "cta": "無料で API キーを取得",
-        "externalLabel": "TokenRhythm の無料 API キーを取得（新しいタブで開きます）"
+        "value": "TokenRhythm API は期間限定で無料です。",
+        "registration": "キャンペーン期間中に登録して API キーを取得すると、DeepSeek、GLM、MiniMax、Kimi などの主要モデルを無料で利用できます。",
+        "cta": "登録して API キーを取得",
+        "externalLabel": "登録して API キーを取得 — TokenRhythm（新しいタブで開きます）",
+        "stepsLabel": "TokenRhythm の接続方法",
+        "stepRegister": "TokenRhythm アカウントを登録",
+        "stepCopy": "API キーをコピー",
+        "stepPaste": "下の API キー入力欄に貼り付け",
+        "stepSelectAndPaste": "上で TokenRhythm を選択してから、API キーを貼り付け",
+        "stepReplaceAndPaste": "下の「キーを変更」を選択してから、API キーを貼り付け"
       },
       "advanced": "プロバイダーの詳細オプション",
       "timeoutLabel": "リクエストのタイムアウト（秒）",

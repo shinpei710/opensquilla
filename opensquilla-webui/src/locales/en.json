@@ -234,10 +234,16 @@
       "chooseToSeeFields": "Choose a provider to see required fields.",
       "recommendation": {
         "title": "Recommended: TokenRhythm",
-        "value": "One API key connects DeepSeek, GLM, MiniMax, Kimi, and other leading models.",
-        "registration": "Register free and get an API key.",
-        "cta": "Get a free API key",
-        "externalLabel": "Get a free TokenRhythm API key (opens in a new tab)"
+        "value": "TokenRhythm API calls are free for a limited time.",
+        "registration": "During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.",
+        "cta": "Register and get an API key",
+        "externalLabel": "Register and get an API key — TokenRhythm (opens in a new tab)",
+        "stepsLabel": "How to connect TokenRhythm",
+        "stepRegister": "Create a TokenRhythm account",
+        "stepCopy": "Copy your API key",
+        "stepPaste": "Paste it into the API key field below",
+        "stepSelectAndPaste": "Select TokenRhythm above, then paste your API key",
+        "stepReplaceAndPaste": "Choose Replace key below, then paste your API key"
       },
       "advanced": "Advanced provider options",
       "timeoutLabel": "Request timeout (seconds)",
