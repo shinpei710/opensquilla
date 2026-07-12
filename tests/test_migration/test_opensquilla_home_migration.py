@@ -336,7 +336,7 @@ def test_apply_imports_home_with_transforms(tmp_path: Path) -> None:
     assert DUMMY_INLINE_KEY not in json.dumps(report)
 
 
-def test_imported_config_and_env_are_owner_only_even_without_secret_rewrite(
+def test_imported_config_and_env_use_owner_only_posix_modes_when_supported(
     tmp_path: Path,
 ) -> None:
     source = _build_source_home(tmp_path)
@@ -351,8 +351,9 @@ def test_imported_config_and_env_are_owner_only_even_without_secret_rewrite(
     report = _run(source, target, apply=True)
 
     assert not _errors(report)
-    assert (target / "config.toml").stat().st_mode & 0o777 == 0o600
-    assert (target / ".env").stat().st_mode & 0o777 == 0o600
+    if os.name != "nt":
+        assert (target / "config.toml").stat().st_mode & 0o777 == 0o600
+        assert (target / ".env").stat().st_mode & 0o777 == 0o600
 
 
 def test_read_only_source_directories_produce_writable_imported_runtime(
@@ -367,9 +368,10 @@ def test_read_only_source_directories_produce_writable_imported_runtime(
     report = _run(source, target, apply=True)
 
     assert not _errors(report)
-    assert (target / "state").stat().st_mode & 0o700 == 0o700
-    assert (target / "workspace").stat().st_mode & 0o700 == 0o700
-    assert (target / "state" / "sessions.db").stat().st_mode & 0o600 == 0o600
+    if os.name != "nt":
+        assert (target / "state").stat().st_mode & 0o700 == 0o700
+        assert (target / "workspace").stat().st_mode & 0o700 == 0o700
+        assert (target / "state" / "sessions.db").stat().st_mode & 0o600 == 0o600
     connection = sqlite3.connect(target / "state" / "sessions.db")
     try:
         connection.execute("CREATE TABLE writable_after_import (id INTEGER)")
