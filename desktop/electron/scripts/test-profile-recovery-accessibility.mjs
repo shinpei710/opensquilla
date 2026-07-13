@@ -30,6 +30,8 @@ const LOCALES = {
     continueRecovery: 'Continue recovery profile',
     createRecovery: 'Create recovery profile',
     retryPrimary: 'Retry primary profile',
+    cleanupRecoveryTitle: 'A data cleanup stopped partway through',
+    abandonCleanup: 'Preserve remaining data and continue',
   },
   'zh-Hans': {
     title: '正在启动 OpenSquilla',
@@ -38,6 +40,8 @@ const LOCALES = {
     continueRecovery: '继续恢复配置',
     createRecovery: '创建恢复配置',
     retryPrimary: '重试主配置',
+    cleanupRecoveryTitle: '数据清理在中途停止',
+    abandonCleanup: '保留剩余数据并继续',
   },
   ja: {
     title: 'OpenSquilla を起動しています',
@@ -46,6 +50,8 @@ const LOCALES = {
     continueRecovery: '復旧プロファイルを続行',
     createRecovery: '復旧プロファイルを作成',
     retryPrimary: 'プライマリを再試行',
+    cleanupRecoveryTitle: 'データのクリーンアップが途中で停止しました',
+    abandonCleanup: '残りのデータを保持して続行',
   },
   fr: {
     title: "Démarrage d'OpenSquilla",
@@ -54,6 +60,8 @@ const LOCALES = {
     continueRecovery: 'Continuer ce profil',
     createRecovery: 'Créer un profil de récupération',
     retryPrimary: 'Réessayer le profil principal',
+    cleanupRecoveryTitle: 'Un nettoyage des données s’est arrêté en cours de route',
+    abandonCleanup: 'Conserver les données restantes et continuer',
   },
   de: {
     title: 'OpenSquilla wird gestartet',
@@ -62,6 +70,8 @@ const LOCALES = {
     continueRecovery: 'Profil fortsetzen',
     createRecovery: 'Wiederherstellungsprofil erstellen',
     retryPrimary: 'Hauptprofil erneut prüfen',
+    cleanupRecoveryTitle: 'Eine Datenbereinigung wurde unterbrochen',
+    abandonCleanup: 'Verbleibende Daten behalten und fortfahren',
   },
   es: {
     title: 'Iniciando OpenSquilla',
@@ -70,6 +80,8 @@ const LOCALES = {
     continueRecovery: 'Continuar perfil de recuperación',
     createRecovery: 'Crear perfil de recuperación',
     retryPrimary: 'Reintentar perfil principal',
+    cleanupRecoveryTitle: 'Una limpieza de datos se detuvo a mitad de camino',
+    abandonCleanup: 'Conservar los datos restantes y continuar',
   },
 }
 
@@ -208,6 +220,10 @@ async function createFixture(locale, blockingCase) {
   if (blockingCase.fixture === 'unfinished-transaction') {
     journalPath = join(userData, '.opensquilla.profile-replace.json')
     journalBytes = '{"schema_version":1,"phase":"prepared"}\n'
+    await writeFile(journalPath, journalBytes, 'utf8')
+  } else if (blockingCase.fixture === 'cleanup-transaction') {
+    journalPath = join(userData, '.opensquilla.profile-cleanup.json')
+    journalBytes = 'synthetic interrupted cleanup authority\n'
     await writeFile(journalPath, journalBytes, 'utf8')
   }
   await writeFile(join(userData, 'desktop-locale'), locale, 'utf8')
@@ -368,6 +384,7 @@ async function assertLocalizedRecovery(page, locale, expected) {
 
 const completedLocales = []
 const completedBlockingCodes = []
+const completedCleanupLocales = []
 for (const [locale, expected] of Object.entries(LOCALES)) {
   const blockingCase = BLOCKING_CASES[locale]
   assert(blockingCase, `missing blocking fixture for ${locale}`)
@@ -383,6 +400,34 @@ for (const [locale, expected] of Object.entries(LOCALES)) {
     )
     assert.equal(await page.locator('#recoveryCode').innerText(), blockingCase.stableCode)
     await assertLocalizedRecovery(page, locale, expected)
+
+    const originalRecoveryState = await page.evaluate(() => (
+      window.opensquillaDesktop.getRecoveryState()
+    ))
+    await page.evaluate((state) => {
+      window.renderRecoveryState({
+        ...state,
+        blocked: true,
+        inspection: {
+          ...state.inspection,
+          outcome: 'recovery_required',
+          stable_code: 'cleanup_transaction_incomplete',
+          allowed_actions: [
+            'abandon-cleanup',
+            'continue-recovery-profile',
+            'create-recovery-profile',
+            'retry-primary-profile',
+            'show-backups',
+            'copy-diagnostics',
+          ],
+        },
+      }, false)
+    }, originalRecoveryState)
+    assert.equal(await page.locator('#recoveryTitle').innerText(), expected.cleanupRecoveryTitle)
+    assert.equal(await page.locator('#abandonCleanup').innerText(), expected.abandonCleanup)
+    assert.equal(await page.locator('#cleanupAbandonGroup').getAttribute('hidden'), null)
+    completedCleanupLocales.push(locale)
+    await page.evaluate((state) => window.renderRecoveryState(state, true), originalRecoveryState)
 
     if (locale === 'en') await assertReducedMotion(page)
 
@@ -433,10 +478,41 @@ for (const [locale, expected] of Object.entries(LOCALES)) {
 }
 
 assert.deepEqual(completedLocales, Object.keys(LOCALES))
+assert.deepEqual(completedCleanupLocales, Object.keys(LOCALES))
 assert.deepEqual(
   completedBlockingCodes,
   Object.values(BLOCKING_CASES).map((item) => item.stableCode),
 )
+
+// A real compiled Electron launch also covers the cleanup-specific recovery
+// state. The destructive action itself is not activated here (the native
+// confirmation is intentionally outside renderer automation); keyboard focus,
+// localized explanation, ARIA region, and the untouched primary bytes are.
+const cleanupFixture = await createFixture('en', {
+  fixture: 'cleanup-transaction',
+  stableCode: 'cleanup_transaction_incomplete',
+})
+let cleanupApp
+try {
+  cleanupApp = await launchFixture(cleanupFixture)
+  const cleanupPage = await recoveryPage(cleanupApp)
+  assert.equal(await cleanupPage.locator('#recoveryCode').innerText(), 'cleanup_transaction_incomplete')
+  assert.equal(await cleanupPage.locator('#recoveryTitle').innerText(), LOCALES.en.cleanupRecoveryTitle)
+  assert.equal(await cleanupPage.locator('#cleanupAbandonGroup').getAttribute('hidden'), null)
+  assert.equal(await cleanupPage.locator('#abandonCleanup').innerText(), LOCALES.en.abandonCleanup)
+  assert.equal(await cleanupPage.locator('#recoveryPanel').getAttribute('role'), 'region')
+  assert.equal(await cleanupPage.locator('#recoveryStatus').getAttribute('aria-live'), 'polite')
+  await tabTo(cleanupPage, 'abandonCleanup')
+  assert.equal(await cleanupPage.evaluate(() => document.activeElement?.id), 'abandonCleanup')
+  assert.deepEqual(await snapshotTree(cleanupFixture.primaryHome), cleanupFixture.primaryBefore)
+  assert.equal(
+    await readFile(cleanupFixture.journalPath, 'utf8'),
+    cleanupFixture.journalBytes,
+  )
+} finally {
+  await cleanupApp?.close().catch(() => {})
+  await rm(cleanupFixture.root, { recursive: true, force: true }).catch(() => {})
+}
 console.log(JSON.stringify({
   ok: true,
   locales: completedLocales,
@@ -444,4 +520,5 @@ console.log(JSON.stringify({
   keyboardContinueVerified: true,
   primaryBytesUnchanged: true,
   reducedMotionVerified: true,
+  cleanupAbandonKeyboardVerified: true,
 }))

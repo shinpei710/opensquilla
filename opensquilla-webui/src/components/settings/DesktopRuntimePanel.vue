@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, shallowRef } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import GatewayStatusBlock from '@/components/settings/GatewayStatusBlock.vue'
@@ -22,9 +22,9 @@ import {
 const { t, locale } = useI18n()
 
 // Desktop-only Runtime section of the shared SettingsDialog. The desktop app
-// owns its local gateway process, so this surfaces its status/log/restart and
-// the "reset saved setup" escape hatch — the controls the old standalone
-// DesktopSettingsView carried. Web never renders this (desktopOnly section).
+// owns its local gateway process, so this surfaces status/log/restart plus the
+// inventory-driven profile cleanup flow. Web never renders this (desktopOnly
+// section).
 const platform = usePlatform()
 const { confirm } = useConfirm()
 const { pushToast } = useToasts()
@@ -54,14 +54,47 @@ const logHint = computed(() => gateway.value?.logPath || t('setup.runtime.noLogP
 // the optional methods actually being wired instead.
 const canRevealLog = computed(() => Boolean(platform.gateway.revealLog))
 const canRestart = computed(() => Boolean(platform.gateway.retryStartup))
-const canReset = computed(() => Boolean(platform.settings.resetDesktopSettings))
 
-// Desktop data cleanup is wired directly on the desktop preload bridge
-// (desktop-only, self-contained — it shells out to `opensquilla uninstall` in
-// the Python core). It does not remove the installed app bundle itself.
-interface UninstallBridge {
-  uninstallRun?: (payload: { purgeData: boolean }) => Promise<{ ok: boolean; aborted?: boolean; detail?: string }>
-  quitApp?: () => Promise<unknown>
+type CleanupMode = 'reset-current-settings' | 'delete-current-profile' | 'delete-all-user-data'
+interface CleanupItem {
+  kind: string
+  path: string
+  exists: boolean
+  identity: string | null
+}
+interface CleanupReport {
+  schema_version: 1
+  outcome: 'ready' | 'blocked' | 'complete' | 'partial'
+  stable_code: string
+  mode: CleanupMode
+  items: CleanupItem[]
+  transaction_id: string
+  revision: number
+  scope_fingerprint: string
+}
+interface CleanupBridge {
+  inspectDesktopCleanup?: (payload: { mode: CleanupMode }) => Promise<{
+    ok: boolean
+    previewId: string | null
+    report: CleanupReport
+    profile: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+  }>
+  discardDesktopCleanup?: (payload: { previewId: string }) => Promise<boolean>
+  applyDesktopCleanup?: (payload: {
+    previewId: string
+    acknowledged: boolean
+    confirmation: string
+  }) => Promise<{
+    ok: boolean
+    aborted?: boolean
+    scheduled?: boolean
+    partial?: boolean
+    previewId?: string | null
+    report?: CleanupReport
+    profile?: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+    detail?: string
+  }>
+  revealDesktopUserData?: () => Promise<boolean>
 }
 
 // Legacy-home import rides the same preload bridge (also desktop-only and
@@ -126,9 +159,13 @@ const MANUAL_MIGRATION_SOURCE_KINDS: ProfileSourceKind[] = [
 ]
 
 const desktopBridge = (
-  globalThis as unknown as { opensquillaDesktop?: UninstallBridge & MigrationBridge }
+  globalThis as unknown as { opensquillaDesktop?: CleanupBridge & MigrationBridge }
 ).opensquillaDesktop
-const canUninstall = computed(() => Boolean(desktopBridge?.uninstallRun))
+const canCleanup = computed(() => Boolean(
+  desktopBridge?.inspectDesktopCleanup
+  && desktopBridge?.discardDesktopCleanup
+  && desktopBridge?.applyDesktopCleanup,
+))
 const canMigrate = computed(
   () => Boolean(desktopBridge?.migrationSummary && desktopBridge?.migrationRun),
 )
@@ -168,62 +205,178 @@ async function restartGateway() {
   }
 }
 
-async function resetSetup() {
-  if (!platform.settings.resetDesktopSettings) return
-  const ok = await confirm({
-    title: t('setup.runtime.resetConfirmTitle'),
-    body: t('setup.runtime.resetConfirmBody'),
-    primaryLabel: t('setup.runtime.resetConfirmPrimary'),
-  })
-  if (!ok) return
-  busy.value = true
+const cleanupOpen = ref(false)
+const cleanupBusy = ref(false)
+const cleanupPreviewId = ref('')
+const cleanupReport = shallowRef<CleanupReport | null>(null)
+const cleanupProfile = ref<{ kind: 'primary' | 'recovery'; recoveryId: string | null } | null>(null)
+const cleanupAcknowledged = ref(false)
+const cleanupConfirmation = ref('')
+const cleanupTitleEl = ref<HTMLElement | null>(null)
+const cleanupReturnFocusEl = ref<HTMLElement | null>(null)
+const DELETE_ALL_CONFIRMATION = 'DELETE ALL OPENSQUILLA DATA'
+
+const cleanupExistingCount = computed(() => (
+  cleanupReport.value?.items.filter((item) => item.exists).length ?? 0
+))
+const cleanupNeedsAcknowledgement = computed(() => (
+  cleanupReport.value?.outcome === 'ready'
+  && Boolean(cleanupPreviewId.value)
+  && cleanupReport.value?.mode !== 'reset-current-settings'
+))
+const cleanupCanApply = computed(() => {
+  const report = cleanupReport.value
+  if (!report || report.outcome !== 'ready' || !cleanupPreviewId.value) return false
+  if (cleanupNeedsAcknowledgement.value && !cleanupAcknowledged.value) return false
+  return report.mode !== 'delete-all-user-data'
+    || cleanupConfirmation.value === DELETE_ALL_CONFIRMATION
+})
+const cleanupModeTitle = computed(() => {
+  const mode = cleanupReport.value?.mode
+  return mode ? t(`setup.runtime.cleanup.${mode}.title`) : ''
+})
+const cleanupModeWarning = computed(() => {
+  const mode = cleanupReport.value?.mode
+  return mode ? t(`setup.runtime.cleanup.${mode}.warning`) : ''
+})
+const cleanupApplyLabel = computed(() => {
+  const mode = cleanupReport.value?.mode
+  return mode ? t(`setup.runtime.cleanup.${mode}.apply`) : ''
+})
+
+async function openCleanup(mode: CleanupMode, trigger?: EventTarget | null) {
+  if (!desktopBridge?.inspectDesktopCleanup) return
+  if (trigger instanceof HTMLElement) cleanupReturnFocusEl.value = trigger
+  cleanupBusy.value = true
+  cleanupOpen.value = false
+  cleanupPreviewId.value = ''
+  cleanupReport.value = null
+  cleanupAcknowledged.value = false
+  cleanupConfirmation.value = ''
   try {
-    await platform.settings.resetDesktopSettings()
-    pushToast(t('setup.runtime.resetDone'))
+    const result = await desktopBridge.inspectDesktopCleanup({ mode })
+    cleanupReport.value = result.report
+    cleanupProfile.value = result.profile
+    cleanupPreviewId.value = result.previewId || ''
+    cleanupOpen.value = true
+    await nextTick()
+    cleanupTitleEl.value?.focus()
   } catch (err) {
-    pushToast(t('setup.runtime.resetFailed', { error: err instanceof Error ? err.message : String(err) }), { tone: 'danger' })
+    pushToast(t('setup.runtime.cleanup.inspectFailed', {
+      detail: err instanceof Error ? err.message : String(err),
+    }), { tone: 'danger' })
   } finally {
-    busy.value = false
+    cleanupBusy.value = false
   }
 }
 
-async function uninstall(purgeData: boolean) {
-  if (!desktopBridge?.uninstallRun) return
-  const ok = await confirm(
-    purgeData
-      ? {
-          title: t('setup.runtime.uninstallPurgeTitle'),
-          body: t('setup.runtime.uninstallPurgeBody'),
-          primaryLabel: t('setup.runtime.uninstallPurgePrimary'),
-        }
-      : {
-          title: t('setup.runtime.uninstallConfirmTitle'),
-          body: t('setup.runtime.uninstallConfirmBody'),
-          primaryLabel: t('setup.runtime.uninstallConfirmPrimary'),
-        },
-  )
-  if (!ok) return
-  busy.value = true
+function clearCleanupState() {
+  cleanupOpen.value = false
+  cleanupPreviewId.value = ''
+  cleanupReport.value = null
+  cleanupProfile.value = null
+  cleanupAcknowledged.value = false
+  cleanupConfirmation.value = ''
+}
+
+async function closeCleanupAndRestoreFocus() {
+  const returnFocus = cleanupReturnFocusEl.value
+  clearCleanupState()
+  cleanupReturnFocusEl.value = null
+  await nextTick()
+  returnFocus?.focus()
+}
+
+async function cancelCleanup() {
+  const previewId = cleanupPreviewId.value
+  if (previewId && desktopBridge?.discardDesktopCleanup) {
+    cleanupBusy.value = true
+    try {
+      await desktopBridge.discardDesktopCleanup({ previewId })
+    } catch (err) {
+      pushToast(t('setup.runtime.cleanup.applyFailed', {
+        detail: err instanceof Error ? err.message : String(err),
+      }), { tone: 'danger' })
+      cleanupBusy.value = false
+      return
+    }
+    cleanupBusy.value = false
+  }
+  await closeCleanupAndRestoreFocus()
+}
+
+async function presentCleanupResult(result: {
+  previewId?: string | null
+  report?: CleanupReport
+  profile?: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+}) {
+  if (result.report) cleanupReport.value = result.report
+  cleanupPreviewId.value = result.previewId || ''
+  if (result.profile) cleanupProfile.value = result.profile
+  cleanupAcknowledged.value = false
+  cleanupConfirmation.value = ''
+  cleanupOpen.value = Boolean(cleanupReport.value)
+  await nextTick()
+  cleanupTitleEl.value?.focus()
+}
+
+async function revealCleanupLocation() {
+  if (!desktopBridge?.revealDesktopUserData) return
   try {
-    const result = await desktopBridge.uninstallRun({ purgeData })
-    if (result?.aborted) {
-      // Cancelled at the native dialog, or refused (e.g. a gateway still running).
-      // Not an error — surface the reason only when it is informative.
-      if (result.detail && result.detail !== 'cancelled') {
-        pushToast(result.detail, { tone: 'danger' })
-      }
-      return
-    }
-    if (!result?.ok) {
-      pushToast(t('setup.runtime.uninstallFailed', { detail: result?.detail || t('setup.runtime.uninstallCheckLog') }), { tone: 'danger' })
-      return
-    }
-    pushToast(t('setup.runtime.uninstallDone'))
-    await desktopBridge.quitApp?.()
+    await desktopBridge.revealDesktopUserData()
   } catch (err) {
-    pushToast(t('setup.runtime.uninstallFailed', { detail: err instanceof Error ? err.message : String(err) }), { tone: 'danger' })
+    pushToast(t('setup.runtime.cleanup.revealFailed', {
+      detail: err instanceof Error ? err.message : String(err),
+    }), { tone: 'danger' })
+  }
+}
+
+async function applyCleanup() {
+  const report = cleanupReport.value
+  if (!desktopBridge?.applyDesktopCleanup || !report || !cleanupCanApply.value) return
+  if (report.mode === 'reset-current-settings') {
+    const approved = await confirm({
+      title: t('setup.runtime.cleanup.resetConfirmTitle'),
+      body: t('setup.runtime.cleanup.resetConfirmBody'),
+      primaryLabel: cleanupApplyLabel.value,
+    })
+    if (!approved) return
+  }
+  cleanupBusy.value = true
+  try {
+    const result = await desktopBridge.applyDesktopCleanup({
+      previewId: cleanupPreviewId.value,
+      acknowledged: cleanupAcknowledged.value,
+      confirmation: cleanupConfirmation.value,
+    })
+    if (result.aborted) {
+      await presentCleanupResult(result)
+      return
+    }
+    if (!result.ok) {
+      await presentCleanupResult(result)
+      pushToast(t(
+        result.partial
+          ? 'setup.runtime.cleanup.partial'
+          : 'setup.runtime.cleanup.applyFailed',
+        { detail: result.detail || result.report?.stable_code || '' },
+      ), { tone: 'danger' })
+      return
+    }
+    pushToast(t(
+      result.scheduled
+        ? 'setup.runtime.cleanup.deleteAllScheduled'
+        : report.mode === 'reset-current-settings'
+          ? 'setup.runtime.cleanup.resetDone'
+          : 'setup.runtime.cleanup.deleteDone',
+    ))
+    await closeCleanupAndRestoreFocus()
+  } catch (err) {
+    pushToast(t('setup.runtime.cleanup.applyFailed', {
+      detail: err instanceof Error ? err.message : String(err),
+    }), { tone: 'danger' })
   } finally {
-    busy.value = false
+    cleanupBusy.value = false
   }
 }
 
@@ -578,18 +731,6 @@ onUnmounted(unsubscribeMigrationProgress)
 
     <SettingsUpdatePanel />
 
-    <div v-if="canReset" class="control-row">
-      <div class="control-row__label-block">
-        <span class="control-row__label">{{ t('setup.runtime.resetLabel') }}</span>
-        <span class="control-row__desc">{{ t('setup.runtime.resetDesc') }}</span>
-      </div>
-      <div class="control-row__control">
-        <button type="button" class="btn btn--ghost runtime-reset" :disabled="busy" @click="resetSetup">
-          {{ t('setup.runtime.resetButton') }}
-        </button>
-      </div>
-    </div>
-
     <div
       v-if="migrationLastResult?.ok"
       class="migration-complete"
@@ -619,7 +760,6 @@ onUnmounted(unsubscribeMigrationProgress)
         </button>
       </div>
     </div>
-
     <div v-if="canMigrate" class="control-row">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('setup.runtime.migrationLabel') }}</span>
@@ -811,20 +951,143 @@ onUnmounted(unsubscribeMigrationProgress)
       </template>
     </div>
 
-    <div v-if="canUninstall" class="control-row danger-zone">
+    <div v-if="canCleanup" class="control-row danger-zone">
       <div class="control-row__label-block">
-        <span class="control-row__label">{{ t('setup.runtime.uninstallLabel') }}</span>
-        <span class="control-row__desc">{{ t('setup.runtime.uninstallDesc') }}</span>
+        <span class="control-row__label">{{ t('setup.runtime.cleanup.label') }}</span>
+        <span class="control-row__desc">{{ t('setup.runtime.cleanup.desc') }}</span>
       </div>
-      <div class="control-row__control danger-zone__actions">
-        <button type="button" class="btn btn--ghost runtime-reset" :disabled="busy" @click="uninstall(false)">
-          {{ t('setup.runtime.uninstallKeepData') }}
+      <div
+        class="control-row__control danger-zone__actions"
+        role="group"
+        :aria-label="t('setup.runtime.cleanup.actionsLabel')"
+      >
+        <button
+          type="button"
+          class="btn btn--ghost"
+          :disabled="busy || cleanupBusy"
+          data-testid="runtime-cleanup-reset"
+          @click="openCleanup('reset-current-settings', $event.currentTarget)"
+        >
+          {{ t('setup.runtime.cleanup.resetAction') }}
         </button>
-        <button type="button" class="btn btn--ghost runtime-reset" :disabled="busy" @click="uninstall(true)">
-          {{ t('setup.runtime.uninstallPurge') }}
+        <button
+          type="button"
+          class="btn btn--ghost runtime-reset"
+          :disabled="busy || cleanupBusy"
+          data-testid="runtime-cleanup-profile"
+          @click="openCleanup('delete-current-profile', $event.currentTarget)"
+        >
+          {{ t('setup.runtime.cleanup.profileAction') }}
+        </button>
+        <button
+          type="button"
+          class="btn btn--ghost runtime-reset"
+          :disabled="busy || cleanupBusy"
+          data-testid="runtime-cleanup-all"
+          @click="openCleanup('delete-all-user-data', $event.currentTarget)"
+        >
+          {{ t('setup.runtime.cleanup.allAction') }}
         </button>
       </div>
     </div>
+
+    <section
+      v-if="cleanupOpen && cleanupReport"
+      class="cleanup-summary"
+      aria-labelledby="cleanup-summary-title"
+      data-testid="runtime-cleanup-summary"
+    >
+      <div class="cleanup-summary__head">
+        <h4 id="cleanup-summary-title" ref="cleanupTitleEl" tabindex="-1">
+          {{ cleanupModeTitle }}
+        </h4>
+        <span class="cleanup-summary__profile">
+          {{ cleanupProfile?.kind === 'recovery'
+            ? t('setup.runtime.cleanup.recoveryProfile')
+            : t('setup.runtime.cleanup.primaryProfile') }}
+        </span>
+      </div>
+      <p class="cleanup-summary__warning">{{ cleanupModeWarning }}</p>
+      <p class="cleanup-summary__count">
+        {{ t('setup.runtime.cleanup.inventoryCount', {
+          existing: cleanupExistingCount,
+          total: cleanupReport.items.length,
+        }) }}
+      </p>
+      <ul class="cleanup-summary__items" :aria-label="t('setup.runtime.cleanup.inventoryLabel')">
+        <li v-for="item in cleanupReport.items" :key="`${item.kind}:${item.path}`">
+          <span class="cleanup-summary__item-kind">{{ item.kind }}</span>
+          <code>{{ item.path }}</code>
+          <span :class="item.exists ? 'cleanup-summary__present' : 'cleanup-summary__missing'">
+            {{ item.exists
+              ? t('setup.runtime.cleanup.present')
+              : t('setup.runtime.cleanup.missing') }}
+          </span>
+        </li>
+      </ul>
+      <div
+        v-if="cleanupReport.outcome === 'blocked'"
+        class="cleanup-summary__blocked"
+        role="alert"
+      >
+        <strong>{{ t('setup.runtime.cleanup.blocked') }}</strong>
+        <code>{{ cleanupReport.stable_code }}</code>
+        <p>{{ t('setup.runtime.cleanup.blockedHelp') }}</p>
+      </div>
+      <label v-if="cleanupNeedsAcknowledgement" class="cleanup-summary__ack">
+        <input v-model="cleanupAcknowledged" type="checkbox" />
+        <span>{{ t('setup.runtime.cleanup.acknowledge') }}</span>
+      </label>
+      <label
+        v-if="cleanupReport.outcome === 'ready' && cleanupPreviewId && cleanupReport.mode === 'delete-all-user-data'"
+        class="cleanup-summary__phrase"
+      >
+        <span>{{ t('setup.runtime.cleanup.typePhrase', { phrase: DELETE_ALL_CONFIRMATION }) }}</span>
+        <input
+          v-model="cleanupConfirmation"
+          type="text"
+          autocomplete="off"
+          spellcheck="false"
+          :aria-label="t('setup.runtime.cleanup.phraseLabel')"
+        />
+      </label>
+      <div class="cleanup-summary__actions">
+        <button type="button" class="btn btn--ghost" :disabled="cleanupBusy" @click="revealCleanupLocation">
+          {{ t('setup.runtime.cleanup.showLocation') }}
+        </button>
+        <button
+          type="button"
+          class="btn btn--ghost"
+          :disabled="cleanupBusy"
+          data-testid="runtime-cleanup-cancel"
+          @click="cancelCleanup"
+        >
+          {{ t('setup.runtime.cleanup.cancel') }}
+        </button>
+        <button
+          v-if="cleanupReport.outcome === 'ready' && cleanupPreviewId"
+          type="button"
+          class="btn"
+          :disabled="cleanupBusy || !cleanupCanApply"
+          data-testid="runtime-cleanup-apply"
+          @click="applyCleanup"
+        >
+          {{ cleanupApplyLabel }}
+        </button>
+        <button
+          v-else
+          type="button"
+          class="btn"
+          :disabled="cleanupBusy"
+          @click="openCleanup(cleanupReport.mode)"
+        >
+          {{ t('setup.runtime.cleanup.retry') }}
+        </button>
+      </div>
+      <p class="cleanup-summary__status" role="status" aria-live="polite">
+        {{ cleanupBusy ? t('setup.runtime.cleanup.working') : '' }}
+      </p>
+    </section>
   </section>
 </template>
 
@@ -870,6 +1133,113 @@ onUnmounted(unsubscribeMigrationProgress)
   display: flex;
   flex-wrap: wrap;
   gap: var(--sp-2);
+}
+
+.cleanup-summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-3);
+  padding: var(--sp-3);
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+}
+
+.cleanup-summary__head,
+.cleanup-summary__actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.cleanup-summary__head h4,
+.cleanup-summary__warning,
+.cleanup-summary__count,
+.cleanup-summary__blocked p,
+.cleanup-summary__status {
+  margin: 0;
+}
+
+.cleanup-summary__head h4:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.cleanup-summary__profile,
+.cleanup-summary__count,
+.cleanup-summary__missing {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.cleanup-summary__warning,
+.cleanup-summary__blocked,
+.cleanup-summary__present {
+  color: var(--danger);
+}
+
+.cleanup-summary__items {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+  max-height: 240px;
+  overflow: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.cleanup-summary__items li {
+  display: grid;
+  grid-template-columns: minmax(110px, auto) minmax(160px, 1fr) auto;
+  align-items: baseline;
+  gap: var(--sp-2);
+  font-size: var(--fs-xs);
+}
+
+.cleanup-summary__items code {
+  overflow-wrap: anywhere;
+}
+
+.cleanup-summary__item-kind {
+  font-weight: 650;
+}
+
+.cleanup-summary__blocked {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding: var(--sp-2);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--danger) 8%, transparent);
+}
+
+.cleanup-summary__ack,
+.cleanup-summary__phrase {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  font-size: var(--fs-sm);
+}
+
+.cleanup-summary__phrase {
+  flex-direction: column;
+}
+
+.cleanup-summary__phrase input {
+  width: min(100%, 420px);
+}
+
+@media (max-width: 640px) {
+  .cleanup-summary__items li {
+    grid-template-columns: 1fr auto;
+  }
+
+  .cleanup-summary__items code {
+    grid-column: 1 / -1;
+  }
 }
 
 /* Inline source selection, dry-run summary, and confirmation. */

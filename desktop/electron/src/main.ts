@@ -1,6 +1,6 @@
 import { app, BrowserWindow, clipboard, dialog, Menu, ipcMain, nativeTheme, safeStorage, shell } from 'electron'
 import electronUpdater from 'electron-updater'
-import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { appendFileSync, createWriteStream, existsSync, lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { access, constants, readFile, readdir, rename, rm, stat, unlink, writeFile } from 'node:fs/promises'
@@ -23,6 +23,18 @@ import {
 } from './desktop-profile-context.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
 import { buildCliInvocation } from './cli-invocation.js'
+import {
+  cleanupSelectorArgs,
+  desktopCleanupScopeIsContained,
+  DesktopCleanupPreviewStore,
+  parseDesktopCleanupMode,
+  parseDesktopCleanupProtocol,
+  sameDesktopCleanupScope,
+  type DesktopCleanupMode,
+  type DesktopCleanupReport,
+  type DesktopCleanupSelection,
+  type TrustedDesktopCleanupPreview,
+} from './desktop-cleanup.js'
 import { secretStorageBackendForPolicy, shouldUseChromiumMockKeychainForPolicy } from './secret-storage-policy.js'
 import {
   GITHUB_UPDATE_OWNER,
@@ -279,6 +291,13 @@ let recoveryOperationBusy = false
 let recoveryOperationError: string | null = null
 let attentionPromptInFlight: Promise<void> | null = null
 let attentionPromptedThisSession = ''
+const desktopCleanupPreviews = new DesktopCleanupPreviewStore()
+let desktopCleanupBusy = false
+// Keep the post-exit delete-all helper and its open stdin pipe strongly
+// reachable until Electron exits. The pipe is unref'ed (so it cannot delay
+// exit) but must not be garbage-collected and closed while Chromium still owns
+// userData handles.
+let pendingDeleteAllHelper: ChildProcess | null = null
 const gatewayProcessTreeChildren = new WeakSet<ChildProcessWithoutNullStreams>()
 const desktopWriters = new DesktopWriterAdmission()
 let desktopOpenFlowRevision = 0
@@ -2093,18 +2112,6 @@ async function saveDesktopSettings(payload: DesktopSettingsPayload): Promise<Des
   return settingsSnapshot(connection)
 }
 
-async function resetDesktopSettings(): Promise<void> {
-  // Reset setup is intentionally non-destructive: preserve config.toml,
-  // workspace identity/memory, and state databases. Only the active profile's
-  // provider credential and primary onboarding bookkeeping are cleared.
-  await rm(credentialPath(), { force: true })
-  if (activeDesktopProfile().kind === 'primary') {
-    transientPendingMigrationProviderSetup = null
-    await rm(pendingMigrationProviderSetupPath(), { force: true })
-    await rm(desktopMigrationResultPath(), { force: true })
-  }
-}
-
 function clearReusableGatewayState(): void {
   gatewayState.url = ''
   gatewayState.port = 0
@@ -2454,6 +2461,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'uninstall.confirmDetail': 'Sessions, configuration, and secrets will be removed. The installed app itself will remain; remove it through your OS after the app closes.',
     'uninstall.cancel': 'Cancel',
     'uninstall.deleteEverything': 'Delete everything',
+    'cleanup.moreItems': 'more locations',
+    'cleanup.cancel': 'Cancel',
+    'cleanup.deleteProfileConfirm': 'Delete profile',
+    'cleanup.deleteProfileTitle': 'Delete the current profile?',
+    'cleanup.deleteProfileMessage': 'This permanently deletes the listed current profile data, credential, and logs. Other recovery profiles and backups are kept.',
+    'cleanup.deleteAllConfirm': 'Delete all data',
+    'cleanup.deleteAllTitle': 'Delete all OpenSquilla user data?',
+    'cleanup.deleteAllMessage': 'OpenSquilla will close first. The deletion starts only after the app and local runtime have fully exited.',
+    'cleanup.abandonConfirm': 'Preserve and continue',
+    'cleanup.abandonTitle': 'Leave the interrupted cleanup?',
+    'cleanup.abandonMessage': 'OpenSquilla will preserve every surviving file and archive only the cleanup transaction record.',
+    'cleanup.abandonDetail': 'Nothing else will be deleted. Review the remaining profile before continuing to use it.',
     'migration.nav.title': 'Import',
     'migration.nav.sub': 'Existing data',
     'migration.step.badge': 'Import',
@@ -2585,6 +2604,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'uninstall.confirmDetail': '会话、配置和密钥都将被移除。已安装的应用本身会保留；应用关闭后请通过操作系统将其卸载。',
     'uninstall.cancel': '取消',
     'uninstall.deleteEverything': '全部删除',
+    'cleanup.moreItems': '个其他位置',
+    'cleanup.cancel': '取消',
+    'cleanup.deleteProfileConfirm': '删除配置文件',
+    'cleanup.deleteProfileTitle': '删除当前配置文件？',
+    'cleanup.deleteProfileMessage': '这会永久删除列出的当前配置文件数据、凭据和日志。其他恢复配置文件和备份会保留。',
+    'cleanup.deleteAllConfirm': '删除全部数据',
+    'cleanup.deleteAllTitle': '删除全部 OpenSquilla 用户数据？',
+    'cleanup.deleteAllMessage': 'OpenSquilla 会先退出。只有应用和本地运行时完全退出后，删除才会开始。',
+    'cleanup.abandonConfirm': '保留并继续',
+    'cleanup.abandonTitle': '结束未完成的清理？',
+    'cleanup.abandonMessage': 'OpenSquilla 会保留所有仍存在的文件，仅归档清理事务记录。',
+    'cleanup.abandonDetail': '不会继续删除任何内容。继续使用前请检查剩余的配置文件。',
     'migration.nav.title': '导入',
     'migration.nav.sub': '现有数据',
     'migration.step.badge': '导入',
@@ -2714,6 +2745,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'uninstall.confirmDetail': 'セッション、設定、シークレットが削除されます。インストール済みのアプリ自体は残ります。アプリを閉じた後、OS から削除してください。',
     'uninstall.cancel': 'キャンセル',
     'uninstall.deleteEverything': 'すべて削除',
+    'cleanup.moreItems': '件のその他の場所',
+    'cleanup.cancel': 'キャンセル',
+    'cleanup.deleteProfileConfirm': 'プロファイルを削除',
+    'cleanup.deleteProfileTitle': '現在のプロファイルを削除しますか？',
+    'cleanup.deleteProfileMessage': '一覧の現在のプロファイルデータ、認証情報、ログを完全に削除します。他のリカバリープロファイルとバックアップは保持されます。',
+    'cleanup.deleteAllConfirm': 'すべてのデータを削除',
+    'cleanup.deleteAllTitle': 'OpenSquilla のすべてのユーザーデータを削除しますか？',
+    'cleanup.deleteAllMessage': 'OpenSquilla を先に終了します。アプリとローカルランタイムが完全に終了した後にのみ削除を開始します。',
+    'cleanup.abandonConfirm': '保持して続行',
+    'cleanup.abandonTitle': '中断したクリーンアップを終了しますか？',
+    'cleanup.abandonMessage': '残っているすべてのファイルを保持し、クリーンアップのトランザクション記録だけをアーカイブします。',
+    'cleanup.abandonDetail': 'これ以上は削除しません。使用を続ける前に残りのプロファイルを確認してください。',
     'migration.nav.title': 'インポート',
     'migration.nav.sub': '既存データ',
     'migration.step.badge': 'インポート',
@@ -2843,6 +2886,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'uninstall.confirmDetail': 'Les sessions, la configuration et les secrets seront supprimés. L’application installée elle-même sera conservée ; supprimez-la via votre système d’exploitation après la fermeture de l’application.',
     'uninstall.cancel': 'Annuler',
     'uninstall.deleteEverything': 'Tout supprimer',
+    'cleanup.moreItems': 'autres emplacements',
+    'cleanup.cancel': 'Annuler',
+    'cleanup.deleteProfileConfirm': 'Supprimer le profil',
+    'cleanup.deleteProfileTitle': 'Supprimer le profil actuel ?',
+    'cleanup.deleteProfileMessage': 'Cette action supprime définitivement les données, l’identifiant et les journaux listés du profil actuel. Les autres profils de récupération et sauvegardes sont conservés.',
+    'cleanup.deleteAllConfirm': 'Supprimer toutes les données',
+    'cleanup.deleteAllTitle': 'Supprimer toutes les données utilisateur OpenSquilla ?',
+    'cleanup.deleteAllMessage': 'OpenSquilla va d’abord se fermer. La suppression ne commence qu’après l’arrêt complet de l’application et de l’environnement local.',
+    'cleanup.abandonConfirm': 'Conserver et continuer',
+    'cleanup.abandonTitle': 'Quitter le nettoyage interrompu ?',
+    'cleanup.abandonMessage': 'OpenSquilla conserve tous les fichiers restants et archive uniquement l’enregistrement de transaction du nettoyage.',
+    'cleanup.abandonDetail': 'Aucun autre élément ne sera supprimé. Vérifiez le profil restant avant de continuer à l’utiliser.',
     'migration.nav.title': 'Importation',
     'migration.nav.sub': 'Données existantes',
     'migration.step.badge': 'Importation',
@@ -2972,6 +3027,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'uninstall.confirmDetail': 'Sitzungen, Konfiguration und Secrets werden entfernt. Die installierte App selbst bleibt erhalten; entfernen Sie sie nach dem Schließen der App über Ihr Betriebssystem.',
     'uninstall.cancel': 'Abbrechen',
     'uninstall.deleteEverything': 'Alles löschen',
+    'cleanup.moreItems': 'weitere Speicherorte',
+    'cleanup.cancel': 'Abbrechen',
+    'cleanup.deleteProfileConfirm': 'Profil löschen',
+    'cleanup.deleteProfileTitle': 'Aktuelles Profil löschen?',
+    'cleanup.deleteProfileMessage': 'Die aufgeführten Daten, Zugangsdaten und Protokolle des aktuellen Profils werden dauerhaft gelöscht. Andere Wiederherstellungsprofile und Sicherungen bleiben erhalten.',
+    'cleanup.deleteAllConfirm': 'Alle Daten löschen',
+    'cleanup.deleteAllTitle': 'Alle OpenSquilla-Benutzerdaten löschen?',
+    'cleanup.deleteAllMessage': 'OpenSquilla wird zuerst beendet. Die Löschung beginnt erst, wenn App und lokale Laufzeit vollständig beendet sind.',
+    'cleanup.abandonConfirm': 'Behalten und fortfahren',
+    'cleanup.abandonTitle': 'Unterbrochene Bereinigung verlassen?',
+    'cleanup.abandonMessage': 'OpenSquilla behält alle verbliebenen Dateien und archiviert nur den Transaktionsdatensatz der Bereinigung.',
+    'cleanup.abandonDetail': 'Es wird nichts weiter gelöscht. Prüfen Sie das verbleibende Profil, bevor Sie es weiter verwenden.',
     'migration.nav.title': 'Import',
     'migration.nav.sub': 'Vorhandene Daten',
     'migration.step.badge': 'Import',
@@ -3101,6 +3168,18 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'uninstall.confirmDetail': 'Se eliminarán las sesiones, la configuración y los secretos. La aplicación instalada en sí permanecerá; elimínala a través de tu sistema operativo después de cerrar la aplicación.',
     'uninstall.cancel': 'Cancelar',
     'uninstall.deleteEverything': 'Eliminar todo',
+    'cleanup.moreItems': 'ubicaciones adicionales',
+    'cleanup.cancel': 'Cancelar',
+    'cleanup.deleteProfileConfirm': 'Eliminar perfil',
+    'cleanup.deleteProfileTitle': '¿Eliminar el perfil actual?',
+    'cleanup.deleteProfileMessage': 'Esto elimina permanentemente los datos, la credencial y los registros enumerados del perfil actual. Se conservan otros perfiles de recuperación y copias de seguridad.',
+    'cleanup.deleteAllConfirm': 'Eliminar todos los datos',
+    'cleanup.deleteAllTitle': '¿Eliminar todos los datos de usuario de OpenSquilla?',
+    'cleanup.deleteAllMessage': 'OpenSquilla se cerrará primero. La eliminación solo comienza cuando la app y el entorno local hayan terminado por completo.',
+    'cleanup.abandonConfirm': 'Conservar y continuar',
+    'cleanup.abandonTitle': '¿Salir de la limpieza interrumpida?',
+    'cleanup.abandonMessage': 'OpenSquilla conserva todos los archivos restantes y archiva únicamente el registro de transacción de limpieza.',
+    'cleanup.abandonDetail': 'No se eliminará nada más. Revisa el perfil restante antes de seguir usándolo.',
     'migration.nav.title': 'Importación',
     'migration.nav.sub': 'Datos existentes',
     'migration.step.badge': 'Importación',
@@ -7563,157 +7642,433 @@ ipcMain.handle('gateway:reveal-log', async () => {
 })
 ipcMain.handle('desktop:settings:get', async () => loadDesktopSettings())
 ipcMain.handle('desktop:settings:save', async (_event, payload: DesktopSettingsPayload) => saveDesktopSettings(payload))
-ipcMain.handle('desktop:settings:reset', async () => {
-  const finishWriter = beginDesktopWriterOperation('reset Desktop settings')
-  try {
-    const child = gatewayProcess && gatewayState.owned ? gatewayProcess : null
-    if (child) {
-      stopGateway()
-      await waitForGatewayProcessExit(child)
-    }
-    await resetDesktopSettings()
-    forceOnboardingOnNextStartup = true
-    clearReusableGatewayState()
-    // This IPC is also reachable from the live Control UI (Settings → Runtime),
-    // which stays on the now-dead gateway after the reset. Return the window to the
-    // boot splash and re-run startup so onboarding re-runs, instead of stranding
-    // the user on a dead page. (The boot.html caller also calls retryStartup; the
-    // in-flight start is joined, not double-started.)
-    bootError = null
-    await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
-    void openOrResumeDesktopApp()
-    return { ok: true }
-  } finally {
-    finishWriter()
-  }
+ipcMain.handle('desktop:settings:reset', async (event) => {
+  if (!trustedRecoveryIpc(event)) throw new Error('Untrusted Desktop reset request.')
+  return await resetDesktopSettingsThroughCleanup()
 })
 ipcMain.handle('desktop:artifact:open', async (_event, payload: ArtifactOpenRequest) => openArtifactWithDefaultApp(payload))
 
 // ── Desktop data cleanup ───────────────────────────────────────────────────
-// The data deletion logic lives in the Python core (`opensquilla uninstall`);
-// the desktop only triggers it via the bundled CLI and then removes the few
-// desktop-owned files that live outside the OpenSquilla home (the encrypted
-// credential and gateway logs under userData/). It intentionally does not
-// remove the installed .app / NSIS application; users do that through the OS.
-//
-// Path note: OPENSQUILLA_STATE_DIR names the OpenSquilla home root. Both the
-// gateway spawn and this uninstall CLI pass desktopHome()
-// (<userData>/opensquilla), so config.toml + state/ resolve identically
-// everywhere.
-async function runUninstallCli(
-  extraArgs: string[],
-): Promise<{ ok: boolean; stdout: string; stderr: string }> {
-  const runtime = await resolveGatewayRuntime()
-  const prefix = runtime.args.slice(0, -2) // drop the trailing ['gateway','run']
-  const child = spawn(runtime.command, [...prefix, 'uninstall', ...extraArgs], {
-    cwd: runtime.cwd,
-    windowsHide: true,
-    env: desktopChildEnvironment(activeDesktopProfile(), {
-      PYTHONUNBUFFERED: '1',
-      PYTHONUTF8: '1',
-      PYTHONIOENCODING: 'utf-8:replace',
-    }),
-  })
-  let stdout = ''
-  let stderr = ''
-  child.stdout.on('data', (chunk) => {
-    stdout += String(chunk)
-  })
-  child.stderr.on('data', (chunk) => {
-    stderr += String(chunk)
-  })
-  const code: number = await new Promise((res) => {
-    child.once('exit', (c) => res(c ?? 1))
-    child.once('error', () => res(1))
-  })
-  return { ok: code === 0, stdout, stderr }
+// Python owns inventory, locking, CAS, no-follow deletion, and partial recovery.
+// Electron owns only trusted IPC, gateway/writer quiescence, explicit native
+// confirmation, and post-operation lifecycle. Renderer payloads never provide a
+// path, profile selector, transaction id, or revision.
+const DESKTOP_CLEANUP_STDOUT_LIMIT = 2 * 1024 * 1024
+const DESKTOP_CLEANUP_INSPECT_TIMEOUT_MS = 30_000
+const DESKTOP_CLEANUP_APPROVAL_LIMIT = 512 * 1024
+const DELETE_ALL_CONFIRMATION = 'DELETE ALL OPENSQUILLA DATA'
+
+function currentDesktopCleanupSelection(mode: DesktopCleanupMode): DesktopCleanupSelection {
+  const profile = activeDesktopProfile()
+  return {
+    mode,
+    profileKind: profile.kind,
+    recoveryId: profile.recoveryId,
+    profileKey: desktopProfileKey(profile),
+  }
 }
 
-ipcMain.handle('desktop:uninstall:summary', async () => {
-  const { ok, stdout } = await runUninstallCli(['--dry-run', '--json'])
-  try {
-    return { ok, plan: JSON.parse(stdout) }
-  } catch {
-    return { ok: false, plan: null, raw: stdout }
+async function runDesktopCleanupCli(
+  profile: DesktopProfilePaths,
+  command: 'cleanup-inspect' | 'cleanup-apply',
+  args: string[],
+): Promise<DesktopCleanupReport> {
+  const runtime = await resolveGatewayRuntime()
+  const prefix = runtime.args.slice(0, -2)
+  return await new Promise((resolveResult, rejectResult) => {
+    const child = spawn(runtime.command, [...prefix, 'recovery', command, ...args], {
+      cwd: runtime.cwd,
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: desktopChildEnvironment(profile, {
+        OPENSQUILLA_RECOVERY_OFFLINE: '1',
+        PYTHONUNBUFFERED: '1',
+        PYTHONUTF8: '1',
+        PYTHONIOENCODING: 'utf-8:replace',
+      }),
+    })
+    let stdout = ''
+    let oversized = false
+    let settled = false
+    let inspectTimeout: NodeJS.Timeout | null = null
+    const finish = (error?: Error, report?: DesktopCleanupReport) => {
+      if (settled) return
+      settled = true
+      if (inspectTimeout) clearTimeout(inspectTimeout)
+      if (error) rejectResult(error)
+      else resolveResult(report as DesktopCleanupReport)
+    }
+    if (command === 'cleanup-inspect') {
+      inspectTimeout = setTimeout(() => {
+        child.kill()
+        finish(new Error('Cleanup inventory inspection timed out.'))
+      }, DESKTOP_CLEANUP_INSPECT_TIMEOUT_MS)
+      inspectTimeout.unref()
+    }
+    child.stdout.on('data', (chunk) => {
+      if (oversized) return
+      stdout += String(chunk)
+      if (stdout.length > DESKTOP_CLEANUP_STDOUT_LIMIT) {
+        oversized = true
+        if (command === 'cleanup-inspect') child.kill()
+      }
+    })
+    // Never copy stderr into a renderer response or diagnostic: filesystem and
+    // environment details can be sensitive. The stable JSON code is sufficient.
+    child.stderr.resume()
+    child.once('error', (error) => finish(
+      error instanceof Error ? error : new Error(String(error)),
+    ))
+    child.once('close', (code) => {
+      if (oversized) return finish(new Error('Cleanup command output exceeded its limit.'))
+      try {
+        return finish(undefined, parseDesktopCleanupProtocol(JSON.parse(stdout)))
+      } catch (error) {
+        if (code !== 0) {
+          return finish(new Error(`Cleanup command failed with exit code ${code ?? 'unknown'}.`))
+        }
+        return finish(error instanceof Error ? error : new Error(String(error)))
+      }
+    })
+  })
+}
+
+async function inspectDesktopCleanup(mode: DesktopCleanupMode): Promise<{
+  ok: boolean
+  previewId: string | null
+  report: DesktopCleanupReport
+  profile: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+}> {
+  desktopCleanupPreviews.clear()
+  const profile = activeDesktopProfile()
+  const selection = currentDesktopCleanupSelection(mode)
+  const report = await runDesktopCleanupCli(profile, 'cleanup-inspect', [
+    '--user-data', app.getPath('userData'),
+    ...cleanupSelectorArgs(selection),
+    '--json',
+  ])
+  if (report.mode !== mode) throw new Error('Cleanup inventory did not match the requested mode.')
+  const preview = report.outcome === 'ready'
+    ? desktopCleanupPreviews.create(report, selection)
+    : null
+  return {
+    ok: report.outcome === 'ready',
+    previewId: preview?.id ?? null,
+    report,
+    profile: { kind: profile.kind, recoveryId: profile.recoveryId },
   }
+}
+
+function cleanupInventoryDetail(report: DesktopCleanupReport): string {
+  const paths = report.items
+    .filter((item) => item.exists)
+    .slice(0, 8)
+    .map((item) => item.path)
+  const remaining = report.items.filter((item) => item.exists).length - paths.length
+  return [
+    ...paths,
+    ...(remaining > 0 ? [`+${remaining} ${desktopT('cleanup.moreItems')}`] : []),
+  ].join('\n')
+}
+
+async function confirmDesktopCleanup(report: DesktopCleanupReport): Promise<boolean> {
+  if (report.mode === 'reset-current-settings') return true
+  const deleteAll = report.mode === 'delete-all-user-data'
+  const options: Electron.MessageBoxOptions = {
+    type: 'warning',
+    buttons: [desktopT('cleanup.cancel'), desktopT(
+      deleteAll ? 'cleanup.deleteAllConfirm' : 'cleanup.deleteProfileConfirm',
+    )],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    title: desktopT(deleteAll ? 'cleanup.deleteAllTitle' : 'cleanup.deleteProfileTitle'),
+    message: desktopT(deleteAll ? 'cleanup.deleteAllMessage' : 'cleanup.deleteProfileMessage'),
+    detail: cleanupInventoryDetail(report),
+  }
+  const window = currentMainWindow()
+  const choice = window
+    ? await dialog.showMessageBox(window, options)
+    : await dialog.showMessageBox(options)
+  return choice.response === 1
+}
+
+async function spawnDeleteAllAfterElectronExit(
+  profile: DesktopProfilePaths,
+  selection: DesktopCleanupSelection,
+  approvedScopeFingerprint: string,
+  approvedReport: DesktopCleanupReport,
+): Promise<void> {
+  const runtime = await resolveGatewayRuntime()
+  const prefix = runtime.args.slice(0, -2)
+  const args = [
+    ...prefix,
+    'recovery', 'cleanup-apply',
+    '--user-data', app.getPath('userData'),
+    ...cleanupSelectorArgs(selection),
+    // The child waits for this process's stdin pipe to close, performs a fresh
+    // post-exit inventory, and applies that inventory. This avoids Windows open
+    // handles and Chromium writes invalidating the live-process preview.
+    '--after-parent-exit',
+    '--transaction-id', 'post-exit-reinspect',
+    '--expected-revision', '0',
+    '--expected-scope-fingerprint', approvedScopeFingerprint,
+    '--confirm-user-data', app.getPath('userData'),
+    '--json',
+  ]
+  const approval = `${JSON.stringify({
+    schema_version: 1,
+    scope_fingerprint: approvedScopeFingerprint,
+    items: approvedReport.items.map((item) => ({ kind: item.kind, path: item.path })),
+  })}\n`
+  if (Buffer.byteLength(approval, 'utf8') > DESKTOP_CLEANUP_APPROVAL_LIMIT) {
+    throw new Error('The confirmed cleanup inventory is too large for the exit handoff.')
+  }
+  await new Promise<void>((resolveSpawn, rejectSpawn) => {
+    const helper = spawn(runtime.command, args, {
+      cwd: runtime.cwd,
+      windowsHide: true,
+      detached: true,
+      stdio: ['pipe', 'ignore', 'ignore'],
+      env: desktopChildEnvironment(profile, {
+        OPENSQUILLA_RECOVERY_OFFLINE: '1',
+        PYTHONUNBUFFERED: '1',
+        PYTHONUTF8: '1',
+        PYTHONIOENCODING: 'utf-8:replace',
+      }),
+    })
+    let settled = false
+    const finish = (error?: Error) => {
+      if (settled) return
+      settled = true
+      if (error) rejectSpawn(error)
+      else resolveSpawn()
+    }
+    helper.stdin.on('error', (error) => finish(
+      error instanceof Error ? error : new Error(String(error)),
+    ))
+    helper.once('error', (error) => finish(
+      error instanceof Error ? error : new Error(String(error)),
+    ))
+    helper.once('spawn', () => {
+      helper.once('exit', () => {
+        if (pendingDeleteAllHelper === helper) pendingDeleteAllHelper = null
+      })
+      helper.stdin.write(approval, 'utf8', (error) => {
+        if (error) return finish(error)
+        // Deliberately keep stdin open. The helper reads this bounded approval
+        // and then waits for EOF, which is emitted only when Electron exits and
+        // releases its Chromium/userData handles.
+        pendingDeleteAllHelper = helper
+        helper.unref()
+        ;(helper.stdin as NodeJS.WritableStream & { unref?: () => void }).unref?.()
+        finish()
+      })
+    })
+  })
+}
+
+async function restoreAfterIncompleteCleanup(
+  profile: DesktopProfilePaths,
+  preserveControlUi = false,
+): Promise<void> {
+  isQuitting = false
+  clearReusableGatewayState()
+  const inspection = await inspectDesktopProfile(profile)
+  recoveryInspection = inspection
+  if (profile.kind === 'primary') primaryRecoveryInspection = inspection
+  bootError = null
+  if (!preserveControlUi || inspection.outcome === 'recovery_required') {
+    await restoreMainWindowToBootPage()
+  }
+  publishRecoveryState()
+  if (inspection.outcome !== 'recovery_required') void openOrResumeDesktopApp()
+}
+
+ipcMain.handle('desktop:cleanup:inspect', async (event, payload?: { mode?: unknown }) => {
+  if (!trustedRecoveryIpc(event)) throw new Error('Untrusted Desktop cleanup request.')
+  if (desktopCleanupBusy) throw new Error('Another Desktop cleanup operation is running.')
+  const mode = parseDesktopCleanupMode(payload?.mode)
+  if (!mode) throw new Error('Choose a supported Desktop cleanup action.')
+  return await inspectDesktopCleanup(mode)
 })
 
-ipcMain.handle('desktop:uninstall:run', async (_event, payload?: { purgeData?: boolean }) => {
-  const purgeData = Boolean(payload?.purgeData)
+ipcMain.handle('desktop:cleanup:discard', (event, payload?: { previewId?: unknown }) => {
+  if (!trustedRecoveryIpc(event)) throw new Error('Untrusted Desktop cleanup request.')
+  return desktopCleanupPreviews.discard(payload?.previewId, desktopProfileKey())
+})
 
-  // A total wipe is irreversible: confirm at the main-process trust boundary
-  // (a renderer-forged IPC call alone must not be able to delete all data).
-  if (purgeData) {
-    const { response } = await dialog.showMessageBox({
-      type: 'warning',
-      buttons: [desktopT('uninstall.cancel'), desktopT('uninstall.deleteEverything')],
-      defaultId: 0,
-      cancelId: 0,
-      title: desktopT('uninstall.confirmTitle'),
-      message: desktopT('uninstall.confirmMessage'),
-      detail: desktopT('uninstall.confirmDetail'),
-    })
-    if (response !== 1) return { ok: false, aborted: true, detail: 'cancelled' }
+async function applyApprovedDesktopCleanup(
+  preview: TrustedDesktopCleanupPreview,
+  approval: { acknowledged: boolean; confirmation: string },
+) {
+  const active = activeDesktopProfile()
+  const report = preview.report
+  if (
+    report.mode !== 'reset-current-settings'
+    && approval.acknowledged !== true
+  ) return { ok: false, detail: 'Confirm that you reviewed every listed location.' }
+  if (
+    report.mode === 'delete-all-user-data'
+    && approval.confirmation !== DELETE_ALL_CONFIRMATION
+  ) return { ok: false, detail: `Type ${DELETE_ALL_CONFIRMATION} to confirm.` }
+  if (!await confirmDesktopCleanup(report)) {
+    const replacement = await inspectDesktopCleanup(report.mode).catch(() => null)
+    return {
+      ...(replacement || {}),
+      ok: false,
+      aborted: true,
+      detail: 'cancelled',
+    }
   }
 
-  // Quiesce the owned gateway before the CLI touches files. Wait for the child to
-  // actually EXIT (child.killed flips true the instant SIGTERM is sent, not when
-  // the drain finishes), bounded by the kill deadline.
-  isQuitting = true
-  if (gatewayProcess && gatewayState.owned) {
-    const child = gatewayProcess
-    // We stay alive and await the exit, so let the gateway take its Windows HTTP
-    // graceful drain instead of an immediate TerminateProcess.
+  const exclusive = desktopWriters.tryBeginExclusive('Desktop data cleanup')
+  if (!exclusive) {
+    return { ok: false, detail: 'OpenSquilla is finishing another profile operation. Try again.' }
+  }
+  desktopCleanupBusy = true
+  let shouldQuit = false
+  try {
+    await waitForDesktopWriterOperations(1)
+    if (desktopProfileKey(active) !== desktopProfileKey()) {
+      return { ok: false, detail: 'The active profile changed. Review the cleanup inventory again.' }
+    }
+    if ((!gatewayProcess || !gatewayState.owned) && gatewayState.url && await healthCheck(gatewayState.url)) {
+      return { ok: false, detail: 'A gateway is still serving this profile; stop it and retry.' }
+    }
+    isQuitting = true
     allowGracefulShutdownWhileQuitting = true
     try {
-      stopGateway()
+      await stopOwnedGatewayAndWait()
     } finally {
       allowGracefulShutdownWhileQuitting = false
     }
-    await new Promise<void>((res) => {
-      if (child.exitCode !== null || child.signalCode !== null) return res()
-      child.once('exit', () => res())
-      setTimeout(res, GATEWAY_SHUTDOWN_KILL_AFTER_MS).unref()
-    })
-  }
 
-  // Refuse to purge while a gateway still serves this profile (covers an
-  // unmanaged/adopted gateway the desktop did not spawn). The app keeps running,
-  // so clear isQuitting to restore normal gateway-crash reporting.
-  if (purgeData && gatewayState.url && (await healthCheck(gatewayState.url))) {
-    isQuitting = false
+    // Gateway shutdown legitimately changes state/log metadata, so the old CAS
+    // revision cannot be applied directly. Reinspect after every writer is gone
+    // and accept only the exact same mode + bounded kind/path scope the user saw.
+    // The refreshed transaction/revision then becomes the apply authority.
+    const refreshed = await runDesktopCleanupCli(active, 'cleanup-inspect', [
+      '--user-data', app.getPath('userData'),
+      ...cleanupSelectorArgs(preview.selection),
+      '--json',
+    ])
+    if (
+      refreshed.outcome !== 'ready'
+      || !sameDesktopCleanupScope(report, refreshed, app.getPath('userData'))
+    ) {
+      const replacement = refreshed.outcome === 'ready'
+        && desktopCleanupScopeIsContained(refreshed, app.getPath('userData'))
+        ? desktopCleanupPreviews.create(refreshed, preview.selection)
+        : null
+      await restoreAfterIncompleteCleanup(active, true)
+      return {
+        ok: false,
+        previewId: replacement?.id ?? null,
+        report: refreshed,
+        profile: { kind: active.kind, recoveryId: active.recoveryId },
+        detail: 'The cleanup locations changed while the local runtime stopped. Review them again.',
+      }
+    }
+
+    if (report.mode === 'delete-all-user-data') {
+      await spawnDeleteAllAfterElectronExit(
+        active,
+        preview.selection,
+        refreshed.scope_fingerprint,
+        report,
+      )
+      shouldQuit = true
+      return { ok: true, scheduled: true, report }
+    }
+
+    const result = await runDesktopCleanupCli(active, 'cleanup-apply', [
+      '--user-data', app.getPath('userData'),
+      ...cleanupSelectorArgs(preview.selection),
+      '--transaction-id', refreshed.transaction_id,
+      '--expected-revision', String(refreshed.revision),
+      '--confirm-user-data', app.getPath('userData'),
+      '--json',
+    ])
+    if (result.outcome === 'complete') {
+      if (report.mode === 'reset-current-settings') {
+        transientPendingMigrationProviderSetup = null
+        forceOnboardingOnNextStartup = true
+        isQuitting = false
+        clearReusableGatewayState()
+        bootError = null
+        setImmediate(() => {
+          void currentMainWindow()?.loadFile(bootPagePath()).then(() => openOrResumeDesktopApp())
+        })
+      } else {
+        shouldQuit = true
+      }
+      return { ok: true, report: result }
+    }
+    await restoreAfterIncompleteCleanup(active)
     return {
       ok: false,
-      aborted: true,
-      detail: 'A gateway is still serving this profile; stop it and retry.',
+      partial: result.outcome === 'partial',
+      report: result,
+      detail: result.stable_code,
+    }
+  } catch (error) {
+    await restoreAfterIncompleteCleanup(active).catch(() => null)
+    return { ok: false, detail: error instanceof Error ? error.message : String(error) }
+  } finally {
+    exclusive.finish()
+    // app.exit bypasses quit handlers that write desktop.log. Once a profile is
+    // deleted, Electron must not reopen writer admission or recreate any path
+    // inside the confirmed scope. Only a failed/cancelled operation may reopen.
+    if (shouldQuit) {
+      app.exit(0)
+    } else {
+      desktopWriters.reopen(exclusive.admissionToken)
+      desktopCleanupBusy = false
     }
   }
+}
 
-  const args = ['--yes', '--json']
-  if (purgeData) args.push('--purge-all', '--confirm-purge-all', 'delete everything')
-  const result = await runUninstallCli(args)
-
-  // The CLI exited non-zero (e.g. quiesce refused, or a delete failed). The app
-  // is still running, so restore normal crash reporting and surface the reason.
-  if (!result.ok) {
-    isQuitting = false
-    return { ok: false, detail: (result.stderr || result.stdout || '').slice(-2000) }
+async function resetDesktopSettingsThroughCleanup() {
+  if (desktopCleanupBusy) return { ok: false, detail: 'Another cleanup operation is running.' }
+  const inspection = await inspectDesktopCleanup('reset-current-settings')
+  if (!inspection.ok || !inspection.previewId) {
+    return { ok: false, report: inspection.report, detail: inspection.report.stable_code }
   }
+  const preview = desktopCleanupPreviews.consume(
+    inspection.previewId,
+    desktopProfileKey(activeDesktopProfile()),
+  )
+  if (!preview) return { ok: false, detail: 'The cleanup inventory changed. Try again.' }
+  return await applyApprovedDesktopCleanup(preview, {
+    acknowledged: true,
+    confirmation: '',
+  })
+}
 
-  // Remove desktop-owned files outside the OpenSquilla home (only on a full data
-  // purge — these hold the encrypted credential and logs).
-  if (purgeData) {
-    await rm(credentialPath(), { force: true }).catch(() => null)
-    transientPendingMigrationProviderSetup = null
-    await rm(pendingMigrationProviderSetupPath(), { force: true }).catch(() => null)
-    await rm(desktopMigrationResultPath(), { force: true }).catch(() => null)
-    await rm(join(app.getPath('userData'), 'logs'), { recursive: true, force: true }).catch(() => null)
+ipcMain.handle('desktop:cleanup:apply', async (event, payload?: {
+  previewId?: unknown
+  acknowledged?: unknown
+  confirmation?: unknown
+}) => {
+  if (!trustedRecoveryIpc(event)) throw new Error('Untrusted Desktop cleanup request.')
+  if (desktopCleanupBusy) return { ok: false, detail: 'Another cleanup operation is running.' }
+  const active = activeDesktopProfile()
+  const preview = desktopCleanupPreviews.consume(payload?.previewId, desktopProfileKey(active))
+  if (!preview) {
+    desktopCleanupPreviews.clear()
+    return { ok: false, detail: 'The cleanup inventory is missing or expired. Review it again.' }
   }
-  // The app keeps running after a successful data cleanup (the user closes it
-  // later), so clear the quit latch — otherwise it stays true and silently
-  // suppresses reporting of any later gateway crash.
-  isQuitting = false
-  return result
+  return await applyApprovedDesktopCleanup(preview, {
+    acknowledged: payload?.acknowledged === true,
+    confirmation: typeof payload?.confirmation === 'string' ? payload.confirmation : '',
+  })
+})
+
+ipcMain.handle('desktop:cleanup:reveal-user-data', async (event) => {
+  if (!trustedRecoveryIpc(event)) throw new Error('Untrusted Desktop cleanup request.')
+  await shell.showItemInFolder(app.getPath('userData'))
+  return true
 })
 
 // ── Legacy home migration (Phase 3 entry points) ─────────────────────────────
@@ -9018,20 +9373,25 @@ async function withRecoveryOperation<T>(
   recoveryOperationBusy = true
   recoveryOperationError = null
   publishRecoveryState()
+  let outcome: { ok: true; value: T } | { ok: false; error: string }
   try {
     await waitForDesktopWriterOperations(1)
     const value = await operation()
-    return { ok: true, value, state: recoveryStateSnapshot() }
+    outcome = { ok: true, value }
   } catch (error) {
     recoveryOperationError = error instanceof Error ? error.message : String(error)
     desktopLog('recovery_operation_failed', { error: recoveryOperationError })
-    return { ok: false, error: recoveryOperationError, state: recoveryStateSnapshot() }
+    outcome = { ok: false, error: recoveryOperationError }
   } finally {
     exclusive.finish()
     desktopWriters.reopen(exclusive.admissionToken)
     recoveryOperationBusy = false
     publishRecoveryState()
   }
+  // Build the response only after the authoritative busy=false transition.
+  // Otherwise the renderer can apply a stale busy snapshot after the final
+  // event and leave every recovery action disabled.
+  return { ...outcome, state: recoveryStateSnapshot() }
 }
 
 async function copyPrimaryCredentialToRecovery(profile: DesktopProfilePaths): Promise<void> {
@@ -9160,6 +9520,80 @@ async function recoverPrimaryProfileTransaction(): Promise<RecoveryProtocolResul
   return result
 }
 
+async function abandonActiveCleanupTransaction(): Promise<RecoveryProtocolResult> {
+  const profile = activeDesktopProfile()
+  let inspection = recoveryInspection
+  if (!inspection || inspection.stable_code !== 'cleanup_transaction_incomplete') {
+    inspection = await inspectDesktopProfile(profile)
+  }
+  if (
+    inspection.stable_code !== 'cleanup_transaction_incomplete'
+    || !inspection.allowed_actions.includes('abandon-cleanup')
+    || !inspection.transaction_id
+  ) {
+    throw new Error('No interrupted cleanup is available to preserve and leave.')
+  }
+  const options: Electron.MessageBoxOptions = {
+    type: 'warning',
+    buttons: [desktopT('cleanup.cancel'), desktopT('cleanup.abandonConfirm')],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    title: desktopT('cleanup.abandonTitle'),
+    message: desktopT('cleanup.abandonMessage'),
+    detail: desktopT('cleanup.abandonDetail'),
+  }
+  const window = currentMainWindow()
+  const choice = window
+    ? await dialog.showMessageBox(window, options)
+    : await dialog.showMessageBox(options)
+  if (choice.response !== 1) return inspection
+
+  await stopOwnedGatewayAndWait()
+  // Stopping the runtime can legitimately change state metadata. Refresh the
+  // cleanup authority after every writer is gone so a retry never reuses a
+  // cached transaction/revision.
+  inspection = await inspectDesktopProfile(profile)
+  recoveryInspection = inspection
+  if (profile.kind === 'primary') primaryRecoveryInspection = inspection
+  publishRecoveryState()
+  if (
+    inspection.stable_code !== 'cleanup_transaction_incomplete'
+    || !inspection.allowed_actions.includes('abandon-cleanup')
+    || !inspection.transaction_id
+  ) {
+    throw new Error('The interrupted cleanup changed. Review the current recovery state.')
+  }
+  const result = await runRecoveryCli(profile, [
+    'abandon-cleanup',
+    '--user-data', app.getPath('userData'),
+    '--home', profile.home,
+    '--profile-kind', profileKindEnvironment(profile.kind),
+    '--transaction-id', inspection.transaction_id,
+    '--expected-revision', String(inspection.revision),
+    '--json',
+  ])
+  recoveryInspection = result
+  if (profile.kind === 'primary') primaryRecoveryInspection = result
+  publishRecoveryState()
+  if (result.outcome !== 'recovery_required') {
+    if (!existsSync(desktopProfileContextPath(app.getPath('userData')))) {
+      await updateDesktopProfileContext((current) => contextForProfile(
+        app.getPath('userData'),
+        profile.kind,
+        profile.recoveryId,
+        new Date().toISOString(),
+        current.persisted.attention_acknowledgement,
+      ))
+    }
+    clearReusableGatewayState()
+    bootError = null
+    await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
+    void openOrResumeDesktopApp()
+  }
+  return result
+}
+
 async function choosePrimaryWorkspace(
   requestedWorkspace: unknown,
 ): Promise<RecoveryProtocolResult> {
@@ -9233,6 +9667,12 @@ ipcMain.handle('desktop:recovery:recover-transaction', async (event) => {
     return { ok: false, error: 'Recovery actions are available only from the recovery page.' }
   }
   return withRecoveryOperation(recoverPrimaryProfileTransaction)
+})
+ipcMain.handle('desktop:recovery:abandon-cleanup', async (event) => {
+  if (!trustedRecoveryIpc(event)) {
+    return { ok: false, error: 'Recovery actions are available only from the recovery page.' }
+  }
+  return withRecoveryOperation(abandonActiveCleanupTransaction)
 })
 ipcMain.handle('desktop:recovery:launch-safe', async (
   event,

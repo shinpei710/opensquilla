@@ -1134,6 +1134,18 @@ def _unfinished_replace_transaction(home: Path) -> bool:
     return not _committed_transaction_is_complete(home, payload)
 
 
+def profile_replacement_transaction_unfinished(home: str | Path) -> bool:
+    """Return whether a profile replacement journal still needs recovery.
+
+    Destructive profile-management operations share this read-only authority
+    check with bootstrap.  Keeping the schema validation here prevents cleanup
+    callers from depending on an implementation-private parser or accepting a
+    malformed/future journal as committed.
+    """
+
+    return _unfinished_replace_transaction(Path(home).expanduser().absolute())
+
+
 def _legacy_import_transaction_present(home: Path) -> bool:
     """Detect a pre-RC4 import journal without trusting or mutating it.
 

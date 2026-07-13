@@ -143,6 +143,7 @@ def test_recovery_ui_is_accessible_and_runtime_reachable() -> None:
         "retryPrimary",
         "returnPrimary",
         "recoverTransaction",
+        "abandonCleanup",
         "revealProfile",
         "revealBackups",
         "copyDiagnostics",
@@ -160,13 +161,13 @@ def test_recovery_ui_is_accessible_and_runtime_reachable() -> None:
         "launchSafeProfile",
         "retryPrimaryProfile",
         "recoverProfileTransaction",
+        "abandonCleanupTransaction",
         "returnPrimaryProfile",
         "revealRecoveryPath",
         "copyRecoveryDiagnostics",
     ):
         assert bridge_name in boot_html
     assert "abandonPartialCleanup" not in boot_html
-    assert "abandonCleanup" not in boot_html
 
 
 def test_recovery_ui_scaffold_has_all_six_locales() -> None:
@@ -190,6 +191,10 @@ def test_recovery_ui_scaffold_has_all_six_locales() -> None:
         "retryPrimary",
         "returnPrimary",
         "recoverTransaction",
+        "cleanupRecoveryTitle",
+        "cleanupRecoveryIntro",
+        "abandonCleanup",
+        "abandonCleanupHelp",
         "revealProfile",
         "revealBackups",
         "copyDiagnostics",
@@ -212,7 +217,8 @@ def test_desktop_profile_context_and_recovery_ipc_are_activated() -> None:
     assert "desktop:recovery" in main_ts
     assert "desktop:recovery" in preload
     assert "onRecoveryState" in preload
-    assert "desktop:recovery:abandon-cleanup" not in main_ts
+    assert "desktop:recovery:abandon-cleanup" in main_ts
+    assert "abandonCleanupTransaction" in preload
     assert "abandonPartialCleanup" not in preload
 
 
@@ -233,6 +239,16 @@ def test_reset_desktop_settings_forces_onboarding_before_gateway_reuse() -> None
         "ipcMain.handle('desktop:settings:reset'",
         "ipcMain.handle('desktop:artifact:open'",
     )
+    cleanup_apply = _section(
+        main_ts,
+        "async function applyApprovedDesktopCleanup",
+        "async function resetDesktopSettingsThroughCleanup",
+    )
+    cleanup_reset = _section(
+        main_ts,
+        "async function resetDesktopSettingsThroughCleanup",
+        "ipcMain.handle('desktop:cleanup:apply'",
+    )
 
     assert "let forceOnboardingOnNextStartup = false" in main_ts
     assert "function clearReusableGatewayState(): void" in main_ts
@@ -244,22 +260,17 @@ def test_reset_desktop_settings_forces_onboarding_before_gateway_reuse() -> None
     assert "forceOnboardingOnNextStartup = false" in start
     assert "forceOnboardingOnNextStartup" in resume
     assert "await reuseHealthyGatewayState()" in resume
-    assert "forceOnboardingOnNextStartup = true" in reset
-    assert "const child = gatewayProcess && gatewayState.owned ? gatewayProcess : null" in reset
-    assert "await waitForGatewayProcessExit(child)" in reset
-    assert "clearReusableGatewayState()" in reset
-    assert reset.index("await waitForGatewayProcessExit(child)") < reset.index(
-        "await resetDesktopSettings()"
-    )
-    reset_operation = _section(
-        main_ts,
-        "async function resetDesktopSettings",
-        "function clearReusableGatewayState",
-    )
-    assert "await rm(credentialPath(), { force: true })" in reset_operation
-    assert "rm(desktopConfigPath()" not in reset_operation
-    assert "workspace" in reset_operation
-    assert "state databases" in reset_operation
+    assert "resetDesktopSettingsThroughCleanup()" in reset
+    assert "inspectDesktopCleanup('reset-current-settings')" in cleanup_reset
+    assert "desktopCleanupPreviews.consume(" in cleanup_reset
+    assert "applyApprovedDesktopCleanup(preview" in cleanup_reset
+    assert "await waitForDesktopWriterOperations(1)" in cleanup_apply
+    assert "await stopOwnedGatewayAndWait()" in cleanup_apply
+    assert "runDesktopCleanupCli(active, 'cleanup-inspect'" in cleanup_apply
+    assert "runDesktopCleanupCli(active, 'cleanup-apply'" in cleanup_apply
+    assert "report.mode === 'reset-current-settings'" in cleanup_apply
+    assert "forceOnboardingOnNextStartup = true" in cleanup_apply
+    assert "clearReusableGatewayState()" in cleanup_apply
 
 
 def test_desktop_gateway_port_selection_is_bind_aware_and_bounded() -> None:
@@ -334,10 +345,10 @@ def test_windows_quit_rejected_shutdown_uses_short_hard_kill_backstop() -> None:
     assert "UPDATE_GATEWAY_EXIT_TIMEOUT_MS" not in rejected
 
 
-def test_windows_uninstall_can_clear_app_data() -> None:
+def test_windows_uninstall_preserves_app_data() -> None:
     package_json = json.loads(_read("desktop/electron/package.json"))
 
-    assert package_json["build"]["nsis"]["deleteAppDataOnUninstall"] is True
+    assert package_json["build"]["nsis"]["deleteAppDataOnUninstall"] is False
 
 
 def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:
@@ -574,13 +585,13 @@ def test_desktop_python_children_force_utf8_stdio() -> None:
         "async function startGateway",
         "async function loadControlUi",
     )
-    uninstall = _section(
+    cleanup = _section(
         main_ts,
-        "async function runUninstallCli",
-        "ipcMain.handle('desktop:uninstall:summary'",
+        "async function runDesktopCleanupCli",
+        "async function inspectDesktopCleanup",
     )
 
-    for section in (start, uninstall):
+    for section in (start, cleanup):
         assert "PYTHONUNBUFFERED: '1'" in section
         assert "PYTHONUTF8: '1'" in section
         assert "PYTHONIOENCODING: 'utf-8:replace'" in section
@@ -1276,22 +1287,22 @@ def test_desktop_cleanup_does_not_claim_os_app_uninstall() -> None:
         "function desktopChildEnvironment",
         "// ── Legacy home import detection",
     )
-    assert "desktopChildEnvironment(activeDesktopProfile()" in cleanup
+    assert "desktopChildEnvironment(profile" in cleanup
+    assert "desktop:uninstall:summary" not in main_ts
+    assert "desktop:uninstall:run" not in main_ts
     assert "OPENSQUILLA_INSTALL_METHOD: 'desktop'" in child_environment
     assert "OPENSQUILLA_STATE_DIR: profile.home" in child_environment
-    assert "remove the installed .app / NSIS application" in cleanup
-    # The purge confirmation is localized via desktopT; the "app remains"
-    # guarantee now lives in the (localized) message catalog rather than inline.
-    assert "desktopT('uninstall.confirmDetail')" in cleanup
     assert "installed app itself will remain" in main_ts
-    assert "does not remove the installed app bundle itself" in panel_vue
+    assert "setup.runtime.cleanup.label" in panel_vue
 
     en_runtime = en_locale["setup"]["runtime"]
     zh_runtime = zh_locale["setup"]["runtime"]
     assert "desktop data cleanup" in en_runtime["uninstallLabel"]
+    assert "remove the installed app itself" in en_runtime["uninstallDesc"]
     assert "uninstalled" not in en_runtime["uninstallDone"].lower()
     assert "remove OpenSquilla through your OS" in en_runtime["uninstallDone"]
     assert "清理桌面本地数据" in zh_runtime["uninstallLabel"]
+    assert "移除已安装的应用本体" in zh_runtime["uninstallDesc"]
     assert "已卸载" not in zh_runtime["uninstallDone"]
 
 

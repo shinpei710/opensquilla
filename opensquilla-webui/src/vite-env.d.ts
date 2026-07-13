@@ -9,6 +9,17 @@ import type {
 } from './platform/types'
 
 type MigrationSourceKind = 'cli-home' | 'desktop-home' | 'windows-portable'
+type DesktopCleanupMode = 'reset-current-settings' | 'delete-current-profile' | 'delete-all-user-data'
+interface DesktopCleanupReport {
+  schema_version: 1
+  outcome: 'ready' | 'blocked' | 'complete' | 'partial'
+  stable_code: string
+  mode: DesktopCleanupMode
+  items: Array<{ kind: string; path: string; exists: boolean; identity: string | null }>
+  transaction_id: string
+  revision: number
+  scope_fingerprint: string
+}
 
 declare global {
   interface OpenSquillaDesktopApi {
@@ -26,6 +37,29 @@ declare global {
     getDesktopSettings: () => Promise<DesktopSettings>
     saveDesktopSettings: (payload: DesktopSettingsPayload) => Promise<DesktopSettings>
     resetDesktopSettings: () => Promise<{ ok: boolean }>
+    inspectDesktopCleanup?: (payload: { mode: DesktopCleanupMode }) => Promise<{
+      ok: boolean
+      previewId: string | null
+      report: DesktopCleanupReport
+      profile: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+    }>
+    discardDesktopCleanup?: (payload: { previewId: string }) => Promise<boolean>
+    applyDesktopCleanup?: (payload: {
+      previewId: string
+      acknowledged: boolean
+      confirmation: string
+    }) => Promise<{
+      ok: boolean
+      aborted?: boolean
+      scheduled?: boolean
+      partial?: boolean
+      previewId?: string | null
+      report?: DesktopCleanupReport
+      profile?: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+      detail?: string
+    }>
+    revealDesktopUserData?: () => Promise<boolean>
+    abandonCleanupTransaction?: () => Promise<unknown>
     setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
     openArtifact: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
     getOnboardingDefaults: () => Promise<unknown>

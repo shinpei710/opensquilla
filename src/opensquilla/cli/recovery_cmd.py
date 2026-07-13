@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from collections.abc import Callable
 from dataclasses import replace
@@ -17,6 +18,14 @@ from opensquilla.recovery import (
     inspect_profile,
     reconcile_profile,
 )
+from opensquilla.recovery.cleanup import (
+    CleanupItem,
+    CleanupReport,
+    abandon_cleanup_transaction,
+    cleanup_apply,
+    cleanup_inspect,
+    cleanup_scope_fingerprint,
+)
 from opensquilla.recovery.settings_transaction import (
     MAX_SETTINGS_INPUT_BYTES,
     apply_desktop_settings,
@@ -28,6 +37,8 @@ recovery_app = typer.Typer(
     no_args_is_help=True,
     pretty_exceptions_enable=False,
 )
+
+_MAX_CLEANUP_APPROVAL_BYTES = 512 * 1024
 
 
 def _emit(report: RecoveryReport, *, json_output: bool) -> None:
@@ -90,6 +101,95 @@ def _run(
             typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from None
     _emit(report, json_output=json_output)
+
+
+def _emit_cleanup(report: CleanupReport, *, json_output: bool) -> None:
+    if json_output:
+        typer.echo(json.dumps(report.as_dict(), ensure_ascii=False, sort_keys=True))
+        return
+    typer.echo(f"{report.outcome}: {report.stable_code}")
+    for item in report.items:
+        state = "present" if item.exists else "missing"
+        typer.echo(f"{state}  {item.kind}  {item.path}")
+
+
+def _cleanup_exit(report: CleanupReport, *, json_output: bool) -> None:
+    _emit_cleanup(report, json_output=json_output)
+    if report.outcome == "partial":
+        raise typer.Exit(code=1)
+    if report.outcome == "blocked":
+        raise typer.Exit(code=2)
+
+
+def _cleanup_scope_pair(item: CleanupItem) -> tuple[str, str]:
+    path = os.path.normcase(os.path.normpath(os.path.abspath(str(item.path))))
+    return item.kind, path
+
+
+def _read_parent_cleanup_approval(
+    *,
+    user_data: Path,
+    expected_fingerprint: str,
+) -> frozenset[tuple[str, str]]:
+    """Read the approved scope only after the parent pipe reaches EOF."""
+
+    raw = sys.stdin.buffer.read(_MAX_CLEANUP_APPROVAL_BYTES + 1)
+    if not raw or len(raw) > _MAX_CLEANUP_APPROVAL_BYTES:
+        raise typer.BadParameter("parent cleanup approval is missing or too large")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise typer.BadParameter("parent cleanup approval is invalid") from exc
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "scope_fingerprint",
+        "items",
+    }:
+        raise typer.BadParameter("parent cleanup approval schema is invalid")
+    if (
+        payload["schema_version"] != 1
+        or payload["scope_fingerprint"] != expected_fingerprint
+        or not isinstance(payload["items"], list)
+    ):
+        raise typer.BadParameter("parent cleanup approval does not match the request")
+
+    root = os.path.normcase(os.path.normpath(os.path.abspath(str(user_data))))
+    approved_items: list[CleanupItem] = []
+    approved_pairs: set[tuple[str, str]] = set()
+    for raw_item in payload["items"]:
+        if not isinstance(raw_item, dict) or set(raw_item) != {"kind", "path"}:
+            raise typer.BadParameter("parent cleanup approval item is invalid")
+        kind = raw_item["kind"]
+        path_raw = raw_item["path"]
+        if (
+            not isinstance(kind, str)
+            or not kind
+            or len(kind) > 256
+            or "\0" in kind
+            or not isinstance(path_raw, str)
+            or not path_raw
+            or len(path_raw) > 32768
+            or "\0" in path_raw
+        ):
+            raise typer.BadParameter("parent cleanup approval item is invalid")
+        path = Path(os.path.abspath(os.path.expanduser(path_raw)))
+        path_key = os.path.normcase(os.path.normpath(str(path)))
+        try:
+            contained = os.path.commonpath((root, path_key)) == root
+        except ValueError:
+            contained = False
+        if not contained or path_key == root:
+            raise typer.BadParameter("parent cleanup approval path is outside userData")
+        item = CleanupItem(kind=kind, path=path, exists=False, identity=None)
+        pair = _cleanup_scope_pair(item)
+        if pair in approved_pairs:
+            raise typer.BadParameter("parent cleanup approval contains a duplicate item")
+        approved_pairs.add(pair)
+        approved_items.append(item)
+
+    if cleanup_scope_fingerprint("delete-all-user-data", approved_items) != expected_fingerprint:
+        raise typer.BadParameter("parent cleanup approval fingerprint is invalid")
+    return frozenset(approved_pairs)
 
 
 def _settings_payload_from_stdin() -> object:
@@ -279,6 +379,168 @@ def recovery_recover_transaction(
         json_output=json_output,
         profile_kind="desktop-primary",
     )
+
+
+@recovery_app.command("abandon-cleanup")
+def recovery_abandon_cleanup(
+    user_data: Path = typer.Option(..., "--user-data", help="Electron userData root A."),
+    home: Path = typer.Option(..., "--home", help="Active Desktop profile root H."),
+    profile_kind: str = typer.Option(
+        "desktop-primary",
+        "--profile-kind",
+        help="desktop-primary (default) or desktop-recovery.",
+    ),
+    transaction_id: str = typer.Option(..., "--transaction-id", help="Inspection id."),
+    expected_revision: int = typer.Option(
+        ...,
+        "--expected-revision",
+        min=0,
+        help="Inspection revision used for compare-and-swap.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit the fixed JSON protocol."),
+) -> None:
+    """Preserve a partial cleanup and archive only its exact journal."""
+
+    kind = _desktop_profile_kind(profile_kind)
+
+    def operation() -> RecoveryReport:
+        abandon_cleanup_transaction(
+            user_data,
+            home=home,
+            profile_kind=kind,
+            transaction_id=transaction_id,
+            expected_revision=expected_revision,
+        )
+        return inspect_profile(home, profile_kind=kind)
+
+    _run(
+        operation,
+        home=home,
+        json_output=json_output,
+        profile_kind=kind,
+    )
+
+
+@recovery_app.command("cleanup-inspect")
+def recovery_cleanup_inspect(
+    user_data: Path = typer.Option(..., "--user-data", help="Electron userData root A."),
+    mode: str = typer.Option(
+        ...,
+        "--mode",
+        help="reset-current-settings, delete-current-profile, or delete-all-user-data.",
+    ),
+    profile_kind: str = typer.Option(..., "--profile-kind", help="primary or recovery."),
+    recovery_id: str | None = typer.Option(None, "--recovery-id", help="Selected recovery UUID."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the cleanup protocol."),
+) -> None:
+    """Read the complete Desktop cleanup inventory without writing anything."""
+
+    report = cleanup_inspect(
+        user_data,
+        mode=mode,
+        profile_kind=profile_kind,
+        recovery_id=recovery_id,
+    )
+    _cleanup_exit(report, json_output=json_output)
+
+
+@recovery_app.command("cleanup-apply")
+def recovery_cleanup_apply(
+    user_data: Path = typer.Option(..., "--user-data", help="Electron userData root A."),
+    mode: str = typer.Option(
+        ...,
+        "--mode",
+        help="reset-current-settings, delete-current-profile, or delete-all-user-data.",
+    ),
+    profile_kind: str = typer.Option(..., "--profile-kind", help="primary or recovery."),
+    transaction_id: str = typer.Option(..., "--transaction-id", help="Cleanup inspection id."),
+    expected_revision: int = typer.Option(
+        ...,
+        "--expected-revision",
+        min=0,
+        help="Cleanup inspection revision used for compare-and-swap.",
+    ),
+    confirm_user_data: Path = typer.Option(
+        ...,
+        "--confirm-user-data",
+        help="Exact normalized Electron userData root shown by inspection.",
+    ),
+    recovery_id: str | None = typer.Option(None, "--recovery-id", help="Selected recovery UUID."),
+    after_parent_exit: bool = typer.Option(
+        False,
+        "--after-parent-exit",
+        hidden=True,
+        help="Wait for the Desktop parent pipe to close, then inspect again before delete-all.",
+    ),
+    expected_scope_fingerprint: str | None = typer.Option(
+        None,
+        "--expected-scope-fingerprint",
+        hidden=True,
+        help="Exact post-stop cleanup kind/path scope approved by Desktop.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit the cleanup protocol."),
+) -> None:
+    """Apply a previously inspected cleanup after exact path confirmation."""
+
+    if after_parent_exit:
+        if mode != "delete-all-user-data" or os.environ.get(
+            "OPENSQUILLA_RECOVERY_OFFLINE"
+        ) != "1":
+            raise typer.BadParameter(
+                "--after-parent-exit is reserved for offline Desktop delete-all"
+            )
+        if (
+            expected_scope_fingerprint is None
+            or len(expected_scope_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in expected_scope_fingerprint)
+        ):
+            raise typer.BadParameter(
+                "--after-parent-exit requires the approved cleanup scope fingerprint"
+            )
+        # Electron writes the exact user-approved kind/path scope but keeps the
+        # pipe open. Reading the complete bounded payload therefore blocks until
+        # parent exit has released Chromium/userData handles and delivered EOF.
+        approved_scope = _read_parent_cleanup_approval(
+            user_data=user_data,
+            expected_fingerprint=expected_scope_fingerprint,
+        )
+        refreshed = cleanup_inspect(
+            user_data,
+            mode=mode,
+            profile_kind=profile_kind,
+            recovery_id=recovery_id,
+        )
+        if refreshed.outcome != "ready":
+            _cleanup_exit(refreshed, json_output=json_output)
+            return
+        refreshed_scope = frozenset(_cleanup_scope_pair(item) for item in refreshed.items)
+        if not refreshed_scope.issubset(approved_scope):
+            _cleanup_exit(
+                replace(
+                    refreshed,
+                    outcome="blocked",
+                    stable_code="cleanup_scope_changed",
+                ),
+                json_output=json_output,
+            )
+            return
+        transaction_id = refreshed.transaction_id
+        expected_revision = refreshed.revision
+    elif expected_scope_fingerprint is not None:
+        raise typer.BadParameter(
+            "--expected-scope-fingerprint is reserved for post-exit Desktop cleanup"
+        )
+
+    report = cleanup_apply(
+        user_data,
+        mode=mode,
+        profile_kind=profile_kind,
+        transaction_id=transaction_id,
+        expected_revision=expected_revision,
+        confirm_user_data=confirm_user_data,
+        recovery_id=recovery_id,
+    )
+    _cleanup_exit(report, json_output=json_output)
 
 
 __all__ = ["recovery_app"]

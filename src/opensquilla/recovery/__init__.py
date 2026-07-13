@@ -10,11 +10,19 @@ from opensquilla.recovery.atomic import (
     no_follow_manifest,
     path_identity,
 )
+from opensquilla.recovery.cleanup import (
+    CleanupItem,
+    CleanupReport,
+    abandon_cleanup_transaction,
+    cleanup_apply,
+    cleanup_inspect,
+)
 from opensquilla.recovery.engine import (
     choose_workspace,
     guard_desktop_profile,
     guarded_desktop_profile,
     inspect_profile,
+    profile_replacement_transaction_unfinished,
     reconcile_profile,
 )
 from opensquilla.recovery.errors import (
@@ -53,6 +61,8 @@ from opensquilla.recovery.transaction import recover_profile_transaction
 
 __all__ = [
     "AtomicStateUnknownError",
+    "CleanupItem",
+    "CleanupReport",
     "ConfigChangedError",
     "CrossDeviceMoveError",
     "DestinationExistsError",
@@ -71,10 +81,13 @@ __all__ = [
     "UnsafePathError",
     "WorkspaceCandidate",
     "WorkspaceOverrideError",
+    "abandon_cleanup_transaction",
     "acquire_legacy_gateway_locks",
     "acquire_profile_locks",
     "apply_desktop_settings",
     "choose_workspace",
+    "cleanup_apply",
+    "cleanup_inspect",
     "guard_desktop_profile",
     "guarded_desktop_profile",
     "inspect_profile",
@@ -83,6 +96,7 @@ __all__ = [
     "move_profile_no_replace",
     "no_follow_manifest",
     "path_identity",
+    "profile_replacement_transaction_unfinished",
     "profile_lock_key",
     "profile_lock_path",
     "reconcile_profile",

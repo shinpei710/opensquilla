@@ -209,6 +209,7 @@ jobs:
           node scripts/test-desktop-locale.mjs
           node scripts/test-desktop-profile-substrate.mjs
           node scripts/test-desktop-profile-context.mjs
+          node scripts/test-desktop-cleanup-contract.mjs
 
   ubuntu-quality:
     name: Lint, test, and build (ubuntu-latest, 3.12)
