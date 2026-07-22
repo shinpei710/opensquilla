@@ -52,6 +52,7 @@ OFFLINE_MARKER_EXCLUSIONS = {
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_artifact_validation.py",
+    "tests/test_ci/test_dockerignore_context.py",
     "tests/test_ci/test_migration_v022.py",
     "tests/test_ci/test_session_storage_connection_contract.py",
     "tests/test_channels/test_stream_terminal_routing.py",
@@ -78,6 +79,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_live_mixed_provider_gateway.py",
     "tests/test_live_multi_provider_matrix.py",
     "tests/test_onboarding/test_llm_profiles.py",
+    "tests/test_packaging/test_webui_build_contract.py",
     "tests/test_provider/test_error_secret_boundary.py",
     "tests/test_provider_native_response_guards.py",
     "tests/test_provider_terminal_evidence.py",
@@ -93,6 +95,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_recovery/test_settings_transaction.py",
     "tests/test_recovery/test_transaction.py",
     "tests/test_scripts/test_release_channel_manifest.py",
+    "tests/test_scripts/test_verify_webui_artifact.py",
     "tests/test_session/test_storage_transactions.py",
     "tests/test_session/test_turn_acceptance_storage.py",
     "tests/test_skills/test_hub_deps_subprocess.py",

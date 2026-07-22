@@ -9,6 +9,7 @@ shows up immediately.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -18,6 +19,8 @@ from starlette.testclient import TestClient
 from opensquilla.gateway import control_ui
 from opensquilla.gateway.config import ControlUiConfig, GatewayConfig
 from opensquilla.gateway.control_ui import create_control_ui_routes
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture
@@ -130,6 +133,36 @@ def test_control_ui_defaults_to_vue_bootstrap(
     assert response.status_code == 200
     assert '/control/static/dist/assets/index.js' in response.text
     assert '/control/static/js/app.js' not in response.text
+
+
+def test_control_ui_explains_how_to_build_missing_vue_assets(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(control_ui, "_DIST_DIR", tmp_path)
+    config = GatewayConfig()
+    config.control_ui.enabled = True
+    app = Starlette(routes=create_control_ui_routes(config))
+
+    response = TestClient(app).get("/control/")
+
+    assert response.status_code == 200
+    assert "Control UI assets are unavailable" in response.text
+    assert "npm ci &amp;&amp; npm run build" in response.text
+    assert "data-webui-artifact-missing" in response.text
+    assert '<div id="app"></div>' not in response.text
+
+
+def test_missing_vue_asset_recovery_is_in_troubleshooting_guide() -> None:
+    troubleshooting = (REPO_ROOT / "docs" / "troubleshooting.md").read_text(
+        encoding="utf-8"
+    )
+    normalized = " ".join(troubleshooting.split())
+
+    assert "## Control UI Assets Are Unavailable" in troubleshooting
+    assert "npm ci\nnpm run build" in troubleshooting
+    assert "Direct VCS URL installs" in troubleshooting
+    assert "official release wheel" in normalized
 
 
 def test_control_ui_legacy_frontend_uses_static_bootstrap() -> None:
